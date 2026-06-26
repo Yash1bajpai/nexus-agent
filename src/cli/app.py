@@ -179,7 +179,7 @@ def main(
         typer.echo("Programmer Assistant CLI v2.0.0")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
-        repl()
+        repl(provider=DEFAULT_PROVIDER, verbose=False, no_stream=False)
 
 if __name__ == "__main__":
     app()
