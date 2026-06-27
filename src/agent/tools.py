@@ -114,13 +114,16 @@ def execute_search_web(query: str) -> str:
     """Search the web using DuckDuckGo and return top results."""
     try:
         import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
+        orig_warn = warnings.warn
+        try:
+            warnings.warn = lambda msg, *a, **kw: None if "duckduckgo_search" in str(msg) else orig_warn(msg, *a, **kw)
             try:
                 from ddgs import DDGS
             except ImportError:
                 from duckduckgo_search import DDGS
             results = DDGS().text(query, max_results=5)
+        finally:
+            warnings.warn = orig_warn
         if not results:
             return f"No web search results found for query: {query}"
         formatted = [f"Search results for: '{query}'\n"]
