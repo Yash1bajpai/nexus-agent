@@ -41,7 +41,7 @@ def chat(
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose)
 
-        display.print_header(provider, getattr(prov, "model", "unknown"))
+        display.print_header(provider, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
 
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
@@ -76,7 +76,7 @@ def repl(
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose)
 
-        display.print_header(provider, getattr(prov, "model", "unknown"))
+        display.print_header(provider, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         typer.echo("Type 'exit' or 'quit' to end the session.\n")
 
         while True:
@@ -118,7 +118,7 @@ def review(
         prov = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose)
-        display.print_header(provider, getattr(prov, "model", "unknown"))
+        display.print_header(provider, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         query = f"Please review the code in '{file_path}'. Use read_file first, analyze for bugs, security issues, and clean code best practices."
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
@@ -143,7 +143,7 @@ def debug(
         prov = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose)
-        display.print_header(provider, getattr(prov, "model", "unknown"))
+        display.print_header(provider, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it, explain the root cause, and use write_file to fix it."
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
@@ -168,7 +168,7 @@ def generate(
         prov = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose)
-        display.print_header(provider, getattr(prov, "model", "unknown"))
+        display.print_header(provider, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         query = f"Generate code based on this instruction: '{prompt}'. Write the final production code to '{output}' using write_file."
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)

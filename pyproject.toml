@@ -23,3 +23,6 @@ devmind = "src.cli.app:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pytest.ini_options]
+filterwarnings = ["ignore"]

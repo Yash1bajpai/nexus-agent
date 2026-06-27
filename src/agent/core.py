@@ -1,3 +1,5 @@
+import os
+import re
 import time
 from typing import Any, Dict
 from src.providers.base import BaseProvider
@@ -6,10 +8,7 @@ from src.agent.tools import get_all_tools, execute_tool
 from src.cli import display
 from src.utils.config import estimate_cost
 
-SYSTEM_PROMPT = """You are Programmer Assistant, an expert coding agent running in a CLI terminal.
-You help developers write, debug, review, and understand code.
-
-RULES:
+RULES_PROMPT = """RULES:
 1. Always use read_file tool before answering questions about a specific file.
    Never guess or assume file contents.
 2. When creating or modifying code files, always use write_file tool.
@@ -24,6 +23,37 @@ RULES:
 10. Never make up file contents, function signatures, or library APIs.
 11. Be direct. Skip unnecessary preamble."""
 
+def parse_at_mentions(user_input: str) -> str:
+    """Detect @filename mentions, synchronously read files, attach context invisibly, and clean prompt."""
+    matches = re.findall(r'(?:^|\s)@([\w\.\-\/\\:]+)', user_input)
+    if not matches:
+        return user_input
+
+    clean_input = user_input
+    attachments = []
+    for raw_fpath in set(matches):
+        fpath = raw_fpath.rstrip('.!,?;:')
+        pattern = r'(?:^|\s)@' + re.escape(raw_fpath) + r'(?=\s|$|[.!,?;:])'
+        clean_input = re.sub(pattern, ' ', clean_input).strip()
+
+        if os.path.exists(fpath) and os.path.isfile(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                attachments.append(f"[Context attached from @{fpath}: \n{content}\n]")
+            except Exception as e:
+                attachments.append(f"[Warning: Could not read @{fpath}: {str(e)}]")
+        else:
+            attachments.append(f"[Warning: Mentioned file @{fpath} does not exist]")
+
+    clean_input = re.sub(r'\s+', ' ', clean_input).strip()
+    if not clean_input:
+        clean_input = "Please inspect the attached file context."
+
+    if attachments:
+        return clean_input + "\n\n" + "\n\n".join(attachments)
+    return clean_input
+
 class Agent:
     """Core autonomous coding agent implementing the ReAct tool-use loop."""
 
@@ -31,11 +61,26 @@ class Agent:
         self.provider = provider
         self.memory = memory
         self.tools = get_all_tools()
-        self.system = SYSTEM_PROMPT
         self.max_iterations = max_iterations
         self.verbose = verbose
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+
+        # Smart Startup: Global vs. Project Context check
+        cwd = os.getcwd()
+        has_git = os.path.exists(os.path.join(cwd, ".git"))
+        has_pyproject = os.path.exists(os.path.join(cwd, "pyproject.toml"))
+        has_package_json = os.path.exists(os.path.join(cwd, "package.json"))
+
+        if has_git or has_pyproject or has_package_json:
+            project_name = os.path.basename(cwd) or "Unknown Project"
+            self.mode_str = f"Project Mode ({project_name})"
+            mode_prompt = f"You are DevMind, currently working inside the project directory: {project_name}."
+        else:
+            self.mode_str = "Global Mode"
+            mode_prompt = "You are DevMind, an expert coding agent running in a CLI terminal in Global Mode."
+
+        self.system = f"{mode_prompt}\nYou help developers write, debug, review, and understand code.\n\n{RULES_PROMPT}"
 
     @property
     def total_tokens(self) -> int:
@@ -48,55 +93,65 @@ class Agent:
 
     def run(self, user_input: str, stream: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
-        self.memory.add("user", user_input)
+        processed_input = parse_at_mentions(user_input)
+        self.memory.add("user", processed_input)
         messages = self.memory.get()
 
-        if self.verbose:
-            display.print_thinking("Thinking...")
+        status = display.create_status("Thinking...") if self.verbose else None
 
         iteration = 0
+        try:
+            while iteration < self.max_iterations:
+                iteration += 1
+                display.update_status(status, "Thinking...")
 
-        while iteration < self.max_iterations:
-            iteration += 1
+                response = self.provider.complete(
+                    messages=messages,
+                    tools=self.tools,
+                    system=self.system
+                )
 
-            response = self.provider.complete(
-                messages=messages,
-                tools=self.tools,
-                system=self.system
-            )
+                self.total_input_tokens += response.input_tokens
+                self.total_output_tokens += response.output_tokens
 
-            self.total_input_tokens += response.input_tokens
-            self.total_output_tokens += response.output_tokens
+                if response.has_tool_calls:
+                    self.memory.add_raw(response.raw_assistant_message)
+                    for tool_call in response.tool_calls:
+                        args_str = ", ".join(f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}" for k, v in tool_call.args.items())
+                        if len(args_str) > 40:
+                            args_str = args_str[:37] + "..."
+                        display.update_status(status, f"Running tool: {tool_call.name}({args_str})...")
 
-            if response.has_tool_calls:
-                self.memory.add_raw(response.raw_assistant_message)
-                for tool_call in response.tool_calls:
-                    if self.verbose:
-                        display.print_tool_call(tool_call.name, tool_call.args)
+                        if self.verbose:
+                            display.print_tool_call(tool_call.name, tool_call.args)
 
-                    start = time.time()
-                    result = execute_tool(tool_call.name, tool_call.args)
-                    duration = time.time() - start
+                        start = time.time()
+                        result = execute_tool(tool_call.name, tool_call.args)
+                        duration = time.time() - start
 
-                    if self.verbose:
-                        display.print_tool_result(result, duration)
+                        if self.verbose:
+                            display.print_tool_result(result, duration)
 
-                    self.memory.add_raw(self.provider.format_tool_result_message(tool_call.id, result))
+                        self.memory.add_raw(self.provider.format_tool_result_message(tool_call.id, result))
 
-                messages = self.memory.get()
-            else:
-                if stream and hasattr(self.provider, "stream"):
-                    final_text = ""
-                    display.console.print("\n[bold green]Response:[/bold green]\n")
-                    for chunk in self.provider.stream(messages, self.tools, self.system):
-                        final_text += chunk
-                        display.console.print(chunk, end="")
-                    display.console.print()
-                    self.memory.add("assistant", final_text)
-                    return final_text
+                    messages = self.memory.get()
                 else:
-                    final_text = response.text
-                    self.memory.add("assistant", final_text)
-                    return final_text
+                    display.stop_status(status)
+                    status = None
+                    if stream and hasattr(self.provider, "stream"):
+                        final_text = ""
+                        display.console.print("\n[bold green]Response:[/bold green]\n")
+                        for chunk in self.provider.stream(messages, self.tools, self.system):
+                            final_text += chunk
+                            display.console.print(chunk, end="")
+                        display.console.print()
+                        self.memory.add("assistant", final_text)
+                        return final_text
+                    else:
+                        final_text = response.text
+                        self.memory.add("assistant", final_text)
+                        return final_text
+        finally:
+            display.stop_status(status)
 
         return "Max tool iterations reached. Please try a more specific question."

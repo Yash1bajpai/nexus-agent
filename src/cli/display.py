@@ -7,15 +7,29 @@ from rich.syntax import Syntax
 
 console = Console()
 
-def print_header(provider_name: str, model_name: str):
+def print_header(provider_name: str, model_name: str, mode: str = ""):
     """Print the assistant start panel."""
     content = f"Provider: {provider_name.capitalize()} ({model_name})"
+    if mode:
+        content += f"\nMode: {mode}"
     panel = Panel(content, title="Programmer Assistant", border_style="cyan")
     console.print(panel)
 
-def print_thinking(message: str = "Thinking..."):
-    """Print thinking status indicator."""
-    console.print(f"[dim italic]{message}[/dim italic]")
+def create_status(message: str = "Thinking...") -> Any:
+    """Create and start a Rich live status spinner."""
+    status = console.status(f"[bold cyan]{message}[/bold cyan]", spinner="line")
+    status.start()
+    return status
+
+def update_status(status: Any, message: str):
+    """Update the text of an active status spinner."""
+    if status is not None:
+        status.update(f"[bold cyan]{message}[/bold cyan]")
+
+def stop_status(status: Any):
+    """Cleanly stop and hide the active status spinner."""
+    if status is not None:
+        status.stop()
 
 def print_tool_call(tool_name: str, args: Dict[str, Any]):
     """Print tool invocation info."""

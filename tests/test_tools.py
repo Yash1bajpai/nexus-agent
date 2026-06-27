@@ -27,6 +27,7 @@ def test_list_directory_not_found():
     result = execute_list_directory("non_existent_folder_999")
     assert result.startswith("ERROR: Directory not found")
 
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
 def test_search_web():
     res = execute_tool("search_web", {"query": "python programming"})
     assert "Search results for:" in res or "ERROR:" in res or "No web search results found" in res
