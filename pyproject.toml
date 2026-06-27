@@ -26,3 +26,6 @@ where = ["."]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore"]
+
+[tool.pyright]
+extraPaths = ["."]

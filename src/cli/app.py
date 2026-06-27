@@ -5,7 +5,7 @@ from src.utils.config import DEFAULT_PROVIDER, ConfigError
 from src.providers.anthropic_provider import AnthropicProvider
 from src.agent.memory import ConversationMemory
 from src.agent.core import Agent
-from src.cli import display
+from . import display
 
 app = typer.Typer(help="Programmer Assistant CLI Coding Agent")
 
