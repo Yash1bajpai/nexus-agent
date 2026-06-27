@@ -95,7 +95,7 @@ class GeminiProvider(BaseProvider):
             output_tokens=out_tokens,
         )
 
-    def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str):
+    def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
         genai_tools = self._convert_tools(tools)
         config = types.GenerateContentConfig(
             system_instruction=system if system else None,

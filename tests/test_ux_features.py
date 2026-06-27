@@ -1,5 +1,6 @@
 import os
 import pytest
+from typing import Any
 from src.agent.core import parse_at_mentions, Agent
 from src.agent.memory import ConversationMemory
 from src.providers.base import BaseProvider, ProviderResponse
@@ -13,7 +14,7 @@ class DummyProvider(BaseProvider):
     def complete(self, messages, tools=None, system="") -> ProviderResponse:
         return ProviderResponse(text="Hello", input_tokens=10, output_tokens=10)
 
-    def stream(self, messages, tools=None, system=""):
+    def stream(self, messages, tools=None, system="") -> Any:
         yield "Hello"
 
     def format_tool_result_message(self, tool_call_id: str, output: str) -> dict:

@@ -41,7 +41,7 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str):
+    def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
         """
         Stream tokens from LLM. Yields chunks or ProviderResponse updates.
         """

@@ -59,7 +59,7 @@ class AnthropicProvider(BaseProvider):
             output_tokens=response.usage.output_tokens,
         )
 
-    def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str):
+    def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
         converted_tools = self._convert_tools(tools)
         kwargs: Dict[str, Any] = {
             "model": self.model,
