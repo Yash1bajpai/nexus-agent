@@ -1,6 +1,7 @@
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict
 from ..providers.base import BaseProvider
 from .memory import ConversationMemory
@@ -25,20 +26,24 @@ RULES_PROMPT = """RULES:
 
 def parse_at_mentions(user_input: str) -> str:
     """Detect @filename mentions, synchronously read files, attach context invisibly, and clean prompt."""
-    matches = re.findall(r'(?:^|\s)@([\w\.\-\/\\:]+)', user_input)
+    matches = re.findall(r'(?:^|\s)@\s*([\w\.\-\/\\:]+)', user_input)
     if not matches:
         return user_input
 
     clean_input = user_input
     attachments = []
-    for raw_fpath in set(matches):
+    for raw_fpath in sorted(set(matches), key=len, reverse=True):
         fpath = raw_fpath.rstrip('.!,?;:')
-        pattern = r'(?:^|\s)@' + re.escape(raw_fpath) + r'(?=\s|$|[.!,?;:])'
-        clean_input = re.sub(pattern, ' ', clean_input).strip()
+        try:
+            resolved_path = Path(fpath).resolve()
+        except Exception:
+            resolved_path = Path(fpath)
 
-        if os.path.exists(fpath) and os.path.isfile(fpath):
+        if resolved_path.exists() and resolved_path.is_file():
+            pattern = r'(?:^|\s)@\s*' + re.escape(raw_fpath) + r'(?=\s|$|[.!,?;:])'
+            clean_input = re.sub(pattern, ' ', clean_input).strip()
             try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
                 attachments.append(f"[Context attached from @{fpath}: \n{content}\n]")
             except Exception as e:
@@ -138,19 +143,11 @@ class Agent:
                 else:
                     display.stop_status(status)
                     status = None
-                    if stream and hasattr(self.provider, "stream"):
-                        final_text = ""
-                        display.console.print("\n[bold green]Response:[/bold green]\n")
-                        for chunk in self.provider.stream(messages, self.tools, self.system):
-                            final_text += chunk
-                            display.console.print(chunk, end="")
-                        display.console.print()
-                        self.memory.add("assistant", final_text)
-                        return final_text
-                    else:
-                        final_text = response.text
-                        self.memory.add("assistant", final_text)
-                        return final_text
+                    final_text = response.text
+                    if stream:
+                        display.print_response(final_text)
+                    self.memory.add("assistant", final_text)
+                    return final_text
         finally:
             display.stop_status(status)
 

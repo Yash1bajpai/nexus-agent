@@ -3,6 +3,7 @@ import pytest
 from typing import Any
 from src.agent.core import parse_at_mentions, Agent
 from src.agent.memory import ConversationMemory
+from src.agent.persistence import SQLiteMemory
 from src.providers.base import BaseProvider, ProviderResponse
 from src.cli import display
 
@@ -21,16 +22,18 @@ class DummyProvider(BaseProvider):
         return {"role": "user", "content": output}
 
 def test_parse_at_mentions(tmp_path):
-    # Create a temporary file
+    # Create temporary files
     test_file = tmp_path / "sample.py"
     test_file.write_text("print('hello world')", encoding="utf-8")
+    test_file2 = tmp_path / "config.txt"
+    test_file2.write_text("debug=true", encoding="utf-8")
     
-    # Test valid mention
-    prompt = f"Please review @{test_file} carefully."
+    # Test valid mention with space after @
+    prompt = f"Please review @ {test_file} and @{test_file2} carefully."
     result = parse_at_mentions(prompt)
-    assert "Please review carefully." in result
-    assert "[Context attached from @" in result
+    assert "Please review and carefully." in result or "Please review and carefully." in re.sub(r'\s+', ' ', result)
     assert "print('hello world')" in result
+    assert "debug=true" in result
 
     # Test missing file mention
     missing_prompt = "Check @non_existent_file_123.py please"
@@ -54,3 +57,16 @@ def test_status_spinner_helpers():
     assert status is not None
     display.update_status(status, "Updated status...")
     display.stop_status(status)
+
+def test_sqlite_memory(tmp_path):
+    db_file = tmp_path / "test_history.db"
+    mem = SQLiteMemory(db_path=db_file, session_id="test_sess")
+    mem.add("user", "Hello SQLite")
+    mem.add("assistant", "Hi there")
+    
+    msgs = mem.get()
+    assert len(msgs) == 2
+    assert msgs[0]["content"] == "Hello SQLite"
+    
+    mem.clear()
+    assert len(mem.get()) == 0

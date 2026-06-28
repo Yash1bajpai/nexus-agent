@@ -32,6 +32,16 @@ Built with a clean **ReAct (Reasoning + Acting)** cognitive architecture, DevMin
 
 Unlike cloud-dependent tools like GitHub Copilot CLI, **DevMind** is built for offline-capable, cost-zero local execution. V2 will integrate a custom-trained 124M parameter LLM as the local backend — enabling completely private, zero-latency execution with no external API key required.
 
+### 📊 How DevMind Compares
+
+| Feature | DevMind | Copilot CLI | Cursor | Aider |
+| :--- | :---: | :---: | :---: | :---: |
+| **Multi-Provider Support** (Claude, Gemini, OpenAI) | ✅ | ❌ | ❌ | ✅ |
+| **Autonomous Local Tool Execution** | ✅ | ❌ | ✅ | ✅ |
+| **Real-Time Token & Cost Tracking** | ✅ | ❌ | ❌ | ❌ |
+| **`@mention` File Context Injection** | ✅ | ❌ | ❌ | ❌ |
+| **Smart Project vs. Global Detection** | ✅ | ❌ | ❌ | ❌ |
+
 ---
 
 ## 🔥 Key Architectural Highlights
@@ -134,10 +144,11 @@ GEMINI_API_KEY=AIzaSy...
 ### 3. Usage
 
 #### Interactive Multi-Turn REPL Mode (Default)
-Start a continuous pair-programming session directly by invoking `devmind`:
+Start a continuous pair-programming session directly by invoking `agent` or `devmind` without any subcommands:
 
 ```bash
-devmind --provider anthropic
+agent
+# Or with flags: agent --provider anthropic
 # Or explicitly: devmind repl --provider gemini
 ```
 
@@ -181,26 +192,27 @@ pytest tests/ -v
 
 ```text
 ============================= test session starts =============================
-collecting ... collected 16 items
+collecting ... collected 17 items
 
-tests/test_providers.py::test_anthropic_provider_schema PASSED           [  6%]
-tests/test_providers.py::test_openai_provider_schema PASSED              [ 12%]
-tests/test_providers.py::test_gemini_provider_schema PASSED              [ 18%]
-tests/test_providers.py::test_provider_tool_result_format PASSED         [ 25%]
-tests/test_tools.py::test_read_file_success PASSED                       [ 31%]
-tests/test_tools.py::test_read_file_not_found PASSED                     [ 37%]
-tests/test_tools.py::test_list_directory_success PASSED                  [ 43%]
-tests/test_tools.py::test_list_directory_not_found PASSED                [ 50%]
-tests/test_tools.py::test_search_web PASSED                              [ 56%]
-tests/test_tools.py::test_write_file_success PASSED                      [ 62%]
-tests/test_tools.py::test_run_code_success PASSED                        [ 68%]
-tests/test_tools.py::test_git_status_tool PASSED                         [ 75%]
-tests/test_tools.py::test_execute_tool_dispatcher PASSED                 [ 81%]
-tests/test_ux_features.py::test_parse_at_mentions PASSED                 [ 87%]
-tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 93%]
-tests/test_ux_features.py::test_status_spinner_helpers PASSED            [100%]
+tests/test_providers.py::test_anthropic_provider_schema PASSED           [  5%]
+tests/test_providers.py::test_openai_provider_schema PASSED              [ 11%]
+tests/test_providers.py::test_gemini_provider_schema PASSED              [ 17%]
+tests/test_providers.py::test_provider_tool_result_format PASSED         [ 23%]
+tests/test_tools.py::test_read_file_success PASSED                       [ 29%]
+tests/test_tools.py::test_read_file_not_found PASSED                     [ 35%]
+tests/test_tools.py::test_list_directory_success PASSED                  [ 41%]
+tests/test_tools.py::test_list_directory_not_found PASSED                [ 47%]
+tests/test_tools.py::test_search_web PASSED                              [ 52%]
+tests/test_tools.py::test_write_file_success PASSED                      [ 58%]
+tests/test_tools.py::test_run_code_success PASSED                        [ 64%]
+tests/test_tools.py::test_git_status_tool PASSED                         [ 70%]
+tests/test_tools.py::test_execute_tool_dispatcher PASSED                 [ 76%]
+tests/test_ux_features.py::test_parse_at_mentions PASSED                 [ 82%]
+tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 88%]
+tests/test_ux_features.py::test_status_spinner_helpers PASSED            [ 94%]
+tests/test_ux_features.py::test_sqlite_memory PASSED                     [100%]
 
-============================= 16 passed in 6.32s ==============================
+============================= 17 passed in 4.16s ==============================
 ```
 
 ---

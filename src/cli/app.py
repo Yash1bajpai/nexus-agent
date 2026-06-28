@@ -2,7 +2,6 @@ import time
 import typer
 from typing import Optional, Any
 from ..utils.config import DEFAULT_PROVIDER, ConfigError
-from ..providers.anthropic_provider import AnthropicProvider
 from ..agent.memory import ConversationMemory
 from ..agent.core import Agent
 from . import display
@@ -17,6 +16,7 @@ def get_provider_instance(provider_name: Any):
         provider_name = str(provider_name or DEFAULT_PROVIDER)
     name_clean = provider_name.lower().strip()
     if name_clean == "anthropic":
+        from ..providers.anthropic_provider import AnthropicProvider
         return AnthropicProvider()
     elif name_clean == "gemini":
         from ..providers.gemini_provider import GeminiProvider
@@ -26,6 +26,7 @@ def get_provider_instance(provider_name: Any):
         return OpenAIProvider()
     else:
         display.print_error(f"Provider '{provider_name}' is not implemented. Using Anthropic fallback.")
+        from ..providers.anthropic_provider import AnthropicProvider
         return AnthropicProvider()
 
 @app.command()
@@ -186,7 +187,7 @@ def main(
     version: bool = typer.Option(False, "--version", help="Show version information.")
 ):
     if version:
-        typer.echo("Programmer Assistant CLI v2.0.0")
+        typer.echo("Programmer Assistant CLI v2.1.2")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
         repl(provider=DEFAULT_PROVIDER, verbose=False, no_stream=False)

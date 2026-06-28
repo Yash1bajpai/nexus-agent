@@ -12,7 +12,7 @@ def print_header(provider_name: str, model_name: str, mode: str = ""):
     content = f"Provider: {provider_name.capitalize()} ({model_name})"
     if mode:
         content += f"\nMode: {mode}"
-    panel = Panel(content, title="Programmer Assistant", border_style="cyan")
+    panel = Panel(content, title="DevMind", border_style="cyan")
     console.print(panel)
 
 def create_status(message: str = "Thinking...") -> Any:

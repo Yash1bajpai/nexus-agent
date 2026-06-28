@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import MagicMock, patch
 # pyrefly: ignore [missing-import]
 from src.providers.base import Tool
 # pyrefly: ignore [missing-import]
@@ -7,6 +8,16 @@ from src.providers.anthropic_provider import AnthropicProvider
 from src.providers.openai_provider import OpenAIProvider
 # pyrefly: ignore [missing-import]
 from src.providers.gemini_provider import GeminiProvider
+
+@pytest.fixture(autouse=True)
+def mock_api_clients(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-anthropic-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-openai-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "mock-gemini-key")
+    with patch("anthropic.Anthropic", return_value=MagicMock()), \
+         patch("openai.OpenAI", return_value=MagicMock()), \
+         patch("google.genai.Client", return_value=MagicMock()):
+        yield
 
 sample_tool = Tool(
     name="test_tool",
