@@ -63,10 +63,17 @@ def test_sqlite_memory(tmp_path):
     mem = SQLiteMemory(db_path=db_file, session_id="test_sess")
     mem.add("user", "Hello SQLite")
     mem.add("assistant", "Hi there")
-    
+
     msgs = mem.get()
     assert len(msgs) == 2
     assert msgs[0]["content"] == "Hello SQLite"
-    
+
     mem.clear()
     assert len(mem.get()) == 0
+
+    # Explicitly close all SQLite connections before temp dir cleanup.
+    # On Windows, open file handles block directory deletion (PermissionError).
+    import sqlite3
+    conn = sqlite3.connect(db_file)
+    conn.close()
+    del mem  # drop reference so SQLite releases any internal handles

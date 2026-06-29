@@ -45,12 +45,13 @@ def chat(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (gemini/anthropic/openai/auto)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
+    max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
     """Execute a single-turn chat instruction with autonomous tool calling."""
     try:
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
-        agent = Agent(provider=prov, memory=memory, verbose=verbose)
+        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
         display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
 
@@ -74,6 +75,7 @@ def repl(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (gemini/anthropic/openai/auto)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
+    max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
     """Start an interactive multi-turn REPL chat session."""
     if hasattr(provider, "default"):
@@ -82,10 +84,12 @@ def repl(
         verbose = bool(verbose.default)
     if hasattr(no_stream, "default"):
         no_stream = bool(no_stream.default)
+    if hasattr(max_iterations, "default"):
+        max_iterations = int(max_iterations.default)
     try:
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
-        agent = Agent(provider=prov, memory=memory, verbose=verbose)
+        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
         display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         typer.echo("Type 'exit' or 'quit' to end the session.\n")
@@ -123,12 +127,13 @@ def review(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
+    max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
     """Review code quality, security, and potential bugs in a local file."""
     try:
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
-        agent = Agent(provider=prov, memory=memory, verbose=verbose)
+        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
         display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         query = f"Please review the code in '{file_path}'. Use read_file first, analyze for bugs, security issues, and clean code best practices."
         start_time = time.time()
@@ -148,6 +153,7 @@ def debug(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
+    max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
     """Diagnose and fix an error in a local codebase.
 
@@ -157,7 +163,7 @@ def debug(
     try:
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
-        agent = Agent(provider=prov, memory=memory, verbose=verbose)
+        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
         display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it, explain the root cause, and use write_file to fix it."
         start_time = time.time()
@@ -177,6 +183,7 @@ def generate(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
+    max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
     """Generate code autonomously and save directly to file.
 
@@ -186,7 +193,7 @@ def generate(
     try:
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
-        agent = Agent(provider=prov, memory=memory, verbose=verbose)
+        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
         display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
         query = f"Generate code based on this instruction: '{prompt}'. Write the final production code to '{output}' using write_file."
         start_time = time.time()
@@ -239,8 +246,7 @@ def commit(
 
         commit_message = commit_message.strip().strip('"').strip("'")
 
-        typer.echo(f"\n  Generated message: [bold]{commit_message}[/bold]" if False else
-                   f"\n  Generated message: {commit_message}")
+        typer.echo(f"\n  Generated message: {commit_message}")
 
         if not yes:
             confirmed = typer.confirm("\n  Commit with this message?", default=True)
@@ -257,7 +263,7 @@ def commit(
             raise typer.Exit(code=1)
         else:
             display.print_warn(result.replace("Committed successfully:\n", ""))
-            typer.echo("\n  [green]✓ Committed![/green]" if False else "\n  ✓ Done!")
+            typer.echo("\n  ✓ Done!")
 
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
 
@@ -271,7 +277,7 @@ def main(
     version: bool = typer.Option(False, "--version", help="Show version information.")
 ):
     if version:
-        typer.echo("DevMind CLI v2.2.0")
+        typer.echo("DevMind CLI v2.2.1")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
         # Run onboarding wizard on first launch
@@ -280,7 +286,7 @@ def main(
             run_if_first_time()
         except Exception:
             pass  # Never block startup on onboarding errors
-        repl(provider=DEFAULT_PROVIDER, verbose=False, no_stream=False)
+        repl(provider=DEFAULT_PROVIDER, verbose=False, no_stream=False, max_iterations=10)
 
 if __name__ == "__main__":
     app()

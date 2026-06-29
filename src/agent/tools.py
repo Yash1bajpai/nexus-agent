@@ -74,10 +74,81 @@ def execute_list_directory(path: str = ".") -> str:
     except Exception as e:
         return f"ERROR: Could not list directory: {str(e)}"
 
+# Modules that are too dangerous to allow inside agent-generated run_code snippets.
+# Use read_file / write_file tools for file I/O; use git_status / git_diff for shell work.
+_FORBIDDEN_IMPORTS = frozenset({
+    "os", "subprocess", "shutil", "socket", "urllib", "urllib3",
+    "pickle", "ctypes", "multiprocessing", "http", "sys",
+    "pathlib", "pty", "asm", "cffi", "signal",
+})
+
+def _sandbox_check(code: str) -> str | None:
+    """
+    AST-based static analysis. Returns an error string if forbidden
+    constructs are detected, or None if code is safe to execute.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return f"ERROR: Code has a syntax error: {e}"
+
+    violations = []
+
+    for node in ast.walk(tree):
+        # Block: import os / import subprocess / from os import path / etc.
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _FORBIDDEN_IMPORTS:
+                    violations.append(f"import {alias.name}")
+
+        elif isinstance(node, ast.ImportFrom):
+            module = (node.module or "").split(".")[0]
+            if module in _FORBIDDEN_IMPORTS:
+                violations.append(f"from {node.module} import ...")
+
+        # Block: __import__("os") and direct open() calls
+        elif isinstance(node, ast.Call):
+            func = node.func
+            # __import__("anything")
+            if isinstance(func, ast.Name) and func.id == "__import__":
+                if node.args and isinstance(node.args[0], ast.Constant):
+                    root = str(node.args[0].value).split(".")[0]
+                    if root in _FORBIDDEN_IMPORTS:
+                        violations.append(f"__import__('{node.args[0].value}')")
+
+            # open() — blocks exec(open("file.py").read()) bypass pattern
+            if isinstance(func, ast.Name) and func.id == "open":
+                violations.append("open() — use read_file tool instead")
+
+            # exec() / eval() — blocks dynamic code execution bypass
+            if isinstance(func, ast.Name) and func.id in ("exec", "eval"):
+                violations.append(f"{func.id}() — dynamic execution is not allowed")
+
+    if violations:
+        bullet_list = "\n  - ".join(violations)
+        return (
+            f"SANDBOX BLOCK: The following forbidden constructs were detected:\n"
+            f"  - {bullet_list}\n\n"
+            f"run_code is for pure computation only (math, algorithms, data processing).\n"
+            f"For file I/O → use read_file / write_file tools.\n"
+            f"For shell commands → use git_status / git_diff tools.\n"
+            f"If you need to run an existing script → use the run_file tool."
+        )
+    return None
+
+
 def execute_run_code(code: str, language: str = "python") -> str:
-    """Run Python code snippet in subprocess with timeout."""
+    """Run Python code snippet in a sandboxed subprocess with AST analysis + timeout."""
     if language.lower() not in ["python", "py"]:
         return f"ERROR: Running language '{language}' is not supported yet. Only Python is supported."
+
+    # AST sandbox check before any execution
+    sandbox_error = _sandbox_check(code)
+    if sandbox_error:
+        return sandbox_error
 
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as tf:
@@ -330,6 +401,52 @@ GIT_COMMIT_TOOL = Tool(
     execute=execute_git_commit,
 )
 
+def execute_run_file(path: str) -> str:
+    """Run an existing Python script file directly via subprocess."""
+    try:
+        p = Path(path).resolve()
+        if not p.exists():
+            return f"ERROR: File not found: {path}"
+        if p.suffix.lower() not in [".py"]:
+            return f"ERROR: Only .py files are supported. Got: {p.suffix}"
+
+        res = subprocess.run(
+            [sys.executable, str(p)],
+            capture_output=True,
+            text=True,
+            timeout=CODE_EXECUTION_TIMEOUT,
+        )
+        out = res.stdout.strip()
+        err = res.stderr.strip()
+        output = ""
+        if out:
+            output += f"STDOUT:\n{out}\n"
+        if err:
+            output += f"STDERR:\n{err}\n"
+        if not output:
+            output = f"[{path} executed successfully with no output]"
+        return output.strip()
+    except subprocess.TimeoutExpired:
+        return f"ERROR: Script timed out after {CODE_EXECUTION_TIMEOUT} seconds."
+    except Exception as e:
+        return f"ERROR: Could not run file: {str(e)}"
+
+RUN_FILE_TOOL = Tool(
+    name="run_file",
+    description="Run an existing Python script file directly. Use this when you need to execute a file already on disk (e.g. to verify generated code). No import restrictions unlike run_code.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute path to the .py file to execute.",
+            }
+        },
+        "required": ["path"],
+    },
+    execute=execute_run_file,
+)
+
 def get_all_tools() -> List[Tool]:
     """Return all available tools."""
     return [
@@ -337,6 +454,7 @@ def get_all_tools() -> List[Tool]:
         WRITE_FILE_TOOL,
         LIST_DIRECTORY_TOOL,
         RUN_CODE_TOOL,
+        RUN_FILE_TOOL,
         SEARCH_WEB_TOOL,
         GIT_STATUS_TOOL,
         GIT_DIFF_TOOL,
@@ -354,3 +472,4 @@ def execute_tool(name: str, args: Dict[str, Any]) -> str:
             except Exception as e:
                 return f"ERROR: Execution failed for tool '{name}': {str(e)}"
     return f"ERROR: Unknown tool '{name}'"
+

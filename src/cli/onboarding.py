@@ -41,7 +41,7 @@ def _input(prompt: str) -> str:
 # ─── System Spec Detection ────────────────────────────────────────────────────
 
 def detect_system_specs() -> dict:
-    specs = {"ram_gb": 0, "cpu_cores": 0, "gpu": None}
+    specs = {"ram_gb": 0, "cpu_cores": 0, "gpu": None, "cpu_name": None, "avx2": False}
 
     try:
         import psutil
@@ -49,6 +49,39 @@ def detect_system_specs() -> dict:
         specs["ram_gb"] = round(mem.total / (1024 ** 3), 1)
         specs["cpu_cores"] = psutil.cpu_count(logical=False) or psutil.cpu_count()
     except ImportError:
+        # psutil missing — default to 8GB middle tier, not lowest
+        specs["ram_gb"] = -1  # sentinel: unknown
+
+    # Try to detect CPU name + AVX2 support
+    try:
+        import platform
+        cpu_name = platform.processor()
+        if not cpu_name:
+            import subprocess as _sp
+            r = _sp.run(["wmic", "cpu", "get", "name"], capture_output=True, text=True, timeout=3)
+            cpu_name = r.stdout.strip().split("\n")[-1].strip() if r.returncode == 0 else ""
+        specs["cpu_name"] = cpu_name or None
+    except Exception:
+        pass
+
+    # Detect AVX2 support (indicates modern CPU, good for llama.cpp)
+    try:
+        import subprocess as _sp
+        r = _sp.run(["python", "-c",
+                     "import platform; print('avx2' in platform.processor().lower())"],
+                    capture_output=True, text=True, timeout=3)
+        # Alternative: check via cpuinfo if available
+        try:
+            import cpuinfo
+            flags = cpuinfo.get_cpu_info().get("flags", [])
+            specs["avx2"] = "avx2" in flags
+        except ImportError:
+            # Conservative fallback: assume modern CPU if it's an Intel 10th gen+ or AMD Zen 2+
+            cpu = (specs.get("cpu_name") or "").lower()
+            specs["avx2"] = any(x in cpu for x in ["i5-1", "i7-1", "i9-1", "i5-12", "i7-12",
+                                                     "i5-11", "i7-11", "ryzen 5 5", "ryzen 7 5",
+                                                     "ryzen 5 7", "ryzen 7 7", "i5-10", "i7-10"])
+    except Exception:
         pass
 
     try:
@@ -66,18 +99,45 @@ def detect_system_specs() -> dict:
 
     return specs
 
-def suggest_local_model(specs: dict) -> str:
+def suggest_local_model(specs: dict) -> tuple[str, str]:
+    """
+    Returns (model_suggestion, note) based on detected hardware.
+
+    Tier logic:
+      GPU any          → 7B+ models
+      RAM > 16GB       → 7B models comfortably
+      4 < RAM <= 16GB  → 3B-class models (Phi-3, Qwen2.5-3B, Llama-3.2-3B)
+      RAM <= 4GB       → TinyLlama 1.1B only
+      RAM unknown (-1) → default to 3B middle tier (don't assume worst)
+    """
     ram = specs.get("ram_gb", 0)
     gpu = specs.get("gpu")
+    avx2 = specs.get("avx2", False)
+    cpu_name = specs.get("cpu_name") or ""
+
+    avx2_note = " (AVX2 detected — fast inference)" if avx2 else ""
 
     if gpu:
-        return f"Llama3-8B-Q5 (GPU detected: {gpu})"
-    elif ram >= 16:
-        return "Mistral-7B-Q4 (~4GB RAM usage)"
-    elif ram >= 8:
-        return "Phi-3-Mini-Q4 (~2.5GB RAM usage)"
+        suggestion = f"Llama3-8B-Q5_K_M (~5GB VRAM){avx2_note}"
+        note = f"GPU detected: {gpu}. 7B models will run at full speed."
+    elif ram == -1:
+        # psutil missing / unknown RAM — use middle tier, not lowest
+        suggestion = f"Phi-3-Mini-3.8B-Q4_K_M (~2.3GB RAM){avx2_note}"
+        note = "RAM could not be detected. Assuming ≥8GB — recommending 3B class. Adjust if your RAM is lower."
+    elif ram > 16:
+        suggestion = f"Mistral-7B-Q4_K_M (~4.1GB RAM){avx2_note}"
+        note = f"{ram}GB RAM detected. 7B models will run comfortably."
+    elif ram > 4:
+        suggestion = f"Phi-3-Mini-3.8B-Q4_K_M (~2.3GB RAM){avx2_note}"
+        note = (
+            f"{ram}GB RAM detected. 3B-class models (Phi-3, Qwen2.5-3B, Llama-3.2-3B) "
+            f"run well at Q4_K_M quantization."
+        )
     else:
-        return "TinyLlama-1.1B-Q4 (637MB) — lightest option"
+        suggestion = "TinyLlama-1.1B-Q4_K_M (637MB)"
+        note = f"{ram}GB RAM detected. Only very small models are safe. TinyLlama recommended."
+
+    return suggestion, note
 
 # ─── Steps ────────────────────────────────────────────────────────────────────
 
@@ -163,24 +223,39 @@ def _step_system_specs():
     ram = specs["ram_gb"]
     cores = specs["cpu_cores"]
     gpu = specs["gpu"]
+    cpu_name = specs.get("cpu_name") or ""
+    avx2 = specs.get("avx2", False)
+
+    ram_display = f"{ram} GB" if ram and ram > 0 else "Unknown (defaulting to middle tier)"
+    avx2_display = "Yes ✓" if avx2 else "Not detected"
 
     if console:
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
         t.add_column(style="dim")
         t.add_column()
-        t.add_row("RAM", f"{ram} GB" if ram else "Unknown")
+        t.add_row("RAM", ram_display)
         t.add_row("CPU Cores", str(cores) if cores else "Unknown")
+        if cpu_name:
+            t.add_row("CPU", cpu_name[:60])
+        t.add_row("AVX2", avx2_display)
         t.add_row("GPU", gpu or "Not detected")
         console.print(t)
     else:
-        print(f"  RAM:       {ram} GB" if ram else "  RAM:       Unknown")
-        print(f"  CPU Cores: {cores}" if cores else "  CPU Cores: Unknown")
+        print(f"  RAM:       {ram_display}")
+        print(f"  CPU Cores: {cores or 'Unknown'}")
+        if cpu_name:
+            print(f"  CPU:       {cpu_name[:60]}")
+        print(f"  AVX2:      {avx2_display}")
         print(f"  GPU:       {gpu or 'Not detected'}")
 
-    suggestion = suggest_local_model(specs)
+    suggestion, note = suggest_local_model(specs)
     _print(f"\n  [bold]Recommended local model:[/bold] {suggestion}" if console else f"\n  Recommended local model: {suggestion}")
-    _print("  [dim]Note: Local model support coming in V2. API providers active now.[/dim]" if console else
-           "  Note: Local model support coming in V2. API providers active now.")
+    _print(f"  [dim]{note}[/dim]" if console else f"  {note}")
+    _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
+           "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
+    _print("  [dim]Local model support coming in V2. API providers active now.[/dim]" if console else
+           "  Local model support coming in V2. API providers active now.")
+
 
 def _step_default_provider() -> str:
     """[3/3] — Let the user pick their default provider."""
