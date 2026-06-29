@@ -1,6 +1,6 @@
 import anthropic
 from typing import Any, Dict, List, Optional
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall
+from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 from ..utils.config import get_env_or_raise
 
 class AnthropicProvider(BaseProvider):
@@ -33,7 +33,15 @@ class AnthropicProvider(BaseProvider):
         if converted_tools:
             kwargs["tools"] = converted_tools
 
-        response = self.client.messages.create(**kwargs)
+        try:
+            response = self.client.messages.create(**kwargs)
+        except anthropic.RateLimitError as e:
+            raise RateLimitError("Anthropic", str(e))
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in str(e) or "rate limit" in err_str or "quota" in err_str:
+                raise RateLimitError("Anthropic", str(e))
+            raise
 
         text = ""
         tool_calls = []
@@ -70,9 +78,17 @@ class AnthropicProvider(BaseProvider):
         if converted_tools:
             kwargs["tools"] = converted_tools
 
-        with self.client.messages.stream(**kwargs) as stream:
-            for text_chunk in stream.text_stream:
-                yield text_chunk
+        try:
+            with self.client.messages.stream(**kwargs) as stream:
+                for text_chunk in stream.text_stream:
+                    yield text_chunk
+        except anthropic.RateLimitError as e:
+            raise RateLimitError("Anthropic", str(e))
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in str(e) or "rate limit" in err_str or "quota" in err_str:
+                raise RateLimitError("Anthropic", str(e))
+            raise
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
         return {

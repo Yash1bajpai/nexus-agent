@@ -158,6 +158,54 @@ def execute_git_status() -> str:
     except Exception as e:
         return f"ERROR: Could not get git status: {str(e)}"
 
+def execute_git_diff() -> str:
+    """Return full git diff of staged changes (or HEAD diff if nothing staged)."""
+    try:
+        # Try staged diff first
+        staged = subprocess.run(["git", "diff", "--staged"], capture_output=True, text=True, check=False)
+        diff_text = staged.stdout.strip()
+
+        if not diff_text:
+            # Fallback: unstaged working-tree changes
+            unstaged = subprocess.run(["git", "diff", "HEAD"], capture_output=True, text=True, check=False)
+            diff_text = unstaged.stdout.strip()
+
+        if not diff_text:
+            return "No changes to commit. Working tree is clean and nothing is staged."
+
+        # Truncate very large diffs to avoid token overflow
+        lines = diff_text.split("\n")
+        if len(lines) > 500:
+            diff_text = "\n".join(lines[:500]) + f"\n\n[... diff truncated at 500 lines, {len(lines)} total ...]"
+
+        return diff_text
+    except Exception as e:
+        return f"ERROR: Could not read git diff: {str(e)}"
+
+def execute_git_commit(message: str) -> str:
+    """Run git commit with the given message. Stages all tracked changes first if nothing is staged."""
+    try:
+        if not message or not message.strip():
+            return "ERROR: Commit message cannot be empty."
+
+        # Check if anything is staged
+        staged_check = subprocess.run(["git", "diff", "--staged", "--name-only"],
+                                      capture_output=True, text=True, check=False)
+        if not staged_check.stdout.strip():
+            # Auto-stage tracked modified files
+            subprocess.run(["git", "add", "-u"], capture_output=True, check=False)
+
+        result = subprocess.run(
+            ["git", "commit", "-m", message.strip()],
+            capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            return f"Committed successfully:\n{result.stdout.strip()}"
+        else:
+            return f"ERROR: git commit failed:\n{result.stderr.strip() or result.stdout.strip()}"
+    except Exception as e:
+        return f"ERROR: Could not commit: {str(e)}"
+
 READ_FILE_TOOL = Tool(
     name="read_file",
     description="Read the contents of any file and return it as a string. Use this before answering any question about a specific file.",
@@ -256,6 +304,32 @@ GIT_STATUS_TOOL = Tool(
     execute=execute_git_status,
 )
 
+GIT_DIFF_TOOL = Tool(
+    name="git_diff",
+    description="Get the full git diff of staged changes (or working-tree changes if nothing is staged). Use before generating a commit message.",
+    input_schema={
+        "type": "object",
+        "properties": {},
+    },
+    execute=execute_git_diff,
+)
+
+GIT_COMMIT_TOOL = Tool(
+    name="git_commit",
+    description="Commit staged changes with a given message. Auto-stages tracked modified files if nothing is staged.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "The commit message to use.",
+            }
+        },
+        "required": ["message"],
+    },
+    execute=execute_git_commit,
+)
+
 def get_all_tools() -> List[Tool]:
     """Return all available tools."""
     return [
@@ -265,6 +339,8 @@ def get_all_tools() -> List[Tool]:
         RUN_CODE_TOOL,
         SEARCH_WEB_TOOL,
         GIT_STATUS_TOOL,
+        GIT_DIFF_TOOL,
+        GIT_COMMIT_TOOL,
     ]
 
 def execute_tool(name: str, args: Dict[str, Any]) -> str:

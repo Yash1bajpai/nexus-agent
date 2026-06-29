@@ -6,7 +6,7 @@
   ![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)
   ![CLI Framework](https://img.shields.io/badge/CLI-Typer%20%7C%20Rich-purple.svg)
   ![OpenAI Support](https://img.shields.io/badge/Model-OpenAI%20GPT--4o-green.svg)
-  ![Anthropic Support](https://img.shields.io/badge/Model-claude--3--5--sonnet--20241022-orange.svg)
+  ![Anthropic Support](https://img.shields.io/badge/Model-claude--sonnet--4--6-orange.svg)
   ![Gemini Support](https://img.shields.io/badge/Model-Gemini%202.5%20Flash-blue.svg)
   [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2.svg?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/yash-bajpai-b5a86332a/)
   ![License](https://img.shields.io/badge/License-MIT-teal.svg)
@@ -14,9 +14,7 @@
 
 ---
 
-<div align="center">
-  <img src="assets/demo.png" alt="DevMind CLI Demo" width="800" />
-</div>
+> **Demo GIF coming soon** — record with `asciinema rec demo.cast` and upload to [asciinema.org](https://asciinema.org)
 
 ---
 
@@ -37,18 +35,22 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **DevMind** is built for o
 | Feature | DevMind | Copilot CLI | Cursor | Aider |
 | :--- | :---: | :---: | :---: | :---: |
 | **Multi-Provider Support** (Claude, Gemini, OpenAI) | ✅ | ❌ | ❌ | ✅ |
+| **Auto-Provider Fallback** (rate limit resilient) | ✅ | ❌ | ❌ | ❌ |
 | **Autonomous Local Tool Execution** | ✅ | ❌ | ✅ | ✅ |
 | **Real-Time Token & Cost Tracking** | ✅ | ❌ | ❌ | ❌ |
 | **`@mention` File Context Injection** | ✅ | ❌ | ❌ | ❌ |
 | **Smart Project vs. Global Detection** | ✅ | ❌ | ❌ | ❌ |
+| **AI-Powered `agent commit`** | ✅ | ❌ | ❌ | ❌ |
 
 ---
 
 ## 🔥 Key Architectural Highlights
 
 - 🧠 **Autonomous ReAct Loop**: Implements multi-step cognitive reasoning (`Thought → Action → Observation → Repeat`), allowing the agent to solve complex multi-file engineering tasks independently (up to 10 autonomous tool iterations per query).
-- 🔌 **Universal Multi-Provider Backend**: Abstracted provider layer supporting seamless switching between industry-leading LLMs (`OpenAI GPT-4o`, `Anthropic claude-3-5-sonnet-20241022`, and `Google gemini-2.5-flash`).
-- 💰 **Real-Time Dynamic Cost Tracker**: Live token computation engine that calculates exact input/output token expenditure and monetary cost in real time per session—a standout capability for budget-conscious enterprise deployments.
+- 🔌 **Universal Multi-Provider Backend**: Abstracted provider layer supporting seamless switching between industry-leading LLMs (`OpenAI GPT-4o`, `Anthropic claude-sonnet-4-6`, and `Google gemini-2.5-flash`).
+- 🔄 **Auto-Provider Fallback**: `--provider auto` chains `gemini → anthropic → openai` and switches silently on rate limit or auth failure, with a clean `[WARN]` message.
+- 💰 **Real-Time Dynamic Cost Tracker**: Live token computation engine that calculates exact input/output token expenditure and monetary cost in real time per session.
+- 🚀 **First-Run Onboarding Wizard**: Auto-detects first launch, guides through API key setup, detects RAM/CPU/GPU specs, and suggests optimal local model for V2.
 - 🛠️ **Comprehensive Developer Toolset**:
   - `read_file`: Safely parses local file contents to prevent hallucinations.
   - `write_file`: Actively writes or overwrites code files with automatic directory creation.
@@ -56,7 +58,8 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **DevMind** is built for o
   - `run_code`: Executes arbitrary Python code inside isolated subprocesses with strict execution timeout enforcement (`CODE_EXECUTION_TIMEOUT = 10s`).
   - `search_web`: Queries live DuckDuckGo indexes for real-time API docs and error debugging.
   - `git_status`: Monitors uncommitted workspace changes and diff statistics.
-- 🎨 **Rich Syntax-Highlighted UI**: Beautiful terminal display powered by `Rich`, featuring markdown rendering and execution status badges (`[TOOL]`, `[OK]`).
+  - `git_diff` + `git_commit`: Reads full staged diff and commits — powering `agent commit`.
+- 🎨 **Rich Syntax-Highlighted UI**: Beautiful terminal display powered by `Rich`, featuring markdown rendering and ReAct trace badges (`[THINKING]`, `[ACTION]`, `[OBSERVE]`).
 - ⚡ **Streaming CLI Response**: Interactive streaming text output with `--no-stream` toggle support.
 
 ---
@@ -74,12 +77,14 @@ devmind/
     │   ├── memory.py            ← Sliding-window conversation buffer (max 20 turns)
     │   └── tools.py             ← Universal tool schema & execution handlers
     ├── cli/
-    │   ├── app.py               ← Typer CLI command definitions (`chat`, `repl`, `review`, `debug`, `generate`)
-    │   └── display.py           ← Rich terminal UI components & live cost tracking
+    │   ├── app.py               ← Typer CLI command definitions (chat, repl, review, debug, generate, commit)
+    │   ├── display.py           ← Rich terminal UI components & live cost tracking
+    │   └── onboarding.py        ← First-run wizard (API keys, system spec detection, provider setup)
     ├── providers/
-    │   ├── base.py              ← Abstract BaseProvider interface
+    │   ├── base.py              ← Abstract BaseProvider interface & RateLimitError
+    │   ├── fallback_provider.py ← Auto-fallback chain (gemini → anthropic → openai)
     │   ├── openai_provider.py   ← OpenAI backend implementation
-    │   ├── anthropic_provider.py ← Anthropic claude-3-5-sonnet-20241022 backend implementation
+    │   ├── anthropic_provider.py ← Anthropic claude-sonnet-4-6 backend implementation
     │   └── gemini_provider.py   ← Google gemini-2.5-flash backend implementation
     └── utils/
         └── config.py            ← Environment loader & dynamic token cost calculator
@@ -92,13 +97,15 @@ graph TD
     User["Developer Query"] --> Core["Agent ReAct Loop"]
     Core --> Provider["LLM Provider (OpenAI / Claude / Gemini)"]
     Provider -->|Tool Call Requested| Dispatcher["Tool Execution Dispatcher"]
+    Provider -->|Rate Limit| Fallback["FallbackProvider (auto-switch)"]
+    Fallback --> Provider
     
     subgraph Sandbox Tools
         Dispatcher --> RF["read_file / list_directory"]
         Dispatcher --> WF["write_file"]
         Dispatcher --> RC["run_code (Subprocess Timeout)"]
         Dispatcher --> WEB["search_web (DuckDuckGo)"]
-        Dispatcher --> GIT["git_status"]
+        Dispatcher --> GIT["git_status / git_diff / git_commit"]
     end
     
     RF --> Obs["Observation Buffer"]
@@ -135,11 +142,13 @@ cp .env.example .env
 
 Open `.env` and configure your keys:
 ```ini
-DEFAULT_PROVIDER=openai
-OPENAI_API_KEY=sk-proj-...
-ANTHROPIC_API_KEY=sk-ant-...
+DEFAULT_PROVIDER=gemini
 GEMINI_API_KEY=AIzaSy...
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-proj-...
 ```
+
+> **First run auto-wizard**: On the very first `agent` launch, an interactive onboarding wizard will guide you through key setup automatically.
 
 ### 3. Usage
 
@@ -150,34 +159,65 @@ Start a continuous pair-programming session directly by invoking `agent` or `dev
 agent
 # Or with flags: agent --provider anthropic
 # Or explicitly: devmind repl --provider gemini
+# Auto-fallback mode: agent --provider auto
 ```
 
 #### Single-Turn Coding (`chat`)
 Execute an instant autonomous coding task directly from your terminal:
 
 ```bash
-devmind chat "Create a python script fib.py that prints the first 10 Fibonacci numbers and run it to verify." --provider openai
+agent chat "Create a python script fib.py that prints the first 10 Fibonacci numbers and run it to verify." --provider openai
 ```
 
 #### Automated Code Review (`review`)
 Inspect local code files for bugs, security vulnerabilities, and clean coding practices:
 
 ```bash
-devmind review src/utils/config.py --provider gemini
+agent review src/utils/config.py --provider gemini
 ```
 
 #### Autonomous Error Debugging (`debug`)
 Feed error tracebacks directly into DevMind to diagnose root causes and write fixes:
 
 ```bash
-devmind debug src/app.py --error "AttributeError: 'NoneType' object has no attribute 'stream'"
+agent debug src/app.py --error "AttributeError: 'NoneType' object has no attribute 'stream'"
+# With verbose ReAct trace:
+agent debug src/app.py --error "KeyError: 'model'" --verbose
 ```
 
 #### Direct File Generation (`generate`)
 Generate complete code files autonomously and save them to your workspace:
 
 ```bash
-devmind generate "Create an async web scraper using aiohttp and BeautifulSoup" --output scraper.py
+agent generate "Create an async web scraper using aiohttp and BeautifulSoup" --output scraper.py
+# Specify provider explicitly:
+agent generate "Write a FastAPI CRUD app" --output api.py --provider gemini
+```
+
+#### AI Commit Message (`commit`)
+Reads your git diff, generates a meaningful conventional commit message, asks for confirmation, then commits:
+
+```bash
+agent commit
+# Skip confirmation prompt:
+agent commit --yes
+```
+
+#### Verbose ReAct Trace
+See the agent's full reasoning process — thinking, actions, and observations:
+
+```bash
+agent chat "Refactor utils.py to use dataclasses" --verbose
+```
+
+Output looks like:
+```
+[THINKING] I need to read the file first to understand the current structure
+[ACTION]   read_file(path="utils.py")
+[OBSERVE]  Done (0.1s) → class Config: | def load(): | ...
+[THINKING] Now I'll rewrite using dataclasses and write_file
+[ACTION]   write_file(path="utils.py", content="...")
+[OBSERVE]  Done (0.0s) → Successfully wrote 847 characters to utils.py
 ```
 
 ---
@@ -225,5 +265,5 @@ tests/test_ux_features.py::test_sqlite_memory PASSED                     [100%]
 ---
 
 <div align="center">
-  <p>Engineered by <a href="https://github.com/Yash1bajpai">Yash Bajpai</a></p>
+  <p>Engineered by <a href="https://github.com/Yash1bajpai">Yash Bajpai</a> · <a href="https://www.linkedin.com/in/yash-bajpai-b5a86332a/">LinkedIn</a></p>
 </div>

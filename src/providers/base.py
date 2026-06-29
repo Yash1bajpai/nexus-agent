@@ -2,6 +2,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+class RateLimitError(Exception):
+    """Raised when an LLM provider returns a 429 rate-limit response."""
+    def __init__(self, provider: str, message: str = "Rate limit exceeded"):
+        self.provider = provider
+        super().__init__(f"[{provider}] {message}")
+
 @dataclass
 class Tool:
     """Universal tool definition format."""

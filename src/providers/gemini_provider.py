@@ -3,7 +3,7 @@ from google import genai
 from google.genai import types
 from typing import Any, Dict, List
 # pyrefly: ignore [missing-import]
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall
+from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 # pyrefly: ignore [missing-import]
 from ..utils.config import get_env_or_raise
 
@@ -55,11 +55,17 @@ class GeminiProvider(BaseProvider):
         )
 
         gemini_contents = self._format_messages(messages)
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=gemini_contents,
-            config=config,
-        )
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=gemini_contents,
+                config=config,
+            )
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in str(e) or "resource_exhausted" in err_str or "rate limit" in err_str or "quota" in err_str:
+                raise RateLimitError("Gemini", str(e))
+            raise
 
         text = ""
         tool_calls = []
@@ -102,14 +108,20 @@ class GeminiProvider(BaseProvider):
             tools=genai_tools if genai_tools else None,
         )
         gemini_contents = self._format_messages(messages)
-        response_stream = self.client.models.generate_content_stream(
-            model=self.model,
-            contents=gemini_contents,
-            config=config,
-        )
-        for chunk in response_stream:
-            if hasattr(chunk, "text") and chunk.text:
-                yield chunk.text
+        try:
+            response_stream = self.client.models.generate_content_stream(
+                model=self.model,
+                contents=gemini_contents,
+                config=config,
+            )
+            for chunk in response_stream:
+                if hasattr(chunk, "text") and chunk.text:
+                    yield chunk.text
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in str(e) or "resource_exhausted" in err_str or "rate limit" in err_str or "quota" in err_str:
+                raise RateLimitError("Gemini", str(e))
+            raise
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
         return {

@@ -3,7 +3,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict
-from ..providers.base import BaseProvider
+from ..providers.base import BaseProvider, RateLimitError
 from .memory import ConversationMemory
 from .tools import get_all_tools, execute_tool
 from ..cli import display
@@ -93,7 +93,7 @@ class Agent:
 
     @property
     def estimated_cost(self) -> float:
-        model_name = getattr(self.provider, "model", "claude-3-5-sonnet-20241022")
+        model_name = getattr(self.provider, "model", "claude-sonnet-4-6")
         return estimate_cost(model_name, self.total_input_tokens, self.total_output_tokens)
 
     def run(self, user_input: str, stream: bool = False) -> str:
@@ -110,24 +110,44 @@ class Agent:
                 iteration += 1
                 display.update_status(status, "Thinking...")
 
-                response = self.provider.complete(
-                    messages=messages,
-                    tools=self.tools,
-                    system=self.system
-                )
+                try:
+                    response = self.provider.complete(
+                        messages=messages,
+                        tools=self.tools,
+                        system=self.system
+                    )
+                except RateLimitError as e:
+                    display.stop_status(status)
+                    status = None
+                    display.print_warn(f"{e.provider} rate limit hit. Switching to next provider...")
+                    raise
 
                 self.total_input_tokens += response.input_tokens
                 self.total_output_tokens += response.output_tokens
 
                 if response.has_tool_calls:
                     self.memory.add_raw(response.raw_assistant_message)
+
+                    # Show THINKING trace: the LLM's reasoning text before tool call
+                    if self.verbose and response.text:
+                        display.stop_status(status)
+                        status = None
+                        display.print_thinking(response.text)
+
                     for tool_call in response.tool_calls:
-                        args_str = ", ".join(f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}" for k, v in tool_call.args.items())
-                        if len(args_str) > 40:
-                            args_str = args_str[:37] + "..."
-                        display.update_status(status, f"Running tool: {tool_call.name}({args_str})...")
+                        # Build short status display (still abbreviated for spinner)
+                        args_preview = ", ".join(
+                            f'{k}="{v[:30]}..."' if isinstance(v, str) and len(v) > 30 else
+                            (f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}")
+                            for k, v in tool_call.args.items()
+                        )
+                        if status is None and self.verbose:
+                            status = display.create_status(f"Running: {tool_call.name}...")
+                        display.update_status(status, f"Running tool: {tool_call.name}({args_preview[:60]})...")
 
                         if self.verbose:
+                            display.stop_status(status)
+                            status = None
                             display.print_tool_call(tool_call.name, tool_call.args)
 
                         start = time.time()
@@ -135,11 +155,15 @@ class Agent:
                         duration = time.time() - start
 
                         if self.verbose:
-                            display.print_tool_result(result, duration)
+                            display.print_tool_result(result, duration, tool_call.name)
 
                         self.memory.add_raw(self.provider.format_tool_result_message(tool_call.id, result))
 
                     messages = self.memory.get()
+
+                    # Resume spinner for next iteration
+                    if self.verbose and status is None:
+                        status = display.create_status("Thinking...")
                 else:
                     display.stop_status(status)
                     status = None

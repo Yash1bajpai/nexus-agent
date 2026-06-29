@@ -1,7 +1,7 @@
 import json
 import openai
 from typing import Any, Dict, List, Optional
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall
+from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 from ..utils.config import get_env_or_raise
 
 class OpenAIProvider(BaseProvider):
@@ -44,7 +44,16 @@ class OpenAIProvider(BaseProvider):
         if converted_tools:
             kwargs["tools"] = converted_tools
 
-        response = self.client.chat.completions.create(**kwargs)
+        response = None
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except openai.RateLimitError as e:
+            raise RateLimitError("OpenAI", str(e))
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in str(e) or "rate limit" in err_str or "quota" in err_str:
+                raise RateLimitError("OpenAI", str(e))
+            raise
         choice = response.choices[0]
         msg = choice.message
 
@@ -110,10 +119,18 @@ class OpenAIProvider(BaseProvider):
         if converted_tools:
             kwargs["tools"] = converted_tools
 
-        response_stream = self.client.chat.completions.create(**kwargs)
-        for chunk in response_stream:
-            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+        try:
+            response_stream = self.client.chat.completions.create(**kwargs)
+            for chunk in response_stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        except openai.RateLimitError as e:
+            raise RateLimitError("OpenAI", str(e))
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in str(e) or "rate limit" in err_str or "quota" in err_str:
+                raise RateLimitError("OpenAI", str(e))
+            raise
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
         return {
