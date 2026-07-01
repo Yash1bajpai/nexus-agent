@@ -267,19 +267,27 @@ def commit(
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
         display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode="Commit Mode")
 
+        from ..agent.tools import execute_git_diff
+        diff_text = execute_git_diff()
+        if not diff_text or "No changes" in diff_text:
+            display.print_error("No staged or unstaged changes found to commit.")
+            raise typer.Exit(code=1)
+
         query = (
-            "Use the git_diff tool to read the current diff. "
-            "Then generate a single conventional commit message (format: type(scope): description). "
+            f"Here is the git diff:\n```\n{diff_text[:3000]}\n```\n\n"
+            "Generate ONE single line conventional commit message (format: type(scope): description). "
             "Keep it under 72 characters. "
-            "Reply with ONLY the commit message string - no explanation, no quotes, no markdown."
+            "Reply ONLY with the commit message line itself. Do NOT output JSON, do NOT output explanations or markdown."
         )
 
-        display.print_warn("Reading git diff and generating commit message...")
+        display.print_warn("Generating commit message...")
         start_time = time.time()
         commit_message = agent.run(query, stream=not no_stream)
         duration = time.time() - start_time
 
-        commit_message = commit_message.strip().strip('"').strip("'")
+        lines = [line.strip().strip('"').strip("'") for line in commit_message.splitlines() if line.strip()]
+        clean_lines = [l for l in lines if not l.startswith('{') and not l.startswith('```') and not l.startswith('#') and not l.startswith('Assuming') and not l.lower().startswith('response:')]
+        commit_message = clean_lines[0] if clean_lines else (lines[-1] if lines else "chore: update codebase")
 
         typer.echo(f"\n  Generated message: {commit_message}")
 

@@ -89,23 +89,29 @@ class OpenAIProvider(BaseProvider):
                     }
                 })
 
-        if not tool_calls and text.strip().startswith('{"name":') and '"arguments"' in text:
-            try:
-                import uuid
-                tc_data = json.loads(text.strip())
-                if "name" in tc_data and "arguments" in tc_data:
-                    args_val = tc_data["arguments"]
-                    parsed_args = args_val if isinstance(args_val, dict) else json.loads(args_val)
-                    tc_id = f"call_{uuid.uuid4().hex[:8]}"
-                    tool_calls.append(ToolCall(id=tc_id, name=tc_data["name"], args=parsed_args))
-                    raw_tool_calls.append({
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {"name": tc_data["name"], "arguments": json.dumps(parsed_args)}
-                    })
-                    text = ""
-            except Exception:
-                pass
+        if not tool_calls and '"name"' in text and '"arguments"' in text:
+            import re, uuid
+            matches = re.findall(r'(\{"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\})', text, re.DOTALL)
+            for m in matches:
+                try:
+                    tc_data = json.loads(m)
+                    if "name" in tc_data and "arguments" in tc_data:
+                        args_val = tc_data["arguments"]
+                        parsed_args = args_val if isinstance(args_val, dict) else (json.loads(args_val) if isinstance(args_val, str) else {})
+                        tc_id = f"call_{uuid.uuid4().hex[:8]}"
+                        tool_calls.append(ToolCall(id=tc_id, name=tc_data["name"], args=parsed_args))
+                        raw_tool_calls.append({
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {"name": tc_data["name"], "arguments": json.dumps(parsed_args)}
+                        })
+                        text = text.replace(m, "").strip()
+                except Exception:
+                    pass
+
+        if tool_calls and text:
+            import re
+            text = re.sub(r'\{"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}', '', text, flags=re.DOTALL).strip()
 
         raw_msg: Dict[str, Any] = {"role": "assistant"}
         if msg.content is not None:
