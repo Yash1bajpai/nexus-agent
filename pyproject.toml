@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "programmer-assistant"
+name = "nexus-agent"
 version = "2.2.1"
 description = "CLI coding agent with multi-provider LLM support and tool use"
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
+nexus-agent = "src.cli.app:app"
 agent = "src.cli.app:app"
 devmind = "src.cli.app:app"
 

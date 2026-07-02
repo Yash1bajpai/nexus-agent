@@ -19,7 +19,7 @@ from ..agent.memory import ConversationMemory
 from ..agent.core import Agent
 from . import display
 
-app = typer.Typer(help="DevMind - Autonomous AI Coding Agent")
+app = typer.Typer(help="Nexus-Agent - Autonomous AI Coding Agent")
 
 def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
     """
@@ -124,6 +124,24 @@ def repl(
                 if user_input.lower() in ["exit", "quit", "q"]:
                     typer.echo("Ending session. Goodbye!")
                     break
+
+                lower_input = user_input.lower()
+                if lower_input == "commit" or lower_input.startswith("commit "):
+                    try:
+                        commit(provider=provider, yes=False, verbose=verbose, no_stream=no_stream, max_iterations=max_iterations)
+                    except typer.Exit:
+                        pass
+                    continue
+                elif lower_input.startswith("chat "):
+                    user_input = user_input[5:].strip().strip('"').strip("'")
+                elif lower_input.startswith("review "):
+                    file_to_rev = user_input[7:].strip().strip('"').strip("'")
+                    user_input = f"Review the file '{file_to_rev}' using read_file tool. Provide comprehensive feedback on bugs, cleanliness, and security. DO NOT modify any files."
+                elif lower_input.startswith("debug "):
+                    parts = user_input[6:].strip().split("--error")
+                    file_to_dbg = parts[0].strip().strip('"').strip("'")
+                    err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
+                    user_input = f"Debug '{file_to_dbg}' given this error traceback:\n{err_msg}\nUse read_file to inspect it, explain the root cause, and use write_file to fix it."
 
                 start_time = time.time()
                 response_text = agent.run(user_input, stream=not no_stream)
@@ -320,7 +338,7 @@ def main(
     version: bool = typer.Option(False, "--version", help="Show version information.")
 ):
     if version:
-        typer.echo("DevMind CLI v2.2.1")
+        typer.echo("Nexus-Agent CLI v2.2.1")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
         # Run onboarding wizard on first launch
