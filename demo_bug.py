@@ -1,7 +1,11 @@
-﻿def calculate_average(numbers):
-    total = 0
-    for n in numbers:
-        total += n
-    return total / len(numbers)
+def calculate_average(numbers: list[float]) -> float:
+    """Return the average of a list of numbers.
+
+    Returns 0.0 for an empty list to avoid ZeroDivisionError.
+    """
+    if not numbers:
+        return 0.0
+    return sum(numbers) / len(numbers)
+
 
 print(calculate_average([]))
