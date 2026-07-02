@@ -136,12 +136,38 @@ def repl(
                     user_input = user_input[5:].strip().strip('"').strip("'")
                 elif lower_input.startswith("review "):
                     file_to_rev = user_input[7:].strip().strip('"').strip("'")
-                    user_input = f"Review the file '{file_to_rev}' using read_file tool. Provide comprehensive feedback on bugs, cleanliness, and security. DO NOT modify any files."
+                    # Pre-read the file ourselves so the model doesn't need a tool call
+                    try:
+                        import os as _os
+                        fpath = _os.path.join(_os.getcwd(), file_to_rev) if not _os.path.isabs(file_to_rev) else file_to_rev
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                            file_contents = _f.read()
+                        user_input = (
+                            f"Here is the content of '{file_to_rev}':\n\n```\n{file_contents}\n```\n\n"
+                            f"Please review this code. Identify bugs, bad practices, missing type hints, "
+                            f"missing docstrings, security issues, and suggest improvements. Be concise."
+                        )
+                    except FileNotFoundError:
+                        display.print_error(f"File not found: {file_to_rev}")
+                        continue
                 elif lower_input.startswith("debug "):
                     parts = user_input[6:].strip().split("--error")
                     file_to_dbg = parts[0].strip().strip('"').strip("'")
                     err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
-                    user_input = f"Debug '{file_to_dbg}' given this error traceback:\n{err_msg}\nUse read_file to inspect it, explain the root cause, and use write_file to fix it."
+                    # Pre-read the file ourselves so the model doesn't need a tool call
+                    try:
+                        import os as _os
+                        fpath = _os.path.join(_os.getcwd(), file_to_dbg) if not _os.path.isabs(file_to_dbg) else file_to_dbg
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                            file_contents = _f.read()
+                        user_input = (
+                            f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
+                            f"The user reports this error:\n{err_msg}\n\n"
+                            f"Identify the root cause and provide the fixed version of the code."
+                        )
+                    except FileNotFoundError:
+                        display.print_error(f"File not found: {file_to_dbg}")
+                        continue
 
                 start_time = time.time()
                 response_text = agent.run(user_input, stream=not no_stream)

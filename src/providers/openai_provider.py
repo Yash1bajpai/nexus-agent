@@ -149,10 +149,29 @@ class OpenAIProvider(BaseProvider):
             kwargs["tools"] = converted_tools
 
         try:
+            # Accumulate full response so we can apply JSON leakage stripping
+            # before yielding anything (critical for local models that leak tool JSON into text)
+            import re
+            full_text = ""
             response_stream = self.client.chat.completions.create(**kwargs)
             for chunk in response_stream:
                 if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                    full_text += chunk.choices[0].delta.content
+
+            # Strip any raw tool JSON blocks that leaked into the text
+            cleaned = re.sub(
+                r'\{[\s]*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}',
+                '',
+                full_text,
+                flags=re.DOTALL
+            ).strip()
+
+            # Also strip trailing comment lines that local models add after JSON
+            cleaned = re.sub(r'^\s*//.*$', '', cleaned, flags=re.MULTILINE).strip()
+
+            if cleaned:
+                yield cleaned
+
         except openai.RateLimitError as e:
             raise RateLimitError("OpenAI", str(e))
         except Exception as e:

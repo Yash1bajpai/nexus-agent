@@ -80,10 +80,10 @@ class Agent:
         if has_git or has_pyproject or has_package_json:
             project_name = os.path.basename(cwd) or "Unknown Project"
             self.mode_str = f"Project Mode ({project_name})"
-            mode_prompt = f"You are DevMind, currently working inside the project directory: {project_name}."
+            mode_prompt = f"You are Nexus-Agent, currently working inside the project directory: {project_name}."
         else:
             self.mode_str = "Global Mode"
-            mode_prompt = "You are DevMind, an expert coding agent running in a CLI terminal in Global Mode."
+            mode_prompt = "You are Nexus-Agent, an expert coding agent running in a CLI terminal in Global Mode."
 
         self.system = f"{mode_prompt}\nYou help developers write, debug, review, and understand code.\n\n{RULES_PROMPT}"
 
