@@ -341,7 +341,7 @@ def commit(
 
     # Quick pre-check: is this even a git repo?
     check = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check.returncode != 0:
         display.print_error("Not inside a git repository.")
         raise typer.Exit(code=1)

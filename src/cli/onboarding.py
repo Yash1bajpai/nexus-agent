@@ -98,7 +98,7 @@ def detect_system_specs() -> dict:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
         )
         if result.returncode == 0 and result.stdout.strip():
             lines = result.stdout.strip().split("\n")

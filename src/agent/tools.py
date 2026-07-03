@@ -159,6 +159,8 @@ def execute_run_code(code: str, language: str = "python") -> str:
             [sys.executable, temp_path],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=CODE_EXECUTION_TIMEOUT
         )
         try:
@@ -210,8 +212,8 @@ def execute_search_web(query: str) -> str:
 def execute_git_status() -> str:
     """Run git status and git diff stats to inspect repository state."""
     try:
-        status_res = subprocess.run(["git", "status", "--short"], capture_output=True, text=True, check=False)
-        diff_res = subprocess.run(["git", "diff", "--stat"], capture_output=True, text=True, check=False)
+        status_res = subprocess.run(["git", "status", "--short"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        diff_res = subprocess.run(["git", "diff", "--stat"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
 
         status_out = status_res.stdout.strip()
         diff_out = diff_res.stdout.strip()
@@ -233,12 +235,12 @@ def execute_git_diff() -> str:
     """Return full git diff of staged changes (or HEAD diff if nothing staged)."""
     try:
         # Try staged diff first
-        staged = subprocess.run(["git", "diff", "--staged"], capture_output=True, text=True, check=False)
+        staged = subprocess.run(["git", "diff", "--staged"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
         diff_text = staged.stdout.strip()
 
         if not diff_text:
             # Fallback: unstaged working-tree changes
-            unstaged = subprocess.run(["git", "diff", "HEAD"], capture_output=True, text=True, check=False)
+            unstaged = subprocess.run(["git", "diff", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
             diff_text = unstaged.stdout.strip()
 
         if not diff_text:
@@ -261,14 +263,14 @@ def execute_git_commit(message: str) -> str:
 
         # Check if anything is staged
         staged_check = subprocess.run(["git", "diff", "--staged", "--name-only"],
-                                      capture_output=True, text=True, check=False)
+                                      capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
         if not staged_check.stdout.strip():
             # Auto-stage tracked modified files
             subprocess.run(["git", "add", "-u"], capture_output=True, check=False)
 
         result = subprocess.run(
             ["git", "commit", "-m", message.strip()],
-            capture_output=True, text=True, check=False
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
         )
         if result.returncode == 0:
             return f"Committed successfully:\n{result.stdout.strip()}"
@@ -414,6 +416,8 @@ def execute_run_file(path: str) -> str:
             [sys.executable, str(p)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=CODE_EXECUTION_TIMEOUT,
         )
         out = res.stdout.strip()
