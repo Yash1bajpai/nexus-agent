@@ -107,7 +107,8 @@ class WebHandler(BaseHTTPRequestHandler):
                         self.send_json({"events": events, "status": "success"})
                         return
 
-                agent = Agent(provider=prov, memory=_memory, verbose=False, event_callback=on_event)
+                session_memory = ConversationMemory() if is_mock else _memory
+                agent = Agent(provider=prov, memory=session_memory, verbose=False, event_callback=on_event)
                 final_text = agent.run(processed_query, stream=False)
 
                 self.send_json({"events": events, "status": "success"})
