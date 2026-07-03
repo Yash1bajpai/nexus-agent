@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the DevMind project will be documented in this file.
+All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
@@ -21,7 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 - **Auto-Provider Fallback** (`src/providers/fallback_provider.py`): `FallbackProvider` chains `gemini → anthropic → openai` and silently switches on `RateLimitError` or missing API key, printing `[WARN]` instead of crashing.
-- **First-Run Onboarding Wizard** (`src/cli/onboarding.py`): Detects first launch via `~/.devmind_initialized`. Three-step setup: API key configuration, system spec detection (RAM/CPU via `psutil`, GPU via `nvidia-smi`), and default provider selection. Runs exactly once.
+- **First-Run Onboarding Wizard** (`src/cli/onboarding.py`): Detects first launch via `~/.nexus_agent_initialized`. Three-step setup: API key configuration, system spec detection (RAM/CPU via `psutil`, GPU via `nvidia-smi`), and default provider selection. Runs exactly once.
 - **`agent commit` command**: Reads `git diff`, generates a conventional commit message via LLM, prompts for confirmation, and commits. Supports `--yes` flag for CI/automation.
 - **`git_diff` and `git_commit` tools**: New tools powering the commit workflow.
 - **Verbose ReAct Trace**: `--verbose` now shows `[THINKING]` / `[ACTION]` / `[OBSERVE]` labels. `run_code` shows full syntax-highlighted code (Monokai, line numbers) and up to 15 lines of output.

@@ -21,7 +21,6 @@ dependencies = [
 [project.scripts]
 nexus-agent = "src.cli.app:app"
 agent = "src.cli.app:app"
-devmind = "src.cli.app:app"
 
 [tool.setuptools.packages.find]
 where = ["."]

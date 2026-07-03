@@ -4,7 +4,7 @@
 Accepted
 
 ## Context
-When building DevMind, an autonomous AI coding assistant for the terminal, we needed to make key architectural choices regarding how the agent interacts with LLMs, manages execution loops, executes tools locally, and handles multiple LLM vendors.
+When building Nexus-Agent, an autonomous AI coding assistant for the terminal, we needed to make key architectural choices regarding how the agent interacts with LLMs, manages execution loops, executes tools locally, and handles multiple LLM vendors.
 
 ## Decisions
 
@@ -14,7 +14,7 @@ We chose to implement a custom **ReAct (Reason + Act)** autonomous execution loo
 
 ### 2. Custom Provider Abstraction vs. LiteLLM / External Gateways
 We designed a lightweight, zero-dependency unified provider interface (`BaseProvider`, `Tool`, `ToolCall`, `ProviderResponse`) supporting Anthropic Claude, Google Gemini, and OpenAI models.
-- **Rationale**: Relying on heavy external wrappers or proxy gateways adds dependency overhead, hides token-level cost accounting, and creates potential points of failure. By implementing native adapters for official SDKs with lazy loading, DevMind maintains complete control over streaming formats, tool schema translation, and exact billing tracking without requiring users to install unused SDK dependencies.
+- **Rationale**: Relying on heavy external wrappers or proxy gateways adds dependency overhead, hides token-level cost accounting, and creates potential points of failure. By implementing native adapters for official SDKs with lazy loading, Nexus-Agent maintains complete control over streaming formats, tool schema translation, and exact billing tracking without requiring users to install unused SDK dependencies.
 
 ### 3. In-Memory Conversation Buffer vs. Heavy External Databases
 We adopted an in-memory conversation buffer (`ConversationMemory`) with configurable rolling truncation (`MAX_CONVERSATION_MESSAGES`).
