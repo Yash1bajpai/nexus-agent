@@ -16,8 +16,7 @@
 
 ## 🎬 Live Demo Recording
 
-<!-- Replace the link below with your copied video URL from GitHub -->
-(https://github.com/user-attachments/assets/73e78850-8669-40e9-aec3-3a355e975c1f)
+https://github.com/user-attachments/assets/73e78850-8669-40e9-aec3-3a355e975c1f
 
 ---
 
