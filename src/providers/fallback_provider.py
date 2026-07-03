@@ -7,6 +7,19 @@ def _make_gemini():
     from .gemini_provider import GeminiProvider
     return GeminiProvider()
 
+def _make_openrouter():
+    """OpenRouter free tier — Laguna M.1 free model (no per-minute rate limit)."""
+    import os
+    from .openai_provider import OpenAIProvider
+    or_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not or_key:
+        raise ConfigError("OPENROUTER_API_KEY not set in .env")
+    return OpenAIProvider(
+        model="poolside/laguna-m.1:free",
+        base_url="https://openrouter.ai/api/v1",
+        api_key=or_key,
+    )
+
 def _make_anthropic():
     from .anthropic_provider import AnthropicProvider
     return AnthropicProvider()
@@ -16,9 +29,10 @@ def _make_openai():
     return OpenAIProvider()
 
 FALLBACK_CHAIN = [
-    ("gemini", _make_gemini),
-    ("anthropic", _make_anthropic),
-    ("openai", _make_openai),
+    ("gemini",      _make_gemini),
+    ("openrouter",  _make_openrouter),   # ← free fallback, no per-minute limit
+    ("anthropic",   _make_anthropic),
+    ("openai",      _make_openai),
 ]
 
 class FallbackProvider(BaseProvider):

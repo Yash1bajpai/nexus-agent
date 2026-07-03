@@ -22,7 +22,15 @@ RULES_PROMPT = """RULES:
    respond in that same language.
 9. After every tool call, reason about the result before deciding next action.
 10. Never make up file contents, function signatures, or library APIs.
-11. Be direct. Skip unnecessary preamble."""
+11. Be direct. Skip unnecessary preamble.
+
+THINKING PROTOCOL (MANDATORY):
+Before making ANY tool call, you MUST first output at least one sentence of plain
+text explaining what you are about to do and why. This reasoning must appear as
+regular text BEFORE the tool call — never silent, never skipped.
+Good example: "I'll read the file first to understand its current structure."
+Bad example: [silent tool call with no prior text]
+This applies to every single tool call in every iteration."""
 
 def parse_at_mentions(user_input: str) -> str:
     """Detect @filename mentions, synchronously read files, attach context invisibly, and clean prompt."""
