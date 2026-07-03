@@ -1,6 +1,6 @@
 """
-DevMind Onboarding Wizard — runs once on first launch.
-Detects first run via ~/.devmind_initialized.
+Nexus-Agent Onboarding Wizard — runs once on first launch.
+Detects first run via ~/.nexus_agent_initialized.
 Covers: welcome banner, API key setup, system spec detection, default provider.
 """
 
@@ -30,7 +30,7 @@ except ImportError:
     _rich = False
 
 console = Console() if _rich else None
-INIT_FILE = Path.home() / ".devmind_initialized"
+INIT_FILE = Path.home() / ".nexus_agent_initialized"
 ENV_FILE = Path(__file__).resolve().parent.parent.parent.parent / ".env"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ def suggest_local_model(specs: dict) -> tuple[str, str]:
 def _show_welcome():
     if console:
         panel = Panel(
-            "[bold white]Welcome to DevMind[/bold white]\n"
+            "[bold white]Welcome to Nexus-Agent[/bold white]\n"
             "[dim]Autonomous AI Coding Agent[/dim]\n\n"
             "  Built by [cyan]Yash Bajpai[/cyan]\n"
             "  [dim]github.com/Yash1bajpai[/dim]\n"
@@ -169,7 +169,7 @@ def _show_welcome():
         console.print()
     else:
         print("\n+--------------------------------------+")
-        print("|         Welcome to DevMind           |")
+        print("|        Welcome to Nexus-Agent        |")
         print("|  Built by Yash Bajpai                |")
         print("|  github.com/Yash1bajpai              |")
         print("|  linkedin.com/in/yash-bajpai-b5a86332a |")
@@ -308,10 +308,10 @@ def run_if_first_time():
 
     # Mark as initialized
     try:
-        INIT_FILE.write_text("DevMind initialized.\n", encoding="utf-8")
+        INIT_FILE.write_text("Nexus-Agent initialized.\n", encoding="utf-8")
     except Exception:
         pass
 
     _print()
-    _print("[bold green][OK] Setup complete! Starting DevMind...[/bold green]\n" if console else
-           "\n[OK] Setup complete! Starting DevMind...\n")
+    _print("[bold green][OK] Setup complete! Starting Nexus-Agent...[/bold green]\n" if console else
+           "\n[OK] Setup complete! Starting Nexus-Agent...\n")

@@ -5,11 +5,11 @@ from typing import Any, Dict, List
 from ..utils.config import MAX_CONVERSATION_MESSAGES
 
 class SQLiteMemory:
-    """Persistent SQLite-backed conversation buffer for DevMind sessions."""
+    """Persistent SQLite-backed conversation buffer for Nexus-Agent sessions."""
 
     def __init__(self, db_path: Path = None, session_id: str = "default", max_messages: int = MAX_CONVERSATION_MESSAGES):
         if db_path is None:
-            home_dir = Path.home() / ".devmind"
+            home_dir = Path.home() / ".nexus-agent"
             home_dir.mkdir(parents=True, exist_ok=True)
             db_path = home_dir / "history.db"
         self.db_path = db_path

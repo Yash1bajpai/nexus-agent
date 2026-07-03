@@ -16,12 +16,8 @@
 
 ## 🎬 Live Demo Recording
 
-> **Watch Nexus-Agent execute autonomous ReAct loops:**
-> To attach your video directly to this README: Drag and drop your `.mp4` video file into any comment box on a GitHub Issue inside this repo. Copy the generated `https://github.com/user-attachments/assets/...` URL and paste it below!
-
-```html
-<video src="https://github.com/user-attachments/assets/YOUR_VIDEO_ID_HERE" controls="controls" style="max-width: 100%; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);"></video>
-```
+<!-- Replace the link below with your copied video URL from GitHub -->
+https://github.com/user-attachments/assets/YOUR_VIDEO_ID_HERE
 
 ---
 
@@ -134,8 +130,8 @@ graph TD
 Clone the repository and install the editable package locally:
 
 ```bash
-git clone https://github.com/Yash1bajpai/devmind.git
-cd devmind
+git clone https://github.com/Yash1bajpai/nexus-agent.git
+cd nexus-agent
 pip install -e .
 ```
 
