@@ -70,12 +70,13 @@ def parse_at_mentions(user_input: str) -> str:
 class Agent:
     """Core autonomous coding agent implementing the ReAct tool-use loop."""
 
-    def __init__(self, provider: BaseProvider, memory: ConversationMemory, max_iterations: int = 10, verbose: bool = True, tools: Optional[list] = None):
+    def __init__(self, provider: BaseProvider, memory: ConversationMemory, max_iterations: int = 10, verbose: bool = True, tools: Optional[list] = None, event_callback: Optional[Any] = None):
         self.provider = provider
         self.memory = memory
         self.tools = tools if tools is not None else get_all_tools()
         self.max_iterations = max_iterations
         self.verbose = verbose
+        self.event_callback = event_callback
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
@@ -137,10 +138,13 @@ class Agent:
                     self.memory.add_raw(response.raw_assistant_message)
 
                     # Show THINKING trace: the LLM's reasoning text before tool call
-                    if self.verbose and response.text:
-                        display.stop_status(status)
-                        status = None
-                        display.print_thinking(response.text)
+                    if response.text:
+                        if self.event_callback:
+                            self.event_callback({"type": "thinking", "content": response.text})
+                        if self.verbose:
+                            display.stop_status(status)
+                            status = None
+                            display.print_thinking(response.text)
 
                     for tool_call in response.tool_calls:
                         # Build short status display (still abbreviated for spinner)
@@ -153,6 +157,9 @@ class Agent:
                             status = display.create_status(f"Running: {tool_call.name}...")
                         display.update_status(status, f"Running tool: {tool_call.name}({args_preview[:60]})...")
 
+                        if self.event_callback:
+                            self.event_callback({"type": "action", "name": tool_call.name, "args": tool_call.args})
+
                         if self.verbose:
                             display.stop_status(status)
                             status = None
@@ -161,6 +168,9 @@ class Agent:
                         start = time.time()
                         result = execute_tool(tool_call.name, tool_call.args)
                         duration = time.time() - start
+
+                        if self.event_callback:
+                            self.event_callback({"type": "observe", "name": tool_call.name, "duration": round(duration, 2), "result": str(result)})
 
                         if self.verbose:
                             display.print_tool_result(result, duration, tool_call.name)
@@ -176,6 +186,8 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     final_text = response.text
+                    if self.event_callback:
+                        self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
                     if stream:
                         display.print_response(final_text)
                     self.memory.add("assistant", final_text)

@@ -399,6 +399,15 @@ def commit(
         display.print_error(f"Commit failed: {str(e)}")
         raise typer.Exit(code=1)
 
+@app.command()
+def web(
+    port: int = typer.Option(8000, "--port", "-p", help="Port to run the web dashboard on."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface to bind."),
+):
+    """Launch the Nexus-Agent interactive Web UI Dashboard."""
+    from .web import run_web_server
+    run_web_server(port=port, host=host)
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -414,7 +423,7 @@ def main(
             run_if_first_time()
         except Exception:
             pass  # Never block startup on onboarding errors
-        repl(provider=DEFAULT_PROVIDER, verbose=False, no_stream=False, max_iterations=10)
+        repl(provider=DEFAULT_PROVIDER, verbose=True, no_stream=True, max_iterations=10)
 
 if __name__ == "__main__":
     app()
