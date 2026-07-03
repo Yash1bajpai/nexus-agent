@@ -1,4 +1,4 @@
-# ⚡ DevMind: Autonomous Agentic AI Coding Assistant
+# ⚡ Nexus-Agent: Autonomous Agentic AI Coding Assistant
 
 <div align="center">
   <p><strong>A production-grade, terminal-first AI Software Engineering Companion powered by autonomous ReAct tool loops and multi-provider backend switching.</strong></p>
@@ -14,25 +14,32 @@
 
 ---
 
-> **Demo GIF coming soon** — record with `asciinema rec demo.cast` and upload to [asciinema.org](https://asciinema.org)
+## 🎬 Live Demo Recording
+
+> **Watch Nexus-Agent execute autonomous ReAct loops:**
+> To attach your video directly to this README: Drag and drop your `.mp4` video file into any comment box on a GitHub Issue inside this repo. Copy the generated `https://github.com/user-attachments/assets/...` URL and paste it below!
+
+```html
+<video src="https://github.com/user-attachments/assets/YOUR_VIDEO_ID_HERE" controls="controls" style="max-width: 100%; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);"></video>
+```
 
 ---
 
 ## 🌟 Overview
 
-**DevMind** is an autonomous command-line coding agent designed to pair-program with developers directly inside their local workspace. Built from the ground up to showcase modern **Agentic AI Engineering** principles, DevMind doesn't just generate text—it autonomously inspects files, modifies codebases, executes scripts inside secure local sandboxes, searches live web documentation, and inspects Git repositories.
+**Nexus-Agent** is an autonomous command-line coding agent designed to pair-program with developers directly inside their local workspace. Built from the ground up to showcase modern **Agentic AI Engineering** principles, Nexus-Agent doesn't just generate text—it autonomously inspects files, modifies codebases, executes scripts inside secure local sandboxes, searches live web documentation, and inspects Git repositories.
 
-Built with a clean **ReAct (Reasoning + Acting)** cognitive architecture, DevMind reasons step-by-step after every tool execution before deciding its next move.
+Built with a clean **ReAct (Reasoning + Acting)** cognitive architecture, Nexus-Agent reasons step-by-step after every tool execution before deciding its next move.
 
 ---
 
-## ❓ Why DevMind?
+## ❓ Why Nexus-Agent?
 
-Unlike cloud-dependent tools like GitHub Copilot CLI, **DevMind** is built for offline-capable, cost-zero local execution. V2 will integrate a custom-trained 124M parameter LLM as the local backend — enabling completely private, zero-latency execution with no external API key required.
+Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built for offline-capable, cost-zero local execution. V2 will integrate a custom-trained 124M parameter LLM as the local backend — enabling completely private, zero-latency execution with no external API key required.
 
-### 📊 How DevMind Compares
+### 📊 How Nexus-Agent Compares
 
-| Feature | DevMind | Copilot CLI | Cursor | Aider |
+| Feature | Nexus-Agent | Copilot CLI | Cursor | Aider |
 | :--- | :---: | :---: | :---: | :---: |
 | **Multi-Provider Support** (Claude, Gemini, OpenAI) | ✅ | ❌ | ❌ | ✅ |
 | **Auto-Provider Fallback** (rate limit resilient) | ✅ | ❌ | ❌ | ❌ |
@@ -58,7 +65,7 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **DevMind** is built for o
   - `run_code`: Executes arbitrary Python code inside isolated subprocesses with strict execution timeout enforcement (`CODE_EXECUTION_TIMEOUT = 10s`).
   - `search_web`: Queries live DuckDuckGo indexes for real-time API docs and error debugging.
   - `git_status`: Monitors uncommitted workspace changes and diff statistics.
-  - `git_diff` + `git_commit`: Reads full staged diff and commits — powering `agent commit`.
+  - `git_diff` + `git_commit`: Reads full staged diff and commits — powering `nexus-agent commit`.
 - 🎨 **Rich Syntax-Highlighted UI**: Beautiful terminal display powered by `Rich`, featuring markdown rendering and ReAct trace badges (`[THINKING]`, `[ACTION]`, `[OBSERVE]`).
 - ⚡ **Streaming CLI Response**: Interactive streaming text output with `--no-stream` toggle support.
 
@@ -67,8 +74,8 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **DevMind** is built for o
 ## 🏗️ System Architecture
 
 ```
-devmind/
-├── pyproject.toml               ← Package metadata & Typer binary entry point (`agent` / `devmind`)
+nexus-agent/
+├── pyproject.toml               ← Package metadata & Typer binary entry point (`nexus-agent` / `agent`)
 ├── requirements.txt             ← Core dependencies (Typer, Rich, OpenAI, Anthropic, Gemini, DDGS)
 ├── .env.example                 ← Environment variable configuration template
 └── src/
@@ -148,66 +155,63 @@ ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-proj-...
 ```
 
-> **First run auto-wizard**: On the very first `agent` launch, an interactive onboarding wizard will guide you through key setup automatically.
+> **First run auto-wizard**: On the very first `nexus-agent` launch, an interactive onboarding wizard will guide you through key setup automatically.
 
 ### 3. Usage
 
 #### Interactive Multi-Turn REPL Mode (Default)
-Start a continuous pair-programming session directly by invoking `agent` or `devmind` without any subcommands:
+Start a continuous pair-programming session directly by invoking `nexus-agent` (or `agent`) without any subcommands:
 
 ```bash
-agent
-# Or with flags: agent --provider anthropic
-# Or explicitly: devmind repl --provider gemini
-# Auto-fallback mode: agent --provider auto
+nexus-agent
+# Or with flags: nexus-agent --provider anthropic
+# Auto-fallback mode: nexus-agent --provider auto
 ```
 
 #### Single-Turn Coding (`chat`)
 Execute an instant autonomous coding task directly from your terminal:
 
 ```bash
-agent chat "Create a python script fib.py that prints the first 10 Fibonacci numbers and run it to verify." --provider openai
+nexus-agent chat "Create a python script fib.py that prints the first 10 Fibonacci numbers and run it to verify." --provider openai
 ```
 
 #### Automated Code Review (`review`)
 Inspect local code files for bugs, security vulnerabilities, and clean coding practices:
 
 ```bash
-agent review src/utils/config.py --provider gemini
+nexus-agent review src/utils/config.py --provider gemini
 ```
 
 #### Autonomous Error Debugging (`debug`)
-Feed error tracebacks directly into DevMind to diagnose root causes and write fixes:
+Feed error tracebacks directly into Nexus-Agent to diagnose root causes and write fixes:
 
 ```bash
-agent debug src/app.py --error "AttributeError: 'NoneType' object has no attribute 'stream'"
+nexus-agent debug src/app.py --error "AttributeError: 'NoneType' object has no attribute 'stream'"
 # With verbose ReAct trace:
-agent debug src/app.py --error "KeyError: 'model'" --verbose
+nexus-agent debug src/app.py --error "KeyError: 'model'" --verbose
 ```
 
 #### Direct File Generation (`generate`)
 Generate complete code files autonomously and save them to your workspace:
 
 ```bash
-agent generate "Create an async web scraper using aiohttp and BeautifulSoup" --output scraper.py
-# Specify provider explicitly:
-agent generate "Write a FastAPI CRUD app" --output api.py --provider gemini
+nexus-agent generate "Create an async web scraper using aiohttp and BeautifulSoup" --output scraper.py
 ```
 
 #### AI Commit Message (`commit`)
 Reads your git diff, generates a meaningful conventional commit message, asks for confirmation, then commits:
 
 ```bash
-agent commit
+nexus-agent commit
 # Skip confirmation prompt:
-agent commit --yes
+nexus-agent commit --yes
 ```
 
 #### Verbose ReAct Trace
 See the agent's full reasoning process — thinking, actions, and observations:
 
 ```bash
-agent chat "Refactor utils.py to use dataclasses" --verbose
+nexus-agent chat "Refactor utils.py to use dataclasses" --verbose
 ```
 
 Output looks like:
@@ -224,7 +228,7 @@ Output looks like:
 
 ## 🧪 Testing & Verification
 
-DevMind maintains a **100% passing unit test suite** covering all tool dispatchers, filesystem handlers, UX features, and subprocess safety boundaries:
+Nexus-Agent maintains a **100% passing unit test suite** covering all tool dispatchers, filesystem handlers, UX features, and subprocess safety boundaries:
 
 ```bash
 pytest tests/ -v
@@ -232,27 +236,27 @@ pytest tests/ -v
 
 ```text
 ============================= test session starts =============================
-collecting ... collected 17 items
+collecting ... collected 19 items
 
 tests/test_providers.py::test_anthropic_provider_schema PASSED           [  5%]
-tests/test_providers.py::test_openai_provider_schema PASSED              [ 11%]
-tests/test_providers.py::test_gemini_provider_schema PASSED              [ 17%]
-tests/test_providers.py::test_provider_tool_result_format PASSED         [ 23%]
-tests/test_tools.py::test_read_file_success PASSED                       [ 29%]
-tests/test_tools.py::test_read_file_not_found PASSED                     [ 35%]
-tests/test_tools.py::test_list_directory_success PASSED                  [ 41%]
-tests/test_tools.py::test_list_directory_not_found PASSED                [ 47%]
-tests/test_tools.py::test_search_web PASSED                              [ 52%]
-tests/test_tools.py::test_write_file_success PASSED                      [ 58%]
-tests/test_tools.py::test_run_code_success PASSED                        [ 64%]
-tests/test_tools.py::test_git_status_tool PASSED                         [ 70%]
-tests/test_tools.py::test_execute_tool_dispatcher PASSED                 [ 76%]
-tests/test_ux_features.py::test_parse_at_mentions PASSED                 [ 82%]
-tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 88%]
-tests/test_ux_features.py::test_status_spinner_helpers PASSED            [ 94%]
-tests/test_ux_features.py::test_sqlite_memory PASSED                     [100%]
+tests/test_providers.py::test_openai_provider_schema PASSED              [ 10%]
+tests/test_providers.py::test_gemini_provider_schema PASSED              [ 15%]
+tests/test_providers.py::test_provider_tool_result_format PASSED         [ 21%]
+tests/test_tools.py::test_read_file_success PASSED                       [ 26%]
+tests/test_tools.py::test_read_file_not_found PASSED                     [ 31%]
+tests/test_tools.py::test_list_directory_success PASSED                  [ 36%]
+tests/test_tools.py::test_list_directory_not_found PASSED                [ 42%]
+tests/test_tools.py::test_search_web PASSED                              [ 47%]
+tests/test_tools.py::test_write_file_success PASSED                      [ 52%]
+tests/test_tools.py::test_run_code_success PASSED                        [ 57%]
+tests/test_tools.py::test_git_status_tool PASSED                         [ 63%]
+tests/test_tools.py::test_execute_tool_dispatcher PASSED                 [ 68%]
+tests/test_ux_features.py::test_parse_at_mentions PASSED                 [ 73%]
+tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 78%]
+tests/test_ux_features.py::test_status_spinner_helpers PASSED            [ 84%]
+tests/test_ux_features.py::test_sqlite_memory PASSED                     [ 89%]
 
-============================= 17 passed in 4.16s ==============================
+============================= 19 passed in 4.28s ==============================
 ```
 
 ---
