@@ -17,7 +17,7 @@
 ## 🎬 Live Demo Recording
 
 <!-- Replace the link below with your copied video URL from GitHub -->
-https://github.com/user-attachments/assets/YOUR_VIDEO_ID_HERE
+[https://github.com/user-attachments/assets/YOUR_VIDEO_ID_HERE](https://github.com/user-attachments/assets/cde20cad-dcc3-400f-b395-370a9ca21e03)
 
 ---
 
