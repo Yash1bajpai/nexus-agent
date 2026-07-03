@@ -19,7 +19,21 @@ from ..agent.memory import ConversationMemory
 from ..agent.core import Agent
 from . import display
 
-app = typer.Typer(help="Nexus-Agent - Autonomous AI Coding Agent")
+app = typer.Typer(
+    help="Nexus-Agent - Autonomous AI Coding Agent",
+    invoke_without_command=True,
+)
+
+@app.callback()
+def main_callback(ctx: typer.Context):
+    """Nexus-Agent — Autonomous AI Coding Agent.
+
+    Run without a subcommand to launch the interactive REPL session.
+    """
+    if ctx.invoked_subcommand is None:
+        # No subcommand → launch REPL with verbose ON by default
+        ctx.invoke(repl)
+
 
 def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
     """
@@ -110,8 +124,8 @@ def chat(
 @app.command()
 def repl(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (gemini/anthropic/openai/auto)."),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
-    no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
+    verbose: bool = typer.Option(True, "--verbose/--no-verbose", "-v", help="Show verbose ReAct tool trace (default: ON)."),
+    no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (default: OFF for REPL)."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
     """Start an interactive multi-turn REPL chat session."""
@@ -141,6 +155,10 @@ def repl(
                     break
 
                 lower_input = user_input.lower()
+                # Detect if we're using MockProvider (shows scripted tool traces)
+                from ..providers.mock_provider import MockProvider
+                _is_mock = isinstance(prov, MockProvider)
+
                 if lower_input == "commit" or lower_input.startswith("commit "):
                     try:
                         commit(provider=provider, yes=False, verbose=verbose, no_stream=no_stream, max_iterations=max_iterations)
@@ -151,38 +169,46 @@ def repl(
                     user_input = user_input[5:].strip().strip('"').strip("'")
                 elif lower_input.startswith("review "):
                     file_to_rev = user_input[7:].strip().strip('"').strip("'")
-                    # Pre-read the file ourselves so the model doesn't need a tool call
-                    try:
-                        import os as _os
-                        fpath = _os.path.join(_os.getcwd(), file_to_rev) if not _os.path.isabs(file_to_rev) else file_to_rev
-                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
-                            file_contents = _f.read()
-                        user_input = (
-                            f"Here is the content of '{file_to_rev}':\n\n```\n{file_contents}\n```\n\n"
-                            f"Please review this code. Identify bugs, bad practices, missing type hints, "
-                            f"missing docstrings, security issues, and suggest improvements. Be concise."
-                        )
-                    except FileNotFoundError:
-                        display.print_error(f"File not found: {file_to_rev}")
-                        continue
+                    if _is_mock:
+                        # Mock provider: pass filename — it shows scripted THINKING→ACTION→OBSERVE
+                        user_input = f"Review {file_to_rev} and tell me if it's good code"
+                    else:
+                        # Real provider: pre-read file to avoid tool-call JSON leakage
+                        try:
+                            import os as _os
+                            fpath = _os.path.join(_os.getcwd(), file_to_rev) if not _os.path.isabs(file_to_rev) else file_to_rev
+                            with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                                file_contents = _f.read()
+                            user_input = (
+                                f"Here is the content of '{file_to_rev}':\n\n```\n{file_contents}\n```\n\n"
+                                f"Please review this code. Identify bugs, bad practices, missing type hints, "
+                                f"missing docstrings, security issues, and suggest improvements. Be concise."
+                            )
+                        except FileNotFoundError:
+                            display.print_error(f"File not found: {file_to_rev}")
+                            continue
                 elif lower_input.startswith("debug "):
                     parts = user_input[6:].strip().split("--error")
                     file_to_dbg = parts[0].strip().strip('"').strip("'")
                     err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
-                    # Pre-read the file ourselves so the model doesn't need a tool call
-                    try:
-                        import os as _os
-                        fpath = _os.path.join(_os.getcwd(), file_to_dbg) if not _os.path.isabs(file_to_dbg) else file_to_dbg
-                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
-                            file_contents = _f.read()
-                        user_input = (
-                            f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
-                            f"The user reports this error:\n{err_msg}\n\n"
-                            f"Identify the root cause and provide the fixed version of the code."
-                        )
-                    except FileNotFoundError:
-                        display.print_error(f"File not found: {file_to_dbg}")
-                        continue
+                    if _is_mock:
+                        # Mock provider: pass filename + error — shows scripted tool trace
+                        user_input = f"Debug {file_to_dbg} --error {err_msg}"
+                    else:
+                        # Real provider: pre-read file to avoid tool-call JSON leakage
+                        try:
+                            import os as _os
+                            fpath = _os.path.join(_os.getcwd(), file_to_dbg) if not _os.path.isabs(file_to_dbg) else file_to_dbg
+                            with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                                file_contents = _f.read()
+                            user_input = (
+                                f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
+                                f"The user reports this error:\n{err_msg}\n\n"
+                                f"Identify the root cause and provide the fixed version of the code."
+                            )
+                        except FileNotFoundError:
+                            display.print_error(f"File not found: {file_to_dbg}")
+                            continue
 
                 start_time = time.time()
                 response_text = agent.run(user_input, stream=not no_stream)
