@@ -1,0 +1,10 @@
+include README.md
+include CHANGELOG.md
+include pyproject.toml
+include requirements.txt
+recursive-include src *
+prune venv
+prune tests
+prune docs
+prune .git
+prune .github

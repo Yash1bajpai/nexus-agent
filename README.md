@@ -126,9 +126,9 @@ graph TD
 
 ### 1. Installation
 
-Install directly via `pip` from GitHub:
+Install officially via PyPI:
 ```bash
-pip install git+https://github.com/Yash1bajpai/nexus-agent.git
+pip install nexus-agent-ai
 ```
 
 Or clone for local development:
