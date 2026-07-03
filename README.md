@@ -126,8 +126,12 @@ graph TD
 
 ### 1. Installation
 
-Clone the repository and install the editable package locally:
+Install directly via `pip` from GitHub:
+```bash
+pip install git+https://github.com/Yash1bajpai/nexus-agent.git
+```
 
+Or clone for local development:
 ```bash
 git clone https://github.com/Yash1bajpai/nexus-agent.git
 cd nexus-agent
