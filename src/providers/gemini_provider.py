@@ -10,7 +10,7 @@ from ..utils.config import get_env_or_raise
 class GeminiProvider(BaseProvider):
     """LLM Provider implementation for Google Gemini models via google-genai SDK."""
 
-    def __init__(self, model: str = "gemini-2.5-flash"):
+    def __init__(self, model: str = "gemini-2.5-flash-lite"):
         api_key = get_env_or_raise("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key)
         self.model = model
@@ -71,8 +71,12 @@ class GeminiProvider(BaseProvider):
         tool_calls = []
 
         candidate = response.candidates[0]
+        parts = None
         if candidate.content and candidate.content.parts:
-            for part in candidate.content.parts:
+            parts = candidate.content.parts
+
+        if parts:
+            for part in parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
                 if hasattr(part, "function_call") and part.function_call:
@@ -85,13 +89,22 @@ class GeminiProvider(BaseProvider):
                         )
                     )
 
+        # Fallback: some Gemini Lite responses put text directly on response.text
+        if not text and not tool_calls:
+            try:
+                fallback = response.text
+                if fallback:
+                    text = fallback
+            except Exception:
+                pass
+
         raw_msg = candidate.content
 
         in_tokens = 0
         out_tokens = 0
         if hasattr(response, "usage_metadata") and response.usage_metadata:
-            in_tokens = getattr(response.usage_metadata, "prompt_token_count", 0)
-            out_tokens = getattr(response.usage_metadata, "candidates_token_count", 0)
+            in_tokens = int(getattr(response.usage_metadata, "prompt_token_count", 0) or 0)
+            out_tokens = int(getattr(response.usage_metadata, "candidates_token_count", 0) or 0)
 
         return ProviderResponse(
             text=text,

@@ -7,10 +7,12 @@ from ..utils.config import get_env_or_raise
 class OpenAIProvider(BaseProvider):
     """LLM Provider implementation for OpenAI GPT models and local OpenAI-compatible servers (Ollama/LM Studio)."""
 
-    def __init__(self, model: str = "gpt-4o-mini", base_url: Optional[str] = None):
+    def __init__(self, model: str = "gpt-4o-mini", base_url: Optional[str] = None, api_key: Optional[str] = None):
         import os
         base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("OLLAMA_HOST")
-        if base_url:
+        if api_key:
+            pass  # use the provided key directly
+        elif base_url:
             api_key = os.getenv("OPENAI_API_KEY", "ollama")
         else:
             api_key = get_env_or_raise("OPENAI_API_KEY")
