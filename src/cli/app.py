@@ -56,12 +56,17 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
     elif name_clean in ["openai", "gpt", "gpt-4o"]:
         from ..providers.openai_provider import OpenAIProvider
         return OpenAIProvider(), "openai"
-    elif name_clean in ["ollama", "local"]:
+    elif name_clean in ["local", "qwen", "awq", "default", "mock", "demo"]:
+        from ..providers.local_provider import LocalQwenProvider
+        prov = LocalQwenProvider()
+        prov.setup_model()
+        return prov, "Qwen 2.5 (7B-AWQ Local)"
+    elif name_clean in ["ollama"]:
         import os
         from ..providers.openai_provider import OpenAIProvider
         base_url = os.getenv("OLLAMA_HOST", "http://localhost:11434/v1")
         local_model = os.getenv("LOCAL_MODEL", "qwen2.5-coder:7b")
-        return OpenAIProvider(model=local_model, base_url=base_url), f"local ({local_model})"
+        return OpenAIProvider(model=local_model, base_url=base_url), f"ollama ({local_model})"
     elif name_clean in ["openrouter", "laguna", "free"]:
         import os
         from ..providers.openai_provider import OpenAIProvider
@@ -73,18 +78,17 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
             base_url="https://openrouter.ai/api/v1",
             api_key=or_key,
         ), "OpenRouter (laguna-m.1:free)"
-    elif name_clean in ["mock", "demo"]:
-        from ..providers.mock_provider import MockProvider
-        return MockProvider(), "Demo (mock)"
     elif name_clean == "auto":
         from ..providers.fallback_provider import FallbackProvider
         fb = FallbackProvider(start_provider=DEFAULT_PROVIDER)
         fb._warn_fn = display.print_fallback_switch
         return fb, f"auto ({fb._current_name})"
     else:
-        display.print_warn(f"Unknown provider '{provider_name}'. Using Anthropic fallback.")
-        from ..providers.anthropic_provider import AnthropicProvider
-        return AnthropicProvider(), "anthropic"
+        display.print_warn(f"Unknown provider '{provider_name}'. Using Local Qwen fallback.")
+        from ..providers.local_provider import LocalQwenProvider
+        prov = LocalQwenProvider()
+        prov.setup_model()
+        return prov, "Qwen 2.5 (7B-AWQ Local)"
 
 
 @app.command()
@@ -155,9 +159,6 @@ def repl(
                     break
 
                 lower_input = user_input.lower()
-                # Detect if we're using MockProvider (shows scripted tool traces)
-                from ..providers.mock_provider import MockProvider
-                _is_mock = isinstance(prov, MockProvider)
 
                 if lower_input == "commit" or lower_input.startswith("commit "):
                     try:
@@ -169,46 +170,36 @@ def repl(
                     user_input = user_input[5:].strip().strip('"').strip("'")
                 elif lower_input.startswith("review "):
                     file_to_rev = user_input[7:].strip().strip('"').strip("'")
-                    if _is_mock:
-                        # Mock provider: pass filename — it shows scripted THINKING→ACTION→OBSERVE
-                        user_input = f"Review {file_to_rev} and tell me if it's good code"
-                    else:
-                        # Real provider: pre-read file to avoid tool-call JSON leakage
-                        try:
-                            import os as _os
-                            fpath = _os.path.join(_os.getcwd(), file_to_rev) if not _os.path.isabs(file_to_rev) else file_to_rev
-                            with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
-                                file_contents = _f.read()
-                            user_input = (
-                                f"Here is the content of '{file_to_rev}':\n\n```\n{file_contents}\n```\n\n"
-                                f"Please review this code. Identify bugs, bad practices, missing type hints, "
-                                f"missing docstrings, security issues, and suggest improvements. Be concise."
-                            )
-                        except FileNotFoundError:
-                            display.print_error(f"File not found: {file_to_rev}")
-                            continue
+                    try:
+                        import os as _os
+                        fpath = _os.path.join(_os.getcwd(), file_to_rev) if not _os.path.isabs(file_to_rev) else file_to_rev
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                            file_contents = _f.read()
+                        user_input = (
+                            f"Here is the content of '{file_to_rev}':\n\n```\n{file_contents}\n```\n\n"
+                            f"Please review this code. Identify bugs, bad practices, missing type hints, "
+                            f"missing docstrings, security issues, and suggest improvements. Be concise."
+                        )
+                    except FileNotFoundError:
+                        display.print_error(f"File not found: {file_to_rev}")
+                        continue
                 elif lower_input.startswith("debug "):
                     parts = user_input[6:].strip().split("--error")
                     file_to_dbg = parts[0].strip().strip('"').strip("'")
                     err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
-                    if _is_mock:
-                        # Mock provider: pass filename + error — shows scripted tool trace
-                        user_input = f"Debug {file_to_dbg} --error {err_msg}"
-                    else:
-                        # Real provider: pre-read file to avoid tool-call JSON leakage
-                        try:
-                            import os as _os
-                            fpath = _os.path.join(_os.getcwd(), file_to_dbg) if not _os.path.isabs(file_to_dbg) else file_to_dbg
-                            with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
-                                file_contents = _f.read()
-                            user_input = (
-                                f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
-                                f"The user reports this error:\n{err_msg}\n\n"
-                                f"Identify the root cause and provide the fixed version of the code."
-                            )
-                        except FileNotFoundError:
-                            display.print_error(f"File not found: {file_to_dbg}")
-                            continue
+                    try:
+                        import os as _os
+                        fpath = _os.path.join(_os.getcwd(), file_to_dbg) if not _os.path.isabs(file_to_dbg) else file_to_dbg
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                            file_contents = _f.read()
+                        user_input = (
+                            f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
+                            f"The user reports this error:\n{err_msg}\n\n"
+                            f"Identify the root cause and provide the fixed version of the code."
+                        )
+                    except FileNotFoundError:
+                        display.print_error(f"File not found: {file_to_dbg}")
+                        continue
 
                 start_time = time.time()
                 response_text = agent.run(user_input, stream=not no_stream)
@@ -399,6 +390,16 @@ def commit(
         display.print_error(f"Commit failed: {str(e)}")
         raise typer.Exit(code=1)
 
+@app.command("pull-model")
+def pull_model_cmd():
+    """Download or verify the built-in 4-bit AWQ local reasoning model (~4.5 GB)."""
+    typer.echo("\n🚀 Nexus-Agent — Pulling Built-In Local Quantized Reasoning Model")
+    from ..providers.local_provider import LocalQwenProvider
+    prov = LocalQwenProvider()
+    path = prov.setup_model()
+    typer.echo(f"\n✅ Local Quantized Model Ready at: {path}\n")
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -407,14 +408,17 @@ def main(
     if version:
         typer.echo("Nexus-Agent CLI v2.2.1")
         raise typer.Exit()
+
+    # Run onboarding wizard on first launch regardless of subcommand
+    try:
+        from .onboarding import run_if_first_time
+        run_if_first_time()
+    except Exception:
+        pass  # Never block startup on onboarding errors
+
     if ctx.invoked_subcommand is None:
-        # Run onboarding wizard on first launch
-        try:
-            from .onboarding import run_if_first_time
-            run_if_first_time()
-        except Exception:
-            pass  # Never block startup on onboarding errors
         repl(provider=DEFAULT_PROVIDER, verbose=True, no_stream=True, max_iterations=10)
+
 
 if __name__ == "__main__":
     app()

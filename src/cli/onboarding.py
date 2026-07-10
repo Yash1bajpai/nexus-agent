@@ -254,31 +254,23 @@ def _step_system_specs():
     else:
         print(f"  RAM:       {ram_display}")
         print(f"  CPU Cores: {cores or 'Unknown'}")
-        if cpu_name:
-            print(f"  CPU:       {cpu_name[:60]}")
-        print(f"  AVX2:      {avx2_display}")
-        print(f"  GPU:       {gpu or 'Not detected'}")
-
-    suggestion, note = suggest_local_model(specs)
-    _print(f"\n  [bold]Recommended local model:[/bold] {suggestion}" if console else f"\n  Recommended local model: {suggestion}")
-    _print(f"  [dim]{note}[/dim]" if console else f"  {note}")
-    _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
+          _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
            "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
-    _print("  [dim]Local model support coming in V2. API providers active now.[/dim]" if console else
-           "  Local model support coming in V2. API providers active now.")
+    _print("  [dim]Local Qwen-2.5-7B-Instruct-AWQ (4-bit) reasoning engine is built-in (`DEFAULT_PROVIDER = 'local'`).[/dim]" if console else
+           "  Local Qwen-2.5-7B-Instruct-AWQ (4-bit) reasoning engine is built-in (`DEFAULT_PROVIDER = 'local'`).")
 
 
 def _step_default_provider() -> str:
-    """[3/3] - Let the user pick their default provider."""
-    _print("\n[bold][[3/3]][/bold] [cyan]Default Provider[/cyan]" if console else "\n[3/3] Default Provider")
+    """[3/4] - Let the user pick their default provider."""
+    _print("\n[bold][[3/4]][/bold] [cyan]Default Provider[/cyan]" if console else "\n[3/4] Default Provider")
 
-    options = ["gemini", "anthropic", "openai", "auto"]
+    options = ["local", "gemini", "anthropic", "openai", "auto"]
     _print("  Choose your default AI provider:")
     for i, opt in enumerate(options, 1):
-        note = " (auto-fallback chain)" if opt == "auto" else ""
+        note = " (Qwen 2.5 7B-AWQ Offline)" if opt == "local" else (" (auto-fallback chain)" if opt == "auto" else "")
         _print(f"    {i}. {opt}{note}")
 
-    current = os.getenv("DEFAULT_PROVIDER", "anthropic")
+    current = os.getenv("DEFAULT_PROVIDER", "local")
     _print(f"  [dim]Current default: {current}[/dim]" if console else f"  Current default: {current}")
 
     try:
@@ -294,6 +286,19 @@ def _step_default_provider() -> str:
 
     return current
 
+
+def _step_local_model_setup():
+    """[4/4] - Download/verify the local Qwen 2.5 4-bit AWQ model weights."""
+    _print("\n[bold][[4/4]][/bold] [cyan]Local Qwen Engine Setup (~4.5 GB)[/cyan]" if console else "\n[4/4] Local Qwen Engine Setup (~4.5 GB)")
+    _print("  Checking & downloading built-in Qwen/Qwen2.5-7B-Instruct-AWQ offline weights...")
+    try:
+        from ..providers.local_provider import LocalQwenProvider
+        prov = LocalQwenProvider()
+        prov.setup_model()
+    except Exception as e:
+        _print(f"  [yellow]Note: Model can be downloaded later when running offline mode ({e})[/yellow]" if console else f"  Note: Model can be downloaded later when running offline mode ({e})")
+
+
 # --- Main Entry ---
 
 def run_if_first_time():
@@ -305,6 +310,7 @@ def run_if_first_time():
     _step_api_keys()
     _step_system_specs()
     _step_default_provider()
+    _step_local_model_setup()
 
     # Mark as initialized
     try:

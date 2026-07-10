@@ -19,6 +19,14 @@ dependencies = [
     "duckduckgo-search>=6.0.0",
     "python-dotenv>=1.0.0",
     "psutil>=5.9.0",
+    "huggingface-hub>=0.24.0",
+]
+
+[project.optional-dependencies]
+local = [
+    "transformers>=4.43.0",
+    "torch>=2.4.0",
+    "autoawq>=0.2.6",
 ]
 
 [project.scripts]
@@ -27,6 +35,7 @@ agent = "src.cli.app:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
+exclude = ["venv*", "tests*"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore"]
