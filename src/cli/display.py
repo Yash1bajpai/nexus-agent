@@ -84,8 +84,14 @@ def print_thinking(text: str):
     """Print the agent's reasoning step (verbose ReAct trace)."""
     if not text or not text.strip():
         return
+    # Strip duplicate leading [THINKING] tag if already present in text
+    cleaned_text = text.strip()
+    while cleaned_text.upper().startswith("[THINKING]"):
+        cleaned_text = cleaned_text[len("[THINKING]"):].strip()
+    if not cleaned_text:
+        return
     # Show up to 3 lines of reasoning
-    lines = [l for l in text.strip().split("\n") if l.strip()]
+    lines = [l for l in cleaned_text.split("\n") if l.strip()]
     preview = " ".join(lines[:3])
     if len(preview) > 200:
         preview = preview[:197] + "..."
@@ -99,7 +105,10 @@ def print_response(text: str):
 
 def print_footer(tokens: int, cost: float, time: float):
     """Print execution statistics footer."""
-    console.print(f"\n  [dim]Tokens: {tokens:,}  |  Est. cost: ${cost:.4f}  |  Time: {time:.1f}s[/dim]\n")
+    if tokens == 0 or cost == 0.0:
+        console.print(f"\n  [dim]Tokens: N/A (local)  |  Est. cost: $0.0000 (offline)  |  Time: {time:.1f}s[/dim]\n")
+    else:
+        console.print(f"\n  [dim]Tokens: {tokens:,}  |  Est. cost: ${cost:.4f}  |  Time: {time:.1f}s[/dim]\n")
 
 def print_error(message: str):
     """Print error message."""

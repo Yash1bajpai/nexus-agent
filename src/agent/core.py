@@ -147,15 +147,15 @@ class Agent:
                             display.print_thinking(response.text)
 
                     for tool_call in response.tool_calls:
-                        # Build short status display (still abbreviated for spinner)
+                        # Build status display with full argument visibility (up to 150 chars)
                         args_preview = ", ".join(
-                            f'{k}="{v[:30]}..."' if isinstance(v, str) and len(v) > 30 else
+                            f'{k}="{v[:120]}..."' if isinstance(v, str) and len(v) > 120 else
                             (f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}")
                             for k, v in tool_call.args.items()
                         )
                         if status is None and self.verbose:
                             status = display.create_status(f"Running: {tool_call.name}...")
-                        display.update_status(status, f"Running tool: {tool_call.name}({args_preview[:60]})...")
+                        display.update_status(status, f"Running tool: {tool_call.name}({args_preview[:150]})...")
 
                         if self.event_callback:
                             self.event_callback({"type": "action", "name": tool_call.name, "args": tool_call.args})
