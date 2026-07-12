@@ -362,7 +362,18 @@ def commit(
         duration = time.time() - start_time
 
         lines = [line.strip().strip('"').strip("'") for line in commit_message.splitlines() if line.strip()]
-        clean_lines = [l for l in lines if not l.startswith('{') and not l.startswith('```') and not l.startswith('#') and not l.startswith('Assuming') and not l.lower().startswith('response:')]
+        clean_lines = [
+            l for l in lines
+            if not l.startswith('{')
+            and not l.startswith('```')
+            and not l.startswith('#')
+            and not l.startswith('Assuming')
+            and not l.lower().startswith('response:')
+            and not l.upper().startswith('[THINKING]')
+            and not l.upper().startswith('[ACTION]')
+            and not l.upper().startswith('[OBSERVE]')
+            and not l.upper().startswith('[REASONING]')
+        ]
         commit_message = clean_lines[0] if clean_lines else (lines[-1] if lines else "chore: update codebase")
 
         typer.echo(f"\n  Generated message: {commit_message}")

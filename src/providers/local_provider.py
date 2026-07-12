@@ -287,8 +287,8 @@ class LocalQwenProvider(BaseProvider):
 
         # Check for directory / file listing or any general command
         return ProviderResponse(
-            text="[THINKING]\nProcessing local user command. I will first inspect the current directory structure (`list_dir`) to verify project context before taking action.",
-            tool_calls=[ToolCall("call_local_4", "list_dir", {"path": "."})],
+            text="[THINKING]\nProcessing local user command. I will first inspect the current directory structure (`list_directory`) to verify project context before taking action.",
+            tool_calls=[ToolCall("call_local_4", "list_directory", {"path": "."})],
             raw_assistant_message={"model": "qwen2.5-7b-instruct-awq-cpu", "tool_calls": 1}
         )
 

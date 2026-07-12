@@ -254,8 +254,8 @@ def _step_system_specs():
     else:
         print(f"  RAM:       {ram_display}")
         print(f"  CPU Cores: {cores or 'Unknown'}")
-          _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
-           "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
+        _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
+               "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
     _print("  [dim]Local Qwen-2.5-7B-Instruct-AWQ (4-bit) reasoning engine is built-in (`DEFAULT_PROVIDER = 'local'`).[/dim]" if console else
            "  Local Qwen-2.5-7B-Instruct-AWQ (4-bit) reasoning engine is built-in (`DEFAULT_PROVIDER = 'local'`).")
 
