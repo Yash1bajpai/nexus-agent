@@ -4,6 +4,16 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] - 2026-07-12
+
+### Fixed
+- **Critical: `IndentationError` in `onboarding.py` line 257**: Fixed bad indentation in `_print(...)` call inside `else` branch that caused first-run onboarding to crash with `IndentationError` before the wizard could start.
+- **Critical: Wrong tool name `list_dir` in CPU fallback**: `local_provider.py` was calling `ToolCall("list_dir", ...)` but the registered tool is `list_directory`. This caused `ERROR: Unknown tool 'list_dir'` on every general command. Fixed to `list_directory`.
+- **`[THINKING]` tags leaking into git commit messages**: When using the local provider, the commit message cleaner in `app.py` was not stripping `[THINKING]`, `[ACTION]`, `[OBSERVE]` markers, resulting in literal `[THINKING]` as the commit message. Now filtered out correctly.
+- **`search_web` returning off-topic results**: DuckDuckGo sometimes returns irrelevant results (e.g. Wikipedia/YouTube) for technical queries. Added `_is_relevant()` keyword validator — if live results don't match any query keyword, a smart curated fallback is used.
+- **Misleading startup download message**: `setup_model()` printed "Downloading core reasoning engine (~4.5 GB)..." even when the model was already cached. Now detects HuggingFace Hub cache and shows "Local engine cache found" when model is already present.
+- **Search query truncation**: Fixed `last_msg[:50]` truncation in search query builder — now uses full stop-word filtered keyword extraction for cleaner, focused queries.
+
 ## [2.2.1] - 2026-06-29
 
 ### Added

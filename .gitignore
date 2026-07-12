@@ -12,6 +12,8 @@ dist/
 build/
 .vscode/
 .idea/
+
+# Internal / self-use files - DO NOT publish
 CHANGELOG_LOCAL.md
 DAILY_JOURNAL.md
 AI_HANDOFF_CONTEXT.md
@@ -19,6 +21,11 @@ BUG_REPORT.md
 DEMO_RECORDING_CHECKLIST.md
 EDGE_CASE_TEST_REPORT.md
 RECRUITER_REVIEW.md
+demo_local_qwen.py
+Programmer_Assistant/
+__test_scan.py
+
+# Database / log files
 *.db
 *.sqlite
 *.sqlite3
