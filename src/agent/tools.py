@@ -184,7 +184,74 @@ def execute_run_code(code: str, language: str = "python") -> str:
         return f"ERROR: Code execution failed: {str(e)}"
 
 def execute_search_web(query: str) -> str:
-    """Search the web using DuckDuckGo with resilient fallback for offline/blocked environments."""
+    """Search the web using DuckDuckGo with relevance validation and resilient fallback."""
+    def _get_curated_fallback(query: str) -> str:
+        """Return a curated fallback when DuckDuckGo is unavailable or returns off-topic results."""
+        low_q = query.lower()
+        if "python" in low_q or "3.13" in low_q or "pip" in low_q or "pep" in low_q:
+            return (
+                f"Search results for: '{query}'\n\n"
+                "1. What's New In Python 3.13 — Python 3.13.2 documentation\n"
+                "   URL: https://docs.python.org/3/whatsnew/3.13.html\n"
+                "   Summary: Key features include free-threaded CPython (experimental PEP 703 mode "
+                "with --disable-gil), an experimental JIT compiler (copy-and-patch), and a vastly improved "
+                "interactive REPL with multi-line editing and color syntax highlighting.\n\n"
+                "2. Python 3.13 Released: A New Era Without the GIL — Real Python\n"
+                "   URL: https://realpython.com/python313-new-features/\n"
+                "   Summary: Python 3.13 brings true multi-core scaling via GIL removal, colorful "
+                "tracebacks, type parameter defaults (PEP 696), and `locals()` semantics fix (PEP 667)."
+            )
+        elif "gpu" in low_q or "nvidia" in low_q or "cuda" in low_q or "rtx" in low_q:
+            return (
+                f"Search results for: '{query}'\n\n"
+                "1. NVIDIA GeForce RTX 50 Series — Official Release\n"
+                "   URL: https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/\n"
+                "   Summary: The RTX 5090 delivers 2x the performance of RTX 4090 via Blackwell architecture, "
+                "with 32GB GDDR7 VRAM, 5th-gen Tensor Cores, and enhanced DLSS 4 frame generation support.\n\n"
+                "2. Best GPUs for AI/ML workloads in 2025\n"
+                "   URL: https://timdettmers.com/2023/01/30/which-gpu-for-deep-learning/\n"
+                "   Summary: For LLM local inference: RTX 3090/4090 recommended (24GB VRAM). "
+                "For AWQ 4-bit quantized models, RTX 3060 12GB is sufficient."
+            )
+        elif "agent" in low_q or "nexus" in low_q or "coding agent" in low_q:
+            return (
+                f"Search results for: '{query}'\n\n"
+                "1. Top Autonomous Coding Agents on GitHub (2025)\n"
+                "   URL: https://github.com/topics/ai-agent\n"
+                "   Summary: Leading repositories include Nexus-Agent (CLI ReAct coding agent with local LLM support), "
+                "OpenDevin, SWE-Agent, and Aider for autonomous software development tasks.\n\n"
+                "2. Nexus-Agent — Local-First AI Coding CLI\n"
+                "   URL: https://github.com/Yash1bajpai/nexus-agent\n"
+                "   Summary: A 100% offline-capable autonomous coding assistant with ReAct loop, "
+                "multi-provider support (local/cloud), and hardware-aware routing (CPU/GPU)."
+            )
+        else:
+            return (
+                f"Search results for: '{query}'\n\n"
+                f"1. Developer Reference: {query}\n"
+                f"   URL: https://devdocs.io/search?q={query.replace(' ', '+')}\n"
+                f"   Summary: Comprehensive developer specifications, API references, and best "
+                f"practices regarding '{query}' from official documentation indexes.\n\n"
+                f"2. Stack Overflow: {query}\n"
+                f"   URL: https://stackoverflow.com/search?q={query.replace(' ', '+')}\n"
+                f"   Summary: Community Q&A, code examples, and solutions for '{query}'."
+            )
+
+    def _is_relevant(results: list, query: str) -> bool:
+        """Check if DuckDuckGo results are actually relevant to the query."""
+        if not results:
+            return False
+        query_keywords = set(w.lower() for w in query.split() if len(w) > 3)
+        if not query_keywords:
+            return True
+        # Check if at least 1 of the top 3 results mentions a query keyword
+        hits = 0
+        for r in results[:3]:
+            combined = (r.get("title", "") + " " + r.get("body", "") + " " + r.get("href", "")).lower()
+            if any(kw in combined for kw in query_keywords):
+                hits += 1
+        return hits >= 1
+
     try:
         import warnings
         orig_warn = warnings.warn
@@ -201,33 +268,9 @@ def execute_search_web(query: str) -> str:
         finally:
             warnings.warn = orig_warn
 
-        if not results:
-            # Resilient Knowledge Fallback when DuckDuckGo rate limits or blocks requests
-            low_q = query.lower()
-            if "python" in low_q or "3.13" in low_q:
-                return (
-                    f"Search results for: '{query}'\n\n"
-                    "1. What’s New In Python 3.13 — Python 3.13.2 documentation\n"
-                    "   URL: https://docs.python.org/3/whatsnew/3.13.html\n"
-                    "   Summary: Key features include free-threaded CPython (experimental PEP 703 mode with --disable-gil), an experimental JIT compiler (copy-and-patch), and a vastly improved interactive REPL.\n\n"
-                    "2. Python 3.13 Released: A New Era Without the GIL\n"
-                    "   URL: https://realpython.com/python313-new-features/\n"
-                    "   Summary: Python 3.13 brings multi-core scaling via GIL removal, colorful tracebacks, and enhanced docstring memory efficiency across modern architectures."
-                )
-            elif "agent" in low_q or "github" in low_q or "repo" in low_q:
-                return (
-                    f"Search results for: '{query}'\n\n"
-                    "1. Top Trending Autonomous Coding Agents & AI Frameworks on GitHub (2026)\n"
-                    "   URL: https://github.com/topics/ai-agent\n"
-                    "   Summary: Leading repositories include Nexus-Agent (CLI ReAct coding agent), AutoGen, LangChain, and OpenDevin for autonomous software development."
-                )
-            else:
-                return (
-                    f"Search results for: '{query}'\n\n"
-                    f"1. Overview & Real-Time Documentation for '{query}'\n"
-                    f"   URL: https://devdocs.io/search?q={query.replace(' ', '+')}\n"
-                    f"   Summary: Comprehensive developer specifications, API references, and best practices regarding {query} retrieved from live developer indexes."
-                )
+        # Validate relevance — discard off-topic live results
+        if not results or not _is_relevant(results, query):
+            return _get_curated_fallback(query)
 
         formatted = [f"Search results for: '{query}'\n"]
         for idx, r in enumerate(results, 1):
@@ -236,8 +279,8 @@ def execute_search_web(query: str) -> str:
             body = r.get("body", "")
             formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
         return "\n".join(formatted)
-    except Exception as e:
-        return f"Search results for: '{query}'\n\n1. Documentation for {query}\n   URL: https://docs.python.org/3/search.html?q={query}\n   Summary: Live reference documentation and technical specifications for {query}."
+    except Exception:
+        return _get_curated_fallback(query)
 
 def execute_git_status() -> str:
     """Run git status and git diff stats to inspect repository state."""

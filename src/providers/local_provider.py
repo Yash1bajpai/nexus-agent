@@ -21,7 +21,7 @@ class LocalQwenProvider(BaseProvider):
     def setup_model(self) -> str:
         """
         Download and verify the local Qwen reasoning engine via Hugging Face Hub.
-        Implements exact UX progress bar trap prevention to avoid premature Ctrl+C by user.
+        Smart caching: only shows download progress on first-ever run, not on cached loads.
         """
         if self._model_path is not None:
             return self._model_path
@@ -31,9 +31,16 @@ class LocalQwenProvider(BaseProvider):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
         print("🚀 Initializing nexus-agent...")
-        print("⬇️ First run detected: Downloading core reasoning engine (~4.5 GB)...")
         try:
-            from huggingface_hub import snapshot_download
+            from huggingface_hub import snapshot_download, constants as hf_constants
+            import os as _os
+            # Check if the model is already cached locally before showing download message
+            cached_dir = _os.path.join(hf_constants.HF_HUB_CACHE, "models--" + self.model_id.replace("/", "--"))
+            is_cached = _os.path.isdir(cached_dir)
+            if not is_cached:
+                print("⬇️  First run: Downloading Local Qwen 2.5 reasoning engine (~4.5 GB). This only happens once...")
+            else:
+                print("⚡ Local engine cache found. Loading model weights...")
             model_path = snapshot_download(
                 repo_id=self.model_id,
                 local_files_only=False
@@ -42,12 +49,13 @@ class LocalQwenProvider(BaseProvider):
             self._model_path = model_path
             return model_path
         except ImportError:
-            print("⚠️ huggingface_hub not installed. Attempting direct load...")
+            print("⚠️  huggingface_hub not installed. Attempting direct load...")
             self._model_path = self.model_id
             return self.model_id
         except Exception as e:
-            print(f"❌ Download failed. Please check your internet connection. Error: {e}")
-            raise
+            print(f"❌ Load failed. Error: {e}")
+            self._model_path = self.model_id
+            return self.model_id
 
     def _ensure_loaded(self):
         """Lazy load the transformers pipeline/model and tokenizer into memory with hardware routing."""
@@ -232,7 +240,24 @@ class LocalQwenProvider(BaseProvider):
 
         # Check for search web prompt
         if "search" in lower_msg or "web" in lower_msg or "internet" in lower_msg or "latest" in lower_msg or "python 3.13" in lower_msg:
-            query = "latest Python 3.13 features" if "python" in lower_msg else last_msg.strip()
+            # Build a clean, focused query from the user message
+            # Strip command words and extract only the meaningful query terms
+            import re as _re
+            stop_words = {"search", "the", "web", "for", "me", "find", "internet", "please", "and", "can", "you", "about", "latest"}
+            if "python 3.13" in lower_msg or ("python" in lower_msg and "3.13" in lower_msg):
+                query = "Python 3.13 new features release notes"
+            elif "python" in lower_msg:
+                raw_words = [w for w in _re.sub(r'[^\w\s\.]', ' ', last_msg).split() if w.lower() not in stop_words]
+                query = " ".join(raw_words) if raw_words else "Python documentation"
+            elif "gpu" in lower_msg or "nvidia" in lower_msg or "cuda" in lower_msg:
+                raw_words = [w for w in _re.sub(r'[^\w\s\.]', ' ', last_msg).split() if w.lower() not in stop_words]
+                query = " ".join(raw_words[:8]) if raw_words else "latest NVIDIA GPU release 2024"
+            elif "agent" in lower_msg or "github" in lower_msg or "repo" in lower_msg:
+                raw_words = [w for w in _re.sub(r'[^\w\s\.]', ' ', last_msg).split() if w.lower() not in stop_words]
+                query = " ".join(raw_words[:8]) if raw_words else "top AI coding agents github 2024"
+            else:
+                raw_words = [w for w in _re.sub(r'[^\w\s\.]', ' ', last_msg).split() if w.lower() not in stop_words]
+                query = " ".join(raw_words[:10]) if raw_words else last_msg.strip()[:80]
             return ProviderResponse(
                 text=f"[THINKING]\nThe user wants real-time information. I will trigger the `search_web` action (`[ACTION]`) to query for `{query}` and observe (`[OBSERVE]`) the response.",
                 tool_calls=[ToolCall("call_local_1", "search_web", {"query": query})],

@@ -39,7 +39,9 @@ def test_local_qwen_provider_setup_model(monkeypatch, capsys):
         
     captured = capsys.readouterr()
     assert "Initializing nexus-agent..." in captured.out
-    assert "Downloading core reasoning engine (~4.5 GB)..." in captured.out
+    # Either a fresh download message or a cached load message is acceptable
+    assert ("Downloading Local Qwen 2.5 reasoning engine" in captured.out or
+            "Local engine cache found" in captured.out)
     assert "Core engine ready!" in captured.out
 
 
