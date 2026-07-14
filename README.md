@@ -39,6 +39,7 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built f
 | **Multi-Provider Support** (Claude, Gemini, OpenAI) | ✅ | ❌ | ❌ | ✅ |
 | **Auto-Provider Fallback** (rate limit resilient) | ✅ | ❌ | ❌ | ❌ |
 | **Autonomous Local Tool Execution** | ✅ | ❌ | ✅ | ✅ |
+| **Mobile / Android (Termux) Support** | ✅ | ❌ | ❌ | ⚠️ |
 | **Real-Time Token & Cost Tracking** | ✅ | ❌ | ❌ | ❌ |
 | **`@mention` File Context Injection** | ✅ | ❌ | ❌ | ❌ |
 | **Smart Project vs. Global Detection** | ✅ | ❌ | ❌ | ❌ |
@@ -53,6 +54,7 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built f
 - 🔄 **Auto-Provider Fallback**: `--provider auto` chains `gemini → anthropic → openai` and switches silently on rate limit or auth failure, with a clean `[WARN]` message.
 - 💰 **Real-Time Dynamic Cost Tracker**: Live token computation engine that calculates exact input/output token expenditure and monetary cost in real time per session.
 - 🚀 **First-Run Onboarding Wizard**: Auto-detects first launch, guides through API key setup, detects RAM/CPU/GPU specs, and suggests optimal local model for V2.
+- 📱 **Full Mobile / Android (Termux) Support**: Optimized zero-dependency C-wheel exclusions and pure-Python `/proc/meminfo` RAM/CPU detection allow `pip install nexus-agent-ai` to run 100% natively on Android phones inside Termux without C-compilation errors.
 - 🛠️ **Comprehensive Developer Toolset**:
   - `read_file`: Safely parses local file contents to prevent hallucinations.
   - `write_file`: Actively writes or overwrites code files with automatic directory creation.
@@ -126,9 +128,23 @@ graph TD
 
 ### 1. Installation
 
-Install officially via PyPI:
+Install officially via PyPI across any desktop or server (Windows / macOS / Linux):
 ```bash
 pip install nexus-agent-ai
+```
+
+#### 📱 Mobile / Android (Termux) Quickstart
+Nexus-Agent is fully optimized to run on Android phones via **Termux** (`v2.2.3+`). It uses pure-Python spec detection (`/proc/meminfo`) and skips C-compilation dependencies (`psutil` wheels) automatically:
+```bash
+# 1. Update Termux & install Python/Git
+pkg update && pkg upgrade -y
+pkg install python git -y
+
+# 2. Install Nexus-Agent cleanly from PyPI
+pip install --upgrade nexus-agent-ai
+
+# 3. Launch from anywhere!
+nexus-agent
 ```
 
 Or clone for local development:
