@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-agent-ai"
-version = "2.2.2"
+version = "2.2.3"
 description = "Autonomous terminal-first AI software engineering assistant with ReAct tool loops and multi-provider fallback"
 readme = "README.md"
 authors = [{name = "Yash Bajpai"}]
@@ -18,7 +18,7 @@ dependencies = [
     "google-genai>=0.1.0",
     "duckduckgo-search>=6.0.0",
     "python-dotenv>=1.0.0",
-    "psutil>=5.9.0",
+    "psutil>=5.9.0; sys_platform == 'win32' or sys_platform == 'darwin'",
     "huggingface-hub>=0.24.0",
 ]
 

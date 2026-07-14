@@ -4,6 +4,12 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] - 2026-07-14
+
+### Fixed
+- **Mobile/Termux/Android Compatibility**: Fixed `pip install nexus-agent-ai` failing on Termux / Android with error `RuntimeError: platform android is not supported` during `psutil` C-wheel compilation. `psutil` is now restricted to `win32` and `darwin` using environment markers (`psutil>=5.9.0; sys_platform == 'win32' or sys_platform == 'darwin'`).
+- **Zero-Dependency System Spec Detection**: Added pure-Python `/proc/meminfo` (for Linux/Android/Termux) and `ctypes.GlobalMemoryStatusEx` (for Windows) RAM and CPU detection in `onboarding.py`, so spec detection works flawlessly across all devices even without `psutil` installed.
+
 ## [2.2.2] - 2026-07-12
 
 ### Fixed

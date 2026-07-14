@@ -54,14 +54,53 @@ def _input(prompt: str) -> str:
 def detect_system_specs() -> dict:
     specs = {"ram_gb": 0, "cpu_cores": 0, "gpu": None, "cpu_name": None, "avx2": False}
 
+    import os
+    specs["cpu_cores"] = os.cpu_count() or 0
+
     try:
         import psutil
         mem = psutil.virtual_memory()
         specs["ram_gb"] = round(mem.total / (1024 ** 3), 1)
-        specs["cpu_cores"] = psutil.cpu_count(logical=False) or psutil.cpu_count()
+        if not specs["cpu_cores"]:
+            specs["cpu_cores"] = psutil.cpu_count(logical=False) or psutil.cpu_count() or 0
     except ImportError:
-        # psutil missing — default to 8GB middle tier, not lowest
-        specs["ram_gb"] = -1  # sentinel: unknown
+        # Pure-Python fallback for Termux/Android/Linux (/proc/meminfo) and Windows (ctypes)
+        ram_found = False
+        try:
+            if os.path.exists("/proc/meminfo"):
+                with open("/proc/meminfo", "r") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                kb = int(parts[1])
+                                specs["ram_gb"] = round(kb / (1024 ** 2), 1)
+                                ram_found = True
+                            break
+            if not ram_found and os.name == "nt":
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                specs["ram_gb"] = round(stat.ullTotalPhys / (1024 ** 3), 1)
+                ram_found = True
+        except Exception:
+            pass
+
+        if not ram_found:
+            specs["ram_gb"] = -1  # sentinel: unknown
 
     # Try to detect CPU name + AVX2 support
     try:
