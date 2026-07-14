@@ -4,6 +4,11 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.4] - 2026-07-14
+
+### Fixed
+- **Mobile/Termux/Android Rust Build Exclusions**: Fixed `pip install nexus-agent-ai` crashing when compiling Rust C-extensions (`jiter` via `anthropic` and `pydantic-core` via `openai`) on Android (`aarch64-linux-android`) when `maturin`/`rustc` are not installed. `anthropic` and `openai` are now restricted to non-Android platforms (`sys_platform != 'android'`) by default, allowing 100% pure-Python cross-platform installation on Android via `pip install nexus-agent-ai`. Desktop/Termux users who want all providers can optionally install via `pip install nexus-agent-ai[all]`.
+
 ## [2.2.3] - 2026-07-14
 
 ### Fixed

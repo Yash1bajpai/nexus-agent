@@ -134,18 +134,19 @@ pip install nexus-agent-ai
 ```
 
 #### 📱 Mobile / Android (Termux) Quickstart
-Nexus-Agent is fully optimized to run on Android phones via **Termux** (`v2.2.3+`). It uses pure-Python spec detection (`/proc/meminfo`) and skips C-compilation dependencies (`psutil` wheels) automatically:
+Nexus-Agent is fully optimized to run on Android phones via **Termux** (`v2.2.4+`). It uses pure-Python spec detection (`/proc/meminfo`) and automatically skips C/Rust compilation dependencies (`psutil`, `jiter`, `pydantic-core`) by default:
 ```bash
 # 1. Update Termux & install Python/Git
 pkg update && pkg upgrade -y
 pkg install python git -y
 
-# 2. Install Nexus-Agent cleanly from PyPI
+# 2. Install Nexus-Agent cleanly from PyPI (fast pure-Python install)
 pip install --upgrade nexus-agent-ai
 
 # 3. Launch from anywhere!
 nexus-agent
 ```
+*(Optional: If you explicitly want Claude (`anthropic`) or ChatGPT (`openai`) models inside Termux, run `pkg install rust python-pydantic -y` before installing via `pip install nexus-agent-ai[all]`)*
 
 Or clone for local development:
 ```bash
