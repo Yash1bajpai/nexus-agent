@@ -4,6 +4,13 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.8] - 2026-07-15
+
+### Documentation & User Guide Polish
+- **Comprehensive Initial Setup User Guide**: Added a step-by-step initial setup walkthrough directly inside `README.md` explaining automatic first-run onboarding wizard configuration (`nexus-agent`), offline local model pulling (`nexus-agent pull-model`), and manual cloud provider `.env` setup (`cp .env.example .env`).
+- **Top Starting Commands Quick Reference**: Added a dedicated quick reference section highlighting the top 6 essential commands (`nexus-agent`, `nexus-agent chat`, `nexus-agent review`, `nexus-agent debug`, `nexus-agent generate`, and `nexus-agent commit`) with clear copy-pasteable examples.
+- **Updated Test Verification Output**: Updated verification section to reflect 100% passing status of all `28 unit tests` (`28 passed in 5.13s`).
+
 ## [2.2.7] - 2026-07-15
 
 ### Fixed & Security Hardened (Audit Verification Release)

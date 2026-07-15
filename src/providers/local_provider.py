@@ -166,7 +166,7 @@ class LocalQwenProvider(BaseProvider):
                     "[THINKING]\nI have observed (`[OBSERVE]`) the configuration structure inside `pyproject.toml`. Here is the overview:\n\n"
                     "### `pyproject.toml` Project Configuration Overview\n"
                     "- **Project Name:** `nexus-agent-ai` (Autonomous terminal coding assistant CLI)\n"
-                    "- **Version:** `2.2.7`\n"
+                    "- **Version:** `2.2.8`\n"
                     "- **Dependencies:** Built on modern Python standards including `rich` (terminal UI), `typer` (CLI routing), `pydantic` (data validation), and `httpx` (API requests).\n"
                     "- **Build Backend:** Uses standard `setuptools.build_meta` for clean distribution and packaging."
                 )

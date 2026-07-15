@@ -63,4 +63,4 @@ def get_package_version() -> str:
                     return line.split("=")[1].strip(" \"'")
     except Exception:
         pass
-    return "2.2.7"
+    return "2.2.8"

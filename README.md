@@ -155,15 +155,36 @@ cd nexus-agent
 pip install -e .
 ```
 
-### 2. API Key Configuration
+### 2. Initial Setup & User Guide
 
-Copy the example environment template and add your preferred API keys:
+When you install `nexus-agent-ai`, getting started takes less than 30 seconds whether you choose **Local Offline Mode** (zero cost, private) or **Cloud Provider Mode** (Claude, OpenAI, Gemini).
 
+#### A. First-Run Interactive Wizard (Automatic)
+On your very first `nexus-agent` invocation from the terminal, the built-in **Interactive Onboarding Wizard** launches automatically:
+```bash
+nexus-agent
+```
+The wizard auto-detects your system specifications (CPU threads, total RAM, and GPU capabilities on Desktop or Termux), helps you choose a default provider (`local`, `gemini`, `anthropic`, or `openai`), and saves your preferences cleanly to a local `.env` file in your workspace or home directory (`~/.nexus_agent_initialized`).
+
+#### B. Offline Local Model Download (`pull-model`)
+Nexus-Agent includes built-in support for autonomous local reasoning (`LocalQwenProvider`) — allowing you to generate, review, and debug code completely offline with **zero API keys required**.
+
+To download or verify the quantized reasoning model (`Qwen2.5-Coder` 4-bit AWQ / GGUF engine):
+```bash
+nexus-agent pull-model
+```
+*What this does:*
+- Checks your system environment and verifies `huggingface_hub` availability.
+- Downloads the optimized local quantized model weights (~4.5 GB) directly to your local cache (`~/.cache/huggingface/hub/...`).
+- Validates model integrity (`verify_download=True`) and confirms readiness (`✅ Local Quantized Model Ready`).
+- Once pulled, you can run offline any time using: `nexus-agent --provider local`.
+
+#### C. Manual API Key Configuration (Cloud Providers)
+If you prefer manual configuration or want to use cloud LLMs (`Anthropic Claude 3.5 Sonnet`, `OpenAI GPT-4o`, `Google Gemini 2.5 Flash`), copy the example environment file:
 ```bash
 cp .env.example .env
 ```
-
-Open `.env` and configure your keys:
+Open `.env` and set your desired default provider and API keys:
 ```ini
 DEFAULT_PROVIDER=gemini
 GEMINI_API_KEY=AIzaSy...
@@ -171,66 +192,63 @@ ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-proj-...
 ```
 
-> **First run auto-wizard**: On the very first `nexus-agent` launch, an interactive onboarding wizard will guide you through key setup automatically.
+---
 
-### 3. Usage
+### 3. Top Starting Commands (Quick Reference)
 
-#### Interactive Multi-Turn REPL Mode (Default)
-Start a continuous pair-programming session directly by invoking `nexus-agent` (or `agent`) without any subcommands:
+Here are the essential commands every developer should try first:
 
+#### ⚡ 1. Start Interactive Pair-Programming (REPL Mode)
+Launch a continuous multi-turn coding session inside your current directory. Ask questions, mention files via `@filename`, and let the agent autonomously inspect and edit code:
 ```bash
 nexus-agent
-# Or with flags: nexus-agent --provider anthropic
-# Auto-fallback mode: nexus-agent --provider auto
+# Specify provider explicitly:
+nexus-agent --provider anthropic
+# Enable auto-switching fallback (gemini -> anthropic -> openai):
+nexus-agent --provider auto
 ```
 
-#### Single-Turn Coding (`chat`)
-Execute an instant autonomous coding task directly from your terminal:
-
+#### 💬 2. Instant One-Shot Coding Task (`chat`)
+Execute a direct autonomous engineering instruction without entering REPL mode:
 ```bash
-nexus-agent chat "Create a python script fib.py that prints the first 10 Fibonacci numbers and run it to verify." --provider openai
+nexus-agent chat "Create a python script primes.py that generates the first 20 prime numbers and run it to verify." --provider gemini
 ```
 
-#### Automated Code Review (`review`)
-Inspect local code files for bugs, security vulnerabilities, and clean coding practices:
-
+#### 🔍 3. Read-Only Code Review (`review`)
+Perform a strict read-only audit of any local code file to identify bugs, security vulnerabilities (`SQLi`, path traversal), and performance bottlenecks:
 ```bash
-nexus-agent review src/utils/config.py --provider gemini
+nexus-agent review src/utils/config.py --provider local
 ```
 
-#### Autonomous Error Debugging (`debug`)
-Feed error tracebacks directly into Nexus-Agent to diagnose root causes and write fixes:
-
+#### 🐞 4. Autonomous Error Traceback Repair (`debug`)
+Paste any terminal traceback or error message directly into Nexus-Agent. The agent autonomously reads the problematic file, diagnoses the exact root cause, and applies the corrected fix via `write_file`:
 ```bash
-nexus-agent debug src/app.py --error "AttributeError: 'NoneType' object has no attribute 'stream'"
-# With verbose ReAct trace:
-nexus-agent debug src/app.py --error "KeyError: 'model'" --verbose
+nexus-agent debug src/app.py --error "ZeroDivisionError: float division by zero when response_times is empty"
 ```
 
-#### Direct File Generation (`generate`)
-Generate complete code files autonomously and save them to your workspace:
-
+#### 📝 5. Direct Code File Generation (`generate`)
+Instruct the agent to write production-ready code directly to a target destination path:
 ```bash
 nexus-agent generate "Create an async web scraper using aiohttp and BeautifulSoup" --output scraper.py
 ```
 
-#### AI Commit Message (`commit`)
-Reads your git diff, generates a meaningful conventional commit message, asks for confirmation, then commits:
-
+#### 📦 6. AI Conventional Git Commit (`commit`)
+Analyze your staged or unstaged Git diff (`git diff`) and autonomously generate a concise conventional commit message (`feat:`, `fix:`, `refactor:`):
 ```bash
 nexus-agent commit
-# Skip confirmation prompt:
+# Skip confirmation and commit immediately:
 nexus-agent commit --yes
 ```
 
-#### Verbose ReAct Trace
-See the agent's full reasoning process — thinking, actions, and observations:
+---
 
+### 4. Advanced Features & Trace Inspection
+
+#### Verbose ReAct Trace Engine (`--verbose`)
+See the agent's internal cognitive reasoning (`[THINKING] → [ACTION] → [OBSERVE]`) in real time across every tool execution loop:
 ```bash
 nexus-agent chat "Refactor utils.py to use dataclasses" --verbose
 ```
-
-Output looks like:
 ```
 [THINKING] I need to read the file first to understand the current structure
 [ACTION]   read_file(path="utils.py")
@@ -240,39 +258,53 @@ Output looks like:
 [OBSERVE]  Done (0.0s) → Successfully wrote 847 characters to utils.py
 ```
 
+#### `@mention` File Context Injection
+Inside REPL mode or chat prompts, mention any file path using `@filename` (e.g. `@src/agent/core.py`). Nexus-Agent automatically attaches the file's exact contents cleanly into its context window before answering.
+
 ---
 
 ## 🧪 Testing & Verification
 
-Nexus-Agent maintains a **100% passing unit test suite** covering all tool dispatchers, filesystem handlers, UX features, and subprocess safety boundaries:
+Nexus-Agent maintains a **100% passing automated regression & security test suite** (`28 unit tests`) covering all tool dispatchers, AST sandbox boundaries, streaming mechanics, and filesystem handlers:
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v --tb=short
 ```
 
 ```text
 ============================= test session starts =============================
-collecting ... collected 19 items
+collecting ... collected 28 items
 
-tests/test_providers.py::test_anthropic_provider_schema PASSED           [  5%]
-tests/test_providers.py::test_openai_provider_schema PASSED              [ 10%]
-tests/test_providers.py::test_gemini_provider_schema PASSED              [ 15%]
-tests/test_providers.py::test_provider_tool_result_format PASSED         [ 21%]
-tests/test_tools.py::test_read_file_success PASSED                       [ 26%]
-tests/test_tools.py::test_read_file_not_found PASSED                     [ 31%]
-tests/test_tools.py::test_list_directory_success PASSED                  [ 36%]
-tests/test_tools.py::test_list_directory_not_found PASSED                [ 42%]
-tests/test_tools.py::test_search_web PASSED                              [ 47%]
-tests/test_tools.py::test_write_file_success PASSED                      [ 52%]
-tests/test_tools.py::test_run_code_success PASSED                        [ 57%]
-tests/test_tools.py::test_git_status_tool PASSED                         [ 63%]
-tests/test_tools.py::test_execute_tool_dispatcher PASSED                 [ 68%]
-tests/test_ux_features.py::test_parse_at_mentions PASSED                 [ 73%]
-tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 78%]
-tests/test_ux_features.py::test_status_spinner_helpers PASSED            [ 84%]
-tests/test_ux_features.py::test_sqlite_memory PASSED                     [ 89%]
+tests/test_audit_fixes.py::test_sandbox_check_blocks_bypass PASSED       [  3%]
+tests/test_audit_fixes.py::test_search_web_offline_labeling PASSED       [  7%]
+tests/test_audit_fixes.py::test_local_provider_setup_model_verify PASSED [ 10%]
+tests/test_audit_fixes.py::test_agent_run_stream_true PASSED             [ 14%]
+tests/test_audit_fixes.py::test_onboarding_env_file_path PASSED          [ 17%]
+tests/test_local_provider.py::test_local_qwen_provider_init PASSED       [ 21%]
+tests/test_local_provider.py::test_local_qwen_provider_convert_tools PASSED [ 25%]
+tests/test_local_provider.py::test_local_qwen_provider_setup_model PASSED [ 28%]
+tests/test_local_provider.py::test_local_qwen_format_tool_result_message PASSED [ 32%]
+tests/test_providers.py::test_anthropic_provider_schema PASSED           [ 35%]
+tests/test_providers.py::test_openai_provider_schema PASSED              [ 39%]
+tests/test_providers.py::test_gemini_provider_schema PASSED              [ 42%]
+tests/test_providers.py::test_provider_tool_result_format PASSED         [ 46%]
+tests/test_providers.py::test_fallback_provider_general_exception PASSED [ 50%]
+tests/test_tools.py::test_read_file_success PASSED                       [ 53%]
+tests/test_tools.py::test_read_file_not_found PASSED                     [ 57%]
+tests/test_tools.py::test_list_directory_success PASSED                  [ 60%]
+tests/test_tools.py::test_list_directory_not_found PASSED                [ 64%]
+tests/test_tools.py::test_search_web PASSED                              [ 67%]
+tests/test_tools.py::test_write_file_success PASSED                      [ 71%]
+tests/test_tools.py::test_run_code_success PASSED                        [ 75%]
+tests/test_tools.py::test_git_status_tool PASSED                         [ 78%]
+tests/test_tools.py::test_execute_tool_dispatcher PASSED                 [ 82%]
+tests/test_tools.py::test_get_readonly_tools PASSED                      [ 85%]
+tests/test_ux_features.py::test_parse_at_mentions PASSED                 [ 89%]
+tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 92%]
+tests/test_ux_features.py::test_status_spinner_helpers PASSED            [ 96%]
+tests/test_ux_features.py::test_sqlite_memory PASSED                     [100%]
 
-============================= 19 passed in 4.28s ==============================
+============================= 28 passed in 5.13s ==============================
 ```
 
 ---
