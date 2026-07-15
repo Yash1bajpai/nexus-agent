@@ -97,6 +97,11 @@ def print_thinking(text: str):
         preview = preview[:197] + "..."
     console.print(f"\n  [bold magenta][THINKING][/bold magenta] {preview}")
 
+def print_stream_chunk(chunk: str):
+    """Print a chunk of streaming token text in real-time."""
+    if chunk:
+        console.print(chunk, end="", style="green")
+
 def print_response(text: str):
     """Print final response panel with Markdown formatting."""
     md = Markdown(text)

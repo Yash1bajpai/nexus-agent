@@ -173,6 +173,7 @@ class OpenAIProvider(BaseProvider):
 
             if cleaned:
                 yield cleaned
+            yield ProviderResponse(text=cleaned)
 
         except openai.RateLimitError as e:
             raise RateLimitError("OpenAI", str(e))

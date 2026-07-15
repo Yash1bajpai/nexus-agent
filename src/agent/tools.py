@@ -7,10 +7,26 @@ from typing import Any, Dict, List
 from ..providers.base import Tool
 from ..utils.config import CODE_EXECUTION_TIMEOUT
 
+def _validate_workspace_path(path: str | Path) -> Path | str:
+    """Validate that path is inside the current workspace or allowed system temporary directory."""
+    p = Path(path).resolve()
+    cwd = Path.cwd().resolve()
+    tmp = Path(tempfile.gettempdir()).resolve()
+    try:
+        if p.is_relative_to(cwd) or p.is_relative_to(tmp):
+            return p
+    except AttributeError:
+        if str(p).startswith(str(cwd)) or str(p).startswith(str(tmp)):
+            return p
+    return f"ERROR: Security Sandbox Access Denied: Path '{path}' is outside the project workspace ({cwd})."
+
 def execute_read_file(path: str) -> str:
     """Read the contents of any file and return it as a string."""
     try:
-        p = Path(path).resolve()
+        validated = _validate_workspace_path(path)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            return validated
+        p = validated
         with open(p, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
@@ -23,7 +39,10 @@ def execute_read_file(path: str) -> str:
 def execute_write_file(path: str, content: str) -> str:
     """Write string content to a file (creating parent directories if needed)."""
     try:
-        p = Path(path).resolve()
+        validated = _validate_workspace_path(path)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            return validated
+        p = validated
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
@@ -36,7 +55,10 @@ def execute_write_file(path: str, content: str) -> str:
 def execute_list_directory(path: str = ".") -> str:
     """List all files and folders in a directory (up to 2 levels deep)."""
     try:
-        root_path = Path(path).resolve()
+        validated = _validate_workspace_path(path)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            return validated
+        root_path = validated
         if not root_path.exists() or not root_path.is_dir():
             return f"ERROR: Directory not found or not a directory: {path}"
 
@@ -79,13 +101,13 @@ def execute_list_directory(path: str = ".") -> str:
 _FORBIDDEN_IMPORTS = frozenset({
     "os", "subprocess", "shutil", "socket", "urllib", "urllib3",
     "pickle", "ctypes", "multiprocessing", "http", "sys",
-    "pathlib", "pty", "asm", "cffi", "signal",
+    "pathlib", "pty", "asm", "cffi", "signal", "importlib", "runpy", "builtins", "io", "codecs",
 })
 
 def _sandbox_check(code: str) -> str | None:
     """
     AST-based static analysis. Returns an error string if forbidden
-    constructs are detected, or None if code is safe to execute.
+    constructs or indirect import bypass mechanisms are detected, or None if safe.
     """
     import ast
 
@@ -97,7 +119,6 @@ def _sandbox_check(code: str) -> str | None:
     violations = []
 
     for node in ast.walk(tree):
-        # Block: import os / import subprocess / from os import path / etc.
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
@@ -109,23 +130,20 @@ def _sandbox_check(code: str) -> str | None:
             if module in _FORBIDDEN_IMPORTS:
                 violations.append(f"from {node.module} import ...")
 
-        # Block: __import__("os") and direct open() calls
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id in ("sys", "builtins", "__builtins__", "importlib"):
+                violations.append(f"{node.value.id}.{node.attr}")
+
         elif isinstance(node, ast.Call):
             func = node.func
-            # __import__("anything")
-            if isinstance(func, ast.Name) and func.id == "__import__":
-                if node.args and isinstance(node.args[0], ast.Constant):
-                    root = str(node.args[0].value).split(".")[0]
-                    if root in _FORBIDDEN_IMPORTS:
-                        violations.append(f"__import__('{node.args[0].value}')")
+            func_name = ""
+            if isinstance(func, ast.Name):
+                func_name = func.id
+            elif isinstance(func, ast.Attribute):
+                func_name = func.attr
 
-            # open() — blocks exec(open("file.py").read()) bypass pattern
-            if isinstance(func, ast.Name) and func.id == "open":
-                violations.append("open() — use read_file tool instead")
-
-            # exec() / eval() — blocks dynamic code execution bypass
-            if isinstance(func, ast.Name) and func.id in ("exec", "eval"):
-                violations.append(f"{func.id}() — dynamic execution is not allowed")
+            if func_name in ("__import__", "import_module", "getattr", "exec", "eval", "compile", "open", "run_module", "run_path"):
+                violations.append(f"{func_name}() — forbidden in sandboxed run_code")
 
     if violations:
         bullet_list = "\n  - ".join(violations)
@@ -268,9 +286,8 @@ def execute_search_web(query: str) -> str:
         finally:
             warnings.warn = orig_warn
 
-        # Validate relevance — discard off-topic live results
         if not results or not _is_relevant(results, query):
-            return _get_curated_fallback(query)
+            return f"[Offline/Cached Reference Data - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
 
         formatted = [f"Search results for: '{query}'\n"]
         for idx, r in enumerate(results, 1):
@@ -280,7 +297,7 @@ def execute_search_web(query: str) -> str:
             formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
         return "\n".join(formatted)
     except Exception:
-        return _get_curated_fallback(query)
+        return f"[Offline/Cached Reference Data - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
 
 def execute_git_status() -> str:
     """Run git status and git diff stats to inspect repository state."""

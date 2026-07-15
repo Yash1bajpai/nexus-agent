@@ -3,7 +3,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, List
-from ..providers.base import BaseProvider, RateLimitError
+from ..providers.base import BaseProvider, RateLimitError, ProviderResponse
 from .memory import ConversationMemory
 from .tools import get_all_tools, execute_tool
 from ..cli import display
@@ -70,9 +70,9 @@ def parse_at_mentions(user_input: str) -> str:
 class Agent:
     """Core autonomous coding agent implementing the ReAct tool-use loop."""
 
-    def __init__(self, provider: BaseProvider, memory: ConversationMemory, max_iterations: int = 10, verbose: bool = True, tools: Optional[list] = None, event_callback: Optional[Any] = None):
+    def __init__(self, provider: BaseProvider, memory: Optional[ConversationMemory] = None, max_iterations: int = 10, verbose: bool = True, tools: Optional[list] = None, event_callback: Optional[Any] = None):
         self.provider = provider
-        self.memory = memory
+        self.memory = memory if memory is not None else ConversationMemory()
         self.tools = tools if tools is not None else get_all_tools()
         self.max_iterations = max_iterations
         self.verbose = verbose
@@ -120,11 +120,31 @@ class Agent:
                 display.update_status(status, "Thinking...")
 
                 try:
-                    response = self.provider.complete(
-                        messages=messages,
-                        tools=self.tools,
-                        system=self.system
-                    )
+                    if stream and hasattr(self.provider, "stream"):
+                        if status:
+                            display.stop_status(status)
+                            status = None
+                        response = None
+                        streamed_text = ""
+                        for item in self.provider.stream(messages=messages, tools=self.tools, system=self.system):
+                            if isinstance(item, ProviderResponse):
+                                response = item
+                            elif isinstance(item, str):
+                                streamed_text += item
+                                if self.event_callback:
+                                    self.event_callback({"type": "stream_chunk", "content": item})
+                                elif self.verbose:
+                                    display.print_stream_chunk(item)
+                        if response is None:
+                            response = self.provider.complete(messages=messages, tools=self.tools, system=self.system)
+                        elif streamed_text and not response.text:
+                            response.text = streamed_text
+                    else:
+                        response = self.provider.complete(
+                            messages=messages,
+                            tools=self.tools,
+                            system=self.system
+                        )
                 except RateLimitError as e:
                     display.stop_status(status)
                     status = None

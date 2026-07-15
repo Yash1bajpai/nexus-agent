@@ -4,6 +4,18 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.7] - 2026-07-15
+
+### Fixed & Security Hardened (Audit Verification Release)
+- **Strict AST Sandbox Hardening (`Issue 1`)**: Closed static analysis sandbox bypasses inside `run_code` (`tools.py`). Blocked indirect import/execution mechanisms including `importlib`, `runpy`, `getattr(builtins, ...)`, `__builtins__`, `open()`, `eval()`, and `exec()`.
+- **Verify Download Error Handling (`Issue 2`)**: Updated `LocalQwenProvider.setup_model(verify_download=True)` (`local_provider.py`) to raise explicit `RuntimeError` if `huggingface_hub` is missing or model download fails during `nexus-agent pull-model`, preventing false-positive success reports.
+- **Dynamic Version & Package Naming Alignment (`Issues 3 & 8`)**: Aligned `--version` CLI check (`app.py`), `pyproject.toml`, and `_get_mock_response()` pyproject simulation (`local_provider.py`) to consistently report `nexus-agent-ai` (`v2.2.7`).
+- **Autonomous Debug & Review Real File Operations (`Issue 4 & 7`)**: Updated `debug` and `review` commands under `LocalQwenProvider` to autonomously invoke `read_file` to inspect target files and execute `write_file` to apply code fixes (`demo_bug.py`, `demo_review.py`, or arbitrary user targets).
+- **True Real-Time Token Streaming (`Issue 5`)**: Updated `Agent.run()` (`core.py`) and provider implementations (`base.py`, `local_provider.py`, `anthropic_provider.py`, `openai_provider.py`, `gemini_provider.py`) to utilize generator-based token streaming (`provider.stream()`) whenever `stream=True`, outputting tokens live via `print_stream_chunk`.
+- **Safe `.env` Target Traversal (`Issue 6`)**: Replaced hardcoded `.parent.parent.parent` (`onboarding.py`, `config.py`) with safe upward directory traversal (`_find_project_root()`), ensuring `.env` files are created cleanly at the `pyproject.toml` or git repository root without leaking to upper filesystem directories (`C:\Yash\.env`).
+- **Prioritized Code Generation (`Issue 9`)**: Reordered `LocalQwenProvider` prompt intent routing (`local_provider.py`) so file generation/writing commands (`generate` / `write_file`) take precedence over file reading checks, ensuring `nexus-agent generate ... --output generated_smoke_test.py` correctly creates target code files.
+- **Offline & Cached Search Labeling (`Issue 10`)**: Updated `execute_search_web()` (`tools.py`) to explicitly prefix fallback responses (`_get_curated_fallback`) with `[Offline/Cached Reference Data - Live search unavailable or rate-limited]:` when live DuckDuckGo results are unavailable or off-topic.
+
 ## [2.2.6] - 2026-07-15
 
 ### Fixed

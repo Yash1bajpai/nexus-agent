@@ -79,9 +79,12 @@ class AnthropicProvider(BaseProvider):
             kwargs["tools"] = converted_tools
 
         try:
+            full_text = []
             with self.client.messages.stream(**kwargs) as stream:
                 for text_chunk in stream.text_stream:
+                    full_text.append(text_chunk)
                     yield text_chunk
+            yield ProviderResponse(text="".join(full_text))
         except anthropic.RateLimitError as e:
             raise RateLimitError("Anthropic", str(e))
         except Exception as e:

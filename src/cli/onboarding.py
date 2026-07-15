@@ -31,7 +31,20 @@ except ImportError:
 
 console = Console() if _rich else None
 INIT_FILE = Path.home() / ".nexus_agent_initialized"
-ENV_FILE = Path(__file__).resolve().parent.parent.parent.parent / ".env"
+
+def _find_project_root() -> Path:
+    curr = Path.cwd().resolve()
+    for p in [curr, *curr.parents]:
+        if (p / ".git").exists() or (p / "pyproject.toml").exists():
+            return p
+    f_curr = Path(__file__).resolve().parent
+    for p in [f_curr, *f_curr.parents]:
+        if (p / "pyproject.toml").exists():
+            return p
+    return curr
+
+_pkg_root = _find_project_root()
+ENV_FILE = _pkg_root / ".env"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 

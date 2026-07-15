@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-agent-ai"
-version = "2.2.6"
+version = "2.2.7"
 description = "Autonomous terminal-first AI software engineering assistant with ReAct tool loops and multi-provider fallback"
 readme = "README.md"
 authors = [{name = "Yash Bajpai"}]

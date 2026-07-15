@@ -127,9 +127,12 @@ class GeminiProvider(BaseProvider):
                 contents=gemini_contents,
                 config=config,
             )
+            full_text = []
             for chunk in response_stream:
                 if hasattr(chunk, "text") and chunk.text:
+                    full_text.append(chunk.text)
                     yield chunk.text
+            yield ProviderResponse(text="".join(full_text))
         except Exception as e:
             err_str = str(e).lower()
             if "429" in str(e) or "resource_exhausted" in err_str or "rate limit" in err_str or "quota" in err_str:

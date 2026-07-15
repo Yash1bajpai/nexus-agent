@@ -407,8 +407,12 @@ def pull_model_cmd():
     typer.echo("\n🚀 Nexus-Agent — Pulling Built-In Local Quantized Reasoning Model")
     from ..providers.local_provider import LocalQwenProvider
     prov = LocalQwenProvider()
-    path = prov.setup_model()
-    typer.echo(f"\n✅ Local Quantized Model Ready at: {path}\n")
+    try:
+        path = prov.setup_model(verify_download=True)
+        typer.echo(f"\n✅ Local Quantized Model Ready at: {path}\n")
+    except Exception as e:
+        display.print_error(f"Failed to download local model: {e}")
+        raise typer.Exit(code=1)
 
 
 @app.callback(invoke_without_command=True)
@@ -417,7 +421,8 @@ def main(
     version: bool = typer.Option(False, "--version", help="Show version information.")
 ):
     if version:
-        typer.echo("Nexus-Agent CLI v2.2.1")
+        from ..utils.config import get_package_version
+        typer.echo(f"Nexus-Agent CLI v{get_package_version()}")
         raise typer.Exit()
 
     # Run onboarding wizard on first launch regardless of subcommand

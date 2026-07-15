@@ -115,8 +115,22 @@ class FallbackProvider(BaseProvider):
                 self._switch_next(failed, reason=str(e))
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
-        # streams can't easily retry mid-flight, so fall back to complete()
-        return self.complete(messages, tools, system)
+        try:
+            if hasattr(self._current_provider, "stream") and self._current_provider is not None:
+                res = None
+                for chunk in self._current_provider.stream(messages, tools, system):
+                    yield chunk
+                    if isinstance(chunk, ProviderResponse):
+                        res = chunk
+                if res is None:
+                    yield self.complete(messages, tools, system)
+                return
+        except Exception as e:
+            self._switch_next(getattr(self._current_provider, "model", "unknown"), reason=str(e))
+        res = self.complete(messages, tools, system)
+        if res.text:
+            yield res.text
+        yield res
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
         return self._current_provider.format_tool_result_message(tool_call_id, result)  # type: ignore
