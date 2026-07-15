@@ -4,6 +4,11 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.6] - 2026-07-15
+
+### Fixed
+- **Termux ARM64 Marker Evaluation**: Fixed PEP 508 environment marker syntax to use exact boolean logic (`sys_platform != 'android' and (platform_system != 'Linux' or platform_machine != 'aarch64')`). On ARM64 Linux / Termux (`aarch64`), `pip install nexus-agent-ai` now cleanly evaluates to `False` for `anthropic` and `openai`, avoiding `jiter`/`maturin` Rust compilation entirely while keeping prebuilt wheel support across Windows, macOS, and x86_64 Linux desktops.
+
 ## [2.2.5] - 2026-07-15
 
 ### Fixed
