@@ -19,9 +19,30 @@ from ..agent.memory import ConversationMemory
 from ..agent.core import Agent
 from . import display
 
+from typer.core import TyperGroup
+import click
+
+class NaturalAgentGroup(TyperGroup):
+    def get_command(self, ctx, cmd_name):
+        rv = super().get_command(ctx, cmd_name)
+        if rv is not None:
+            return rv
+        return super().get_command(ctx, "chat")
+
+    def resolve_command(self, ctx, args):
+        if not args:
+            return super().resolve_command(ctx, args)
+        cmd_name = args[0]
+        # Check if the first argument is one of our registered subcommands
+        if cmd_name not in self.commands and cmd_name not in ["--help", "-h", "--version", "--install-completion", "--show-completion"]:
+            cmd = super().get_command(ctx, "chat")
+            return "chat", cmd, args
+        return super().resolve_command(ctx, args)
+
 app = typer.Typer(
     help="Nexus-Agent - Autonomous AI Coding Agent",
     invoke_without_command=True,
+    cls=NaturalAgentGroup,
 )
 
 @app.callback()

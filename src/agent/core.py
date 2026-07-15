@@ -133,7 +133,7 @@ class Agent:
                                 streamed_text += item
                                 if self.event_callback:
                                     self.event_callback({"type": "stream_chunk", "content": item})
-                                elif self.verbose:
+                                else:
                                     display.print_stream_chunk(item)
                         if response is None:
                             response = self.provider.complete(messages=messages, tools=self.tools, system=self.system)
@@ -208,8 +208,13 @@ class Agent:
                     final_text = response.text
                     if self.event_callback:
                         self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
-                    if stream:
+                    
+                    # FIX: Only print static response panel if it wasn't streamed live to prevent duplicate text print
+                    if stream and streamed_text and not self.event_callback:
+                        print() # Just insert a newline for formatting
+                    else:
                         display.print_response(final_text)
+                        
                     self.memory.add("assistant", final_text)
                     return final_text
         finally:
