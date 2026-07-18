@@ -48,6 +48,12 @@ def parse_at_mentions(user_input: str) -> str:
             resolved_path = Path(fpath)
 
         if resolved_path.exists() and resolved_path.is_file():
+            from .tools import _validate_workspace_path
+            validated = _validate_workspace_path(resolved_path)
+            if isinstance(validated, str):
+                attachments.append(f"[Warning: Security blocked reading @{fpath}: {validated}]")
+                continue
+
             pattern = r'(?:^|\s)@\s*' + re.escape(raw_fpath) + r'(?=\s|$|[.!,?;:])'
             clean_input = re.sub(pattern, ' ', clean_input).strip()
             try:
@@ -102,7 +108,7 @@ class Agent:
 
     @property
     def estimated_cost(self) -> float:
-        model_name = getattr(self.provider, "model", "claude-sonnet-4-6")
+        model_name = getattr(self.provider, "model", "claude-3-5-sonnet-20241022")
         return estimate_cost(model_name, self.total_input_tokens, self.total_output_tokens)
 
     def run(self, user_input: str, stream: bool = False) -> str:
@@ -114,6 +120,7 @@ class Agent:
         status = display.create_status("Thinking...") if self.verbose else None
 
         iteration = 0
+        executed_tools = set()
         try:
             while iteration < self.max_iterations:
                 iteration += 1
@@ -136,7 +143,8 @@ class Agent:
                                 else:
                                     display.print_stream_chunk(item)
                         if response is None:
-                            response = self.provider.complete(messages=messages, tools=self.tools, system=self.system)
+                            approx_out = max(1, len(streamed_text) // 4) if streamed_text else 0
+                            response = ProviderResponse(text=streamed_text, input_tokens=0, output_tokens=approx_out)
                         elif streamed_text and not response.text:
                             response.text = streamed_text
                     else:
@@ -158,7 +166,7 @@ class Agent:
                     self.memory.add_raw(response.raw_assistant_message)
 
                     # Show THINKING trace: the LLM's reasoning text before tool call
-                    if response.text:
+                    if response.text and not stream:
                         if self.event_callback:
                             self.event_callback({"type": "thinking", "content": response.text})
                         if self.verbose:
@@ -185,8 +193,18 @@ class Agent:
                             status = None
                             display.print_tool_call(tool_call.name, tool_call.args)
 
+                        # Check for exact duplicate tool calls
+                        # We use json.dumps with sorted_keys to ensure deterministic string representation
+                        import json
+                        tool_sig = f"{tool_call.name}:{json.dumps(tool_call.args, sort_keys=True)}"
                         start = time.time()
-                        result = execute_tool(tool_call.name, tool_call.args)
+                        
+                        if tool_sig in executed_tools:
+                            result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
+                        else:
+                            executed_tools.add(tool_sig)
+                            result = execute_tool(tool_call.name, tool_call.args)
+                            
                         duration = time.time() - start
 
                         if self.event_callback:
@@ -209,11 +227,11 @@ class Agent:
                     if self.event_callback:
                         self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
                     
-                    # FIX: Only print static response panel if it wasn't streamed live to prevent duplicate text print
-                    if stream and streamed_text and not self.event_callback:
-                        print() # Just insert a newline for formatting
-                    else:
-                        display.print_response(final_text)
+                    if stream and not self.event_callback:
+                        if streamed_text:
+                            print() # Just insert a newline after streamed chunks
+                        else:
+                            display.print_response(final_text)
                         
                     self.memory.add("assistant", final_text)
                     return final_text

@@ -99,7 +99,8 @@ nexus-agent/
 ```mermaid
 graph TD
     User["Developer Query"] --> Core["Agent ReAct Loop"]
-    Core --> Provider["LLM Provider (OpenAI / Claude / Gemini)"]
+    Core --> Mem["Conversation Memory (Pair-Aware Pruning)"]
+    Mem --> Provider["LLM Provider (Local / OpenAI / Claude / Gemini)"]
     Provider -->|Tool Call Requested| Dispatcher["Tool Execution Dispatcher"]
     Provider -->|Rate Limit| Fallback["FallbackProvider (auto-switch)"]
     Fallback --> Provider
@@ -107,8 +108,8 @@ graph TD
     subgraph Sandbox Tools
         Dispatcher --> RF["read_file / list_directory"]
         Dispatcher --> WF["write_file"]
-        Dispatcher --> RC["run_code (Subprocess Timeout)"]
-        Dispatcher --> WEB["search_web (DuckDuckGo)"]
+        Dispatcher --> RC["run_code / run_file"]
+        Dispatcher --> WEB["search_web (DuckDuckGo / Offline Cache)"]
         Dispatcher --> GIT["git_status / git_diff / git_commit"]
     end
     
@@ -118,7 +119,7 @@ graph TD
     WEB --> Obs
     GIT --> Obs
     
-    Obs -->|Append Tool Result| Core
+    Obs -->|Append Tool Result| Mem
     Provider -->|Final Markdown Text| UI["Rich Terminal UI Panel"]
 ```
 

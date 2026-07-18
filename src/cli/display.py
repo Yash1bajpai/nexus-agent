@@ -110,7 +110,7 @@ def print_response(text: str):
 
 def print_footer(tokens: int, cost: float, time: float):
     """Print execution statistics footer."""
-    if tokens == 0 or cost == 0.0:
+    if tokens == 0 and cost == 0.0:
         console.print(f"\n  [dim]Tokens: N/A (local)  |  Est. cost: $0.0000 (offline)  |  Time: {time:.1f}s[/dim]\n")
     else:
         console.print(f"\n  [dim]Tokens: {tokens:,}  |  Est. cost: ${cost:.4f}  |  Time: {time:.1f}s[/dim]\n")

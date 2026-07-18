@@ -29,7 +29,7 @@ def test_search_web_offline_labeling():
     res = execute_search_web("python 3.13 new features")
     # Whether live or fallback, if fallback triggered it must have explicit labeling
     if "Offline/Cached Reference Data" in res:
-        assert "[Offline/Cached Reference Data - Live search unavailable or rate-limited]:" in res
+        assert "[Offline/Cached Reference Data (as of 2025) - Live search unavailable or rate-limited]:" in res
 
 def test_local_provider_setup_model_verify(monkeypatch):
     """Verify setup_model(verify_download=True) raises RuntimeError if huggingface_hub is missing or fails."""

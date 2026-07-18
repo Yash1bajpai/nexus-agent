@@ -228,8 +228,8 @@ def _show_welcome():
         print("+--------------------------------------+\n")
 
 def _step_api_keys():
-    """[1/3] - Check which API keys are set and offer to add missing ones."""
-    _print("\n[bold][[1/3]][/bold] [cyan]API Key Setup[/cyan]" if console else "\n[1/3] API Key Setup")
+    """[1/4] - Check which API keys are set and offer to add missing ones."""
+    _print("\n[bold][[1/4]][/bold] [cyan]API Key Setup[/cyan]" if console else "\n[1/4] API Key Setup")
 
     keys_to_check = [
         ("GEMINI_API_KEY", "Google Gemini"),
@@ -279,8 +279,8 @@ def _write_env_key(key: str, value: str):
     env_path.write_text("".join(lines), encoding="utf-8")
 
 def _step_system_specs():
-    """[2/3] - Detect RAM, CPU, GPU and recommend a local model."""
-    _print("\n[bold][[2/3]][/bold] [cyan]System Detection[/cyan]" if console else "\n[2/3] System Detection")
+    """[2/4] - Detect RAM, CPU, GPU and recommend a local model."""
+    _print("\n[bold][[2/4]][/bold] [cyan]System Detection[/cyan]" if console else "\n[2/4] System Detection")
 
     specs = detect_system_specs()
     ram = specs["ram_gb"]

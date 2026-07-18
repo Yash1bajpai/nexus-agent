@@ -93,7 +93,8 @@ class OpenAIProvider(BaseProvider):
 
         if not tool_calls and '"name"' in text and '"arguments"' in text:
             import re, uuid
-            matches = re.findall(r'(\{"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\})', text, re.DOTALL)
+            pattern = r'\{[^{}]*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|"[^"]*")\s*\}'
+            matches = re.findall(pattern, text, re.DOTALL)
             for m in matches:
                 try:
                     tc_data = json.loads(m)
@@ -110,10 +111,6 @@ class OpenAIProvider(BaseProvider):
                         text = text.replace(m, "").strip()
                 except Exception:
                     pass
-
-        if tool_calls and text:
-            import re
-            text = re.sub(r'\{"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}', '', text, flags=re.DOTALL).strip()
 
         raw_msg: Dict[str, Any] = {"role": "assistant"}
         if msg.content is not None:
@@ -151,29 +148,75 @@ class OpenAIProvider(BaseProvider):
             kwargs["tools"] = converted_tools
 
         try:
-            # Accumulate full response so we can apply JSON leakage stripping
-            # before yielding anything (critical for local models that leak tool JSON into text)
-            import re
             full_text = ""
+            # tool_call_deltas: {index: {"id": str, "name": str, "arguments": str}}
+            tc_deltas: Dict[int, Dict[str, str]] = {}
+            in_tokens = 0
+            out_tokens = 0
+
             response_stream = self.client.chat.completions.create(**kwargs)
             for chunk in response_stream:
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    full_text += chunk.choices[0].delta.content
+                if not chunk.choices:
+                    # Final chunk may carry usage without choices
+                    if chunk.usage:
+                        in_tokens = chunk.usage.prompt_tokens or 0
+                        out_tokens = chunk.usage.completion_tokens or 0
+                    continue
 
-            # Strip any raw tool JSON blocks that leaked into the text
-            cleaned = re.sub(
-                r'\{[\s]*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}',
-                '',
-                full_text,
-                flags=re.DOTALL
-            ).strip()
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    full_text += delta.content
+                    yield delta.content
 
-            # Also strip trailing comment lines that local models add after JSON
-            cleaned = re.sub(r'^\s*//.*$', '', cleaned, flags=re.MULTILINE).strip()
+                if delta and delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tc_deltas:
+                            tc_deltas[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc_delta.id:
+                            tc_deltas[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tc_deltas[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tc_deltas[idx]["arguments"] += tc_delta.function.arguments
 
-            if cleaned:
-                yield cleaned
-            yield ProviderResponse(text=cleaned)
+                if chunk.usage:
+                    in_tokens = chunk.usage.prompt_tokens or 0
+                    out_tokens = chunk.usage.completion_tokens or 0
+
+            # Build complete tool calls from accumulated deltas
+            tool_calls = []
+            raw_tool_calls = []
+            for idx in sorted(tc_deltas):
+                tcd = tc_deltas[idx]
+                try:
+                    parsed_args = json.loads(tcd["arguments"]) if tcd["arguments"] else {}
+                except Exception:
+                    parsed_args = {}
+                tool_calls.append(
+                    ToolCall(id=tcd["id"], name=tcd["name"], args=parsed_args)
+                )
+                raw_tool_calls.append({
+                    "id": tcd["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tcd["name"],
+                        "arguments": tcd["arguments"],
+                    }
+                })
+
+            raw_msg: Dict[str, Any] = {"role": "assistant", "content": full_text}
+            if raw_tool_calls:
+                raw_msg["tool_calls"] = raw_tool_calls
+
+            yield ProviderResponse(
+                text=full_text,
+                tool_calls=tool_calls,
+                raw_assistant_message=raw_msg,
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+            )
 
         except openai.RateLimitError as e:
             raise RateLimitError("OpenAI", str(e))

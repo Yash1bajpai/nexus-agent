@@ -117,16 +117,11 @@ class FallbackProvider(BaseProvider):
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
         try:
             if hasattr(self._current_provider, "stream") and self._current_provider is not None:
-                res = None
                 for chunk in self._current_provider.stream(messages, tools, system):
                     yield chunk
-                    if isinstance(chunk, ProviderResponse):
-                        res = chunk
-                if res is None:
-                    yield self.complete(messages, tools, system)
                 return
         except Exception as e:
-            self._switch_next(getattr(self._current_provider, "model", "unknown"), reason=str(e))
+            self._switch_next(self._current_name or "unknown", reason=str(e))
         res = self.complete(messages, tools, system)
         if res.text:
             yield res.text

@@ -84,7 +84,31 @@ class AnthropicProvider(BaseProvider):
                 for text_chunk in stream.text_stream:
                     full_text.append(text_chunk)
                     yield text_chunk
-            yield ProviderResponse(text="".join(full_text))
+                final_msg = stream.get_final_message()
+
+            text = "".join(full_text)
+            tool_calls = []
+            for content_block in final_msg.content:
+                if content_block.type == "tool_use":
+                    tool_calls.append(
+                        ToolCall(
+                            id=content_block.id,
+                            name=content_block.name,
+                            args=content_block.input,
+                        )
+                    )
+
+            raw_msg = {"role": "assistant", "content": final_msg.content}
+            in_tokens = final_msg.usage.input_tokens if final_msg.usage else 0
+            out_tokens = final_msg.usage.output_tokens if final_msg.usage else 0
+
+            yield ProviderResponse(
+                text=text,
+                tool_calls=tool_calls,
+                raw_assistant_message=raw_msg,
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+            )
         except anthropic.RateLimitError as e:
             raise RateLimitError("Anthropic", str(e))
         except Exception as e:

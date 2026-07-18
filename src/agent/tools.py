@@ -71,8 +71,8 @@ def execute_list_directory(path: str = ".") -> str:
             current_path = Path(current_root)
             depth = len(current_path.parts) - root_depth
 
-            if depth >= 2:
-                dirs[:] = []  # Do not recurse deeper than 2 levels
+            if depth >= 5:
+                dirs[:] = []  # Do not recurse deeper than 5 levels
                 continue
 
             # Filter out ignored directories in-place
@@ -131,8 +131,21 @@ def _sandbox_check(code: str) -> str | None:
                 violations.append(f"from {node.module} import ...")
 
         elif isinstance(node, ast.Attribute):
+            # Block access to dangerous module attributes
             if isinstance(node.value, ast.Name) and node.value.id in ("sys", "builtins", "__builtins__", "importlib"):
                 violations.append(f"{node.value.id}.{node.attr}")
+            # Block dunder attribute access (sandbox escape: ().__class__.__bases__)
+            elif node.attr.startswith("__") and node.attr.endswith("__"):
+                violations.append(f"dunder attribute access (.{node.attr}) — forbidden in sandboxed run_code")
+
+        elif isinstance(node, ast.Name):
+            # Block dangerous builtin names and dunder escape hatches
+            blocked_names = {
+                "globals", "locals", "vars", "dir", "help", "breakpoint",
+                "license", "credits", "copyright", "exit", "quit", "input",
+            }
+            if node.id in blocked_names or (node.id.startswith("__") and node.id.endswith("__")):
+                violations.append(f"{node.id} is not available in sandboxed run_code")
 
         elif isinstance(node, ast.Call):
             func = node.func
@@ -173,18 +186,20 @@ def execute_run_code(code: str, language: str = "python") -> str:
             tf.write(code)
             temp_path = tf.name
 
-        res = subprocess.run(
-            [sys.executable, temp_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=CODE_EXECUTION_TIMEOUT
-        )
         try:
-            os.unlink(temp_path)
-        except Exception:
-            pass
+            res = subprocess.run(
+                [sys.executable, temp_path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=CODE_EXECUTION_TIMEOUT
+            )
+        finally:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
         out = res.stdout.strip()
         err = res.stderr.strip()
@@ -287,7 +302,7 @@ def execute_search_web(query: str) -> str:
             warnings.warn = orig_warn
 
         if not results or not _is_relevant(results, query):
-            return f"[Offline/Cached Reference Data - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
+            return f"[Offline/Cached Reference Data (as of 2025) - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
 
         formatted = [f"Search results for: '{query}'\n"]
         for idx, r in enumerate(results, 1):
@@ -297,7 +312,7 @@ def execute_search_web(query: str) -> str:
             formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
         return "\n".join(formatted)
     except Exception:
-        return f"[Offline/Cached Reference Data - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
+        return f"[Offline/Cached Reference Data (as of 2025) - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
 
 def execute_git_status() -> str:
     """Run git status and git diff stats to inspect repository state."""
@@ -347,19 +362,18 @@ def execute_git_diff() -> str:
 
 def execute_git_commit(message: str) -> str:
     """Run git commit with the given message. Stages all tracked changes first if nothing is staged."""
+    """Run git commit with the given message. Errors if no staged changes exist."""
     try:
         if not message or not message.strip():
             return "ERROR: Commit message cannot be empty."
 
         # Check if anything is staged
-        staged_check = subprocess.run(["git", "diff", "--staged", "--name-only"],
-                                      capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        staged_check = subprocess.run(["git", "diff", "--cached", "--name-only"], capture_output=True, text=True, check=False)
         if not staged_check.stdout.strip():
-            # Auto-stage tracked modified files
-            subprocess.run(["git", "add", "-u"], capture_output=True, check=False)
+            return "ERROR: No staged changes found. Use git_status to review untracked/modified files, then manually stage specific files before committing."
 
         result = subprocess.run(
-            ["git", "commit", "-m", message.strip()],
+            ["git", "commit", "-m", message],
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
         )
         if result.returncode == 0:
@@ -495,6 +509,10 @@ GIT_COMMIT_TOOL = Tool(
 
 def execute_run_file(path: str) -> str:
     """Run an existing Python script file directly via subprocess."""
+    validated = _validate_workspace_path(path)
+    if isinstance(validated, str):
+        return validated
+        
     try:
         p = Path(path).resolve()
         if not p.exists():

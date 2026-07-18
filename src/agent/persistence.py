@@ -43,17 +43,33 @@ class SQLiteMemory:
                 "INSERT INTO conversation_history (session_id, role, message_json) VALUES (?, ?, ?)",
                 (self.session_id, role, json.dumps(message))
             )
-            # Prune excess messages
-            conn.execute("""
-                DELETE FROM conversation_history
-                WHERE session_id = ? AND id NOT IN (
-                    SELECT id FROM conversation_history
-                    WHERE session_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                )
-            """, (self.session_id, self.session_id, self.max_messages))
+            self._prune(conn)
             conn.commit()
+
+    def _prune(self, conn):
+        """Enforce sliding window limit cleanly without breaking tool_call / tool_result pairs."""
+        cursor = conn.execute(
+            "SELECT id, role FROM conversation_history WHERE session_id = ? ORDER BY id ASC",
+            (self.session_id,)
+        )
+        rows = cursor.fetchall()
+        if len(rows) <= self.max_messages:
+            return
+
+        target_idx = len(rows) - self.max_messages
+        while target_idx < len(rows):
+            if rows[target_idx][1] == "user":
+                break
+            target_idx += 1
+
+        if target_idx >= len(rows):
+            target_idx = len(rows) - self.max_messages
+            while target_idx < len(rows) and rows[target_idx][1] == "tool":
+                target_idx += 1
+
+        if target_idx > 0 and target_idx < len(rows):
+            cutoff_id = rows[target_idx][0]
+            conn.execute("DELETE FROM conversation_history WHERE session_id = ? AND id < ?", (self.session_id, cutoff_id))
 
     def get(self) -> List[Dict[str, Any]]:
         """Retrieve recent messages for the active session."""

@@ -28,8 +28,10 @@ def test_local_qwen_provider_convert_tools():
 def test_local_qwen_provider_setup_model(monkeypatch, capsys):
     prov = LocalQwenProvider()
     mock_snapshot = MagicMock(return_value="/mock/path/to/qwen-awq")
+    mock_hf = MagicMock()
+    mock_hf.snapshot_download = mock_snapshot
     
-    with patch("huggingface_hub.snapshot_download", mock_snapshot):
+    with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
         path = prov.setup_model()
         assert path == "/mock/path/to/qwen-awq"
         mock_snapshot.assert_called_once_with(

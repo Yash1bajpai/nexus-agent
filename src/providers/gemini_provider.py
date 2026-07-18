@@ -1,3 +1,4 @@
+import uuid
 from google import genai
 # pyrefly: ignore [missing-import]
 from google.genai import types
@@ -27,6 +28,18 @@ class GeminiProvider(BaseProvider):
                 content = msg.get("content", "")
                 if role == "assistant":
                     role = "model"
+                elif role == "tool":
+                    tool_name = msg.get("name") or msg.get("tool_call_id", "unknown_tool")
+                    formatted.append({
+                        "role": "model",
+                        "parts": [{
+                            "function_response": {
+                                "name": tool_name,
+                                "response": {"result": content},
+                            }
+                        }]
+                    })
+                    continue
                 elif role == "system":
                     continue
                 formatted.append({"role": role, "parts": [{"text": content}]})
@@ -83,7 +96,7 @@ class GeminiProvider(BaseProvider):
                     fc = part.function_call
                     tool_calls.append(
                         ToolCall(
-                            id=fc.name,
+                            id=f"{fc.name}_{uuid.uuid4().hex[:8]}",
                             name=fc.name,
                             args=dict(fc.args) if fc.args else {},
                         )
@@ -128,11 +141,40 @@ class GeminiProvider(BaseProvider):
                 config=config,
             )
             full_text = []
+            tool_calls = []
+            last_chunk = None
             for chunk in response_stream:
+                last_chunk = chunk
                 if hasattr(chunk, "text") and chunk.text:
                     full_text.append(chunk.text)
                     yield chunk.text
-            yield ProviderResponse(text="".join(full_text))
+                # Collect function_call parts from streamed chunks
+                if hasattr(chunk, "candidates") and chunk.candidates:
+                    for candidate in chunk.candidates:
+                        if candidate.content and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                if hasattr(part, "function_call") and part.function_call:
+                                    fc = part.function_call
+                                    tool_calls.append(
+                                        ToolCall(
+                                            id=f"{fc.name}_{uuid.uuid4().hex[:8]}",
+                                            name=fc.name,
+                                            args=dict(fc.args) if fc.args else {},
+                                        )
+                                    )
+
+            in_tokens = 0
+            out_tokens = 0
+            if last_chunk and hasattr(last_chunk, "usage_metadata") and last_chunk.usage_metadata:
+                in_tokens = int(getattr(last_chunk.usage_metadata, "prompt_token_count", 0) or 0)
+                out_tokens = int(getattr(last_chunk.usage_metadata, "candidates_token_count", 0) or 0)
+
+            yield ProviderResponse(
+                text="".join(full_text),
+                tool_calls=tool_calls,
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+            )
         except Exception as e:
             err_str = str(e).lower()
             if "429" in str(e) or "resource_exhausted" in err_str or "rate limit" in err_str or "quota" in err_str:

@@ -1,5 +1,7 @@
 import sys
 import time
+import re
+from pathlib import Path
 import typer
 from typing import Optional, Any, Tuple
 
@@ -44,16 +46,6 @@ app = typer.Typer(
     invoke_without_command=True,
     cls=NaturalAgentGroup,
 )
-
-@app.callback()
-def main_callback(ctx: typer.Context):
-    """Nexus-Agent — Autonomous AI Coding Agent.
-
-    Run without a subcommand to launch the interactive REPL session.
-    """
-    if ctx.invoked_subcommand is None:
-        # No subcommand → launch REPL with verbose ON by default
-        ctx.invoke(repl)
 
 
 def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
@@ -129,7 +121,8 @@ def chat(
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
-        display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
+        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
 
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
@@ -150,7 +143,7 @@ def chat(
 def repl(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (gemini/anthropic/openai/auto)."),
     verbose: bool = typer.Option(True, "--verbose/--no-verbose", "-v", help="Show verbose ReAct tool trace (default: ON)."),
-    no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (default: OFF for REPL)."),
+    no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (by default OFF in REPL mode for clean multi-turn prompts)."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
     """Start an interactive multi-turn REPL chat session."""
@@ -167,7 +160,8 @@ def repl(
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
-        display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
+        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         typer.echo("Type 'exit' or 'quit' to end the session.\n")
 
         while True:
@@ -205,7 +199,7 @@ def repl(
                         display.print_error(f"File not found: {file_to_rev}")
                         continue
                 elif lower_input.startswith("debug "):
-                    parts = user_input[6:].strip().split("--error")
+                    parts = re.split(r'--error\s+|-e\s+', user_input[6:].strip(), maxsplit=1)
                     file_to_dbg = parts[0].strip().strip('"').strip("'")
                     err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
                     try:
@@ -257,7 +251,8 @@ def review(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations, tools=get_readonly_tools())
-        display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
+        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Please perform a STRICTLY READ-ONLY review of the code in '{file_path}'. Use read_file first, analyze for bugs, security issues, and clean code best practices. Do NOT attempt to modify any files."
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
@@ -290,8 +285,9 @@ def debug(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
-        query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it, explain the root cause, and use write_file to fix it."
+        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
+        query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it carefully, explain the root cause, and if appropriate provide the fixed code."
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
         duration = time.time() - start_time
@@ -323,13 +319,18 @@ def generate(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode=getattr(agent, "mode_str", ""))
+        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Generate code based on this instruction: '{prompt}'. Write the final production code to '{output}' using write_file."
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
         duration = time.time() - start_time
         if no_stream:
             display.print_response(response_text)
+        if not Path(output).exists():
+            display.print_error(f"Warning: The agent completed execution but target file '{output}' was not verified on disk.")
+        else:
+            typer.echo(f"\n✅ Verified generated file created: {output}\n")
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
     except Exception as e:
         display.print_error(str(e))
@@ -362,7 +363,8 @@ def commit(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        display.print_header(resolved_name, getattr(prov, "model", "unknown"), mode="Commit Mode")
+        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        display.print_header(resolved_name, model_display, mode="Commit Mode")
 
         from ..agent.tools import execute_git_diff
         diff_text = execute_git_diff()
@@ -454,7 +456,7 @@ def main(
         pass  # Never block startup on onboarding errors
 
     if ctx.invoked_subcommand is None:
-        repl(provider=DEFAULT_PROVIDER, verbose=True, no_stream=True, max_iterations=10)
+        ctx.invoke(repl)
 
 
 if __name__ == "__main__":

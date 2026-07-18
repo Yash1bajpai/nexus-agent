@@ -77,3 +77,84 @@ def test_fallback_provider_general_exception():
     res = fb.complete([], [], "test")
     assert res.text == "Success"
     assert fb._current_name == "anthropic"
+
+def test_anthropic_complete_and_stream():
+    prov = AnthropicProvider()
+    mock_block_text = MagicMock()
+    mock_block_text.type = "text"
+    mock_block_text.text = "Here is the result."
+    
+    mock_block_tool = MagicMock()
+    mock_block_tool.type = "tool_use"
+    mock_block_tool.id = "toolu_123"
+    mock_block_tool.name = "test_tool"
+    mock_block_tool.input = {"arg1": "hello"}
+
+    mock_resp = MagicMock()
+    mock_resp.content = [mock_block_text, mock_block_tool]
+    mock_resp.usage.input_tokens = 15
+    mock_resp.usage.output_tokens = 25
+    prov.client.messages.create.return_value = mock_resp
+
+    res = prov.complete([{"role": "user", "content": "hi"}], [sample_tool], "system")
+    assert res.text == "Here is the result."
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0].id == "toolu_123"
+    assert res.tool_calls[0].name == "test_tool"
+    assert res.input_tokens == 15
+    assert res.output_tokens == 25
+
+def test_openai_complete_and_stream():
+    prov = OpenAIProvider()
+    mock_tool_call = MagicMock()
+    mock_tool_call.id = "call_abc"
+    mock_tool_call.function.name = "test_tool"
+    mock_tool_call.function.arguments = '{"arg1": "hello"}'
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = "Done."
+    mock_choice.message.tool_calls = [mock_tool_call]
+
+    mock_resp = MagicMock()
+    mock_resp.choices = [mock_choice]
+    mock_resp.usage.prompt_tokens = 10
+    mock_resp.usage.completion_tokens = 20
+    prov.client.chat.completions.create.return_value = mock_resp
+
+    res = prov.complete([{"role": "user", "content": "hi"}], [sample_tool], "system")
+    assert res.text == "Done."
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0].id == "call_abc"
+    assert res.tool_calls[0].name == "test_tool"
+    assert res.input_tokens == 10
+    assert res.output_tokens == 20
+
+def test_gemini_complete_and_stream():
+    prov = GeminiProvider()
+    mock_fc = MagicMock()
+    mock_fc.name = "test_tool"
+    mock_fc.args = {"arg1": "hello"}
+
+    mock_part_text = MagicMock()
+    mock_part_text.text = "Here is the info."
+    mock_part_text.function_call = None
+
+    mock_part_fc = MagicMock()
+    mock_part_fc.text = None
+    mock_part_fc.function_call = mock_fc
+
+    mock_candidate = MagicMock()
+    mock_candidate.content.parts = [mock_part_text, mock_part_fc]
+
+    mock_resp = MagicMock()
+    mock_resp.candidates = [mock_candidate]
+    mock_resp.usage_metadata.prompt_token_count = 12
+    mock_resp.usage_metadata.candidates_token_count = 18
+    prov.client.models.generate_content.return_value = mock_resp
+
+    res = prov.complete([{"role": "user", "content": "hi"}], [sample_tool], "system")
+    assert res.text == "Here is the info."
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0].name == "test_tool"
+    assert res.input_tokens == 12
+    assert res.output_tokens == 18

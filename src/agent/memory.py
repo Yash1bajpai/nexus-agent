@@ -19,9 +19,25 @@ class ConversationMemory:
         self._prune()
 
     def _prune(self):
-        """Enforce sliding window limit."""
-        if len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages:]
+        """Enforce sliding window limit cleanly without breaking tool_call / tool_result pairs."""
+        if len(self.messages) <= self.max_messages:
+            return
+
+        # Start looking from -self.max_messages for a safe split point
+        target_idx = len(self.messages) - self.max_messages
+        while target_idx < len(self.messages):
+            if self.messages[target_idx].get("role") == "user":
+                break
+            target_idx += 1
+
+        if target_idx >= len(self.messages):
+            # If no user message found in the trailing window, fall back to max_messages
+            target_idx = len(self.messages) - self.max_messages
+            # Adjust forward if it lands on a tool result or inside an active sequence
+            while target_idx < len(self.messages) and self.messages[target_idx].get("role") == "tool":
+                target_idx += 1
+
+        self.messages = self.messages[target_idx:]
 
     def get(self) -> List[Dict[str, Any]]:
         """Retrieve a copy of the current message history."""
