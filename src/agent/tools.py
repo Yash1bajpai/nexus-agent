@@ -16,9 +16,26 @@ def _validate_workspace_path(path: str | Path) -> Path | str:
         if p.is_relative_to(cwd) or p.is_relative_to(tmp):
             return p
     except AttributeError:
-        if str(p).startswith(str(cwd)) or str(p).startswith(str(tmp)):
-            return p
+        try:
+            if os.path.commonpath([str(p), str(cwd)]) == str(cwd) or \
+               os.path.commonpath([str(p), str(tmp)]) == str(tmp):
+                return p
+        except ValueError:
+            pass
     return f"ERROR: Security Sandbox Access Denied: Path '{path}' is outside the project workspace ({cwd})."
+
+def _safe_git_run(args: List[str]) -> subprocess.CompletedProcess:
+    """Execute a git command safely with timeouts, blocked stdin, and captured output."""
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        timeout=15.0,
+        check=False
+    )
 
 def execute_read_file(path: str) -> str:
     """Read the contents of any file and return it as a string."""
@@ -102,6 +119,12 @@ _FORBIDDEN_IMPORTS = frozenset({
     "os", "subprocess", "shutil", "socket", "urllib", "urllib3",
     "pickle", "ctypes", "multiprocessing", "http", "sys",
     "pathlib", "pty", "asm", "cffi", "signal", "importlib", "runpy", "builtins", "io", "codecs",
+    "gc", "warnings", "pkgutil",
+})
+
+_FORBIDDEN_ATTRIBUTES = frozenset({
+    "gi_frame", "gi_code", "f_builtins", "f_globals", "f_locals",
+    "cr_frame", "cr_code", "ag_frame", "ag_code", "get_objects", "get_referents"
 })
 
 def _sandbox_check(code: str) -> str | None:
@@ -134,6 +157,9 @@ def _sandbox_check(code: str) -> str | None:
             # Block access to dangerous module attributes
             if isinstance(node.value, ast.Name) and node.value.id in ("sys", "builtins", "__builtins__", "importlib"):
                 violations.append(f"{node.value.id}.{node.attr}")
+            # Block forbidden introspection/GC attributes
+            elif node.attr in _FORBIDDEN_ATTRIBUTES:
+                violations.append(f"forbidden attribute access (.{node.attr}) — forbidden in sandboxed run_code")
             # Block dunder attribute access (sandbox escape: ().__class__.__bases__)
             elif node.attr.startswith("__") and node.attr.endswith("__"):
                 violations.append(f"dunder attribute access (.{node.attr}) — forbidden in sandboxed run_code")
@@ -169,7 +195,6 @@ def _sandbox_check(code: str) -> str | None:
             f"If you need to run an existing script -> use the run_file tool."
         )
     return None
-
 
 def execute_run_code(code: str, language: str = "python") -> str:
     """Run Python code snippet in a sandboxed subprocess with AST analysis + timeout."""
@@ -317,8 +342,8 @@ def execute_search_web(query: str) -> str:
 def execute_git_status() -> str:
     """Run git status and git diff stats to inspect repository state."""
     try:
-        status_res = subprocess.run(["git", "status", "--short"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-        diff_res = subprocess.run(["git", "diff", "--stat"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        status_res = _safe_git_run(["git", "status", "--short"])
+        diff_res = _safe_git_run(["git", "diff", "--stat"])
 
         status_out = status_res.stdout.strip()
         diff_out = diff_res.stdout.strip()
@@ -340,12 +365,12 @@ def execute_git_diff() -> str:
     """Return full git diff of staged changes (or HEAD diff if nothing staged)."""
     try:
         # Try staged diff first
-        staged = subprocess.run(["git", "diff", "--staged"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        staged = _safe_git_run(["git", "diff", "--staged"])
         diff_text = staged.stdout.strip()
 
         if not diff_text:
             # Fallback: unstaged working-tree changes
-            unstaged = subprocess.run(["git", "diff", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+            unstaged = _safe_git_run(["git", "diff", "HEAD"])
             diff_text = unstaged.stdout.strip()
 
         if not diff_text:
@@ -361,21 +386,17 @@ def execute_git_diff() -> str:
         return f"ERROR: Could not read git diff: {str(e)}"
 
 def execute_git_commit(message: str) -> str:
-    """Run git commit with the given message. Stages all tracked changes first if nothing is staged."""
     """Run git commit with the given message. Errors if no staged changes exist."""
     try:
         if not message or not message.strip():
             return "ERROR: Commit message cannot be empty."
 
         # Check if anything is staged
-        staged_check = subprocess.run(["git", "diff", "--cached", "--name-only"], capture_output=True, text=True, check=False)
+        staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
         if not staged_check.stdout.strip():
             return "ERROR: No staged changes found. Use git_status to review untracked/modified files, then manually stage specific files before committing."
 
-        result = subprocess.run(
-            ["git", "commit", "-m", message],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
-        )
+        result = _safe_git_run(["git", "commit", "-m", message])
         if result.returncode == 0:
             return f"Committed successfully:\n{result.stdout.strip()}"
         else:
@@ -508,7 +529,7 @@ GIT_COMMIT_TOOL = Tool(
 )
 
 def execute_run_file(path: str) -> str:
-    """Run an existing Python script file directly via subprocess."""
+    """Run an existing Python script file directly via subprocess, checking contents with _sandbox_check first."""
     validated = _validate_workspace_path(path)
     if isinstance(validated, str):
         return validated
@@ -520,12 +541,24 @@ def execute_run_file(path: str) -> str:
         if p.suffix.lower() not in [".py"]:
             return f"ERROR: Only .py files are supported. Got: {p.suffix}"
 
+        # Read the file's text content and validate against AST sandbox
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return f"ERROR: Could not read script file for sandbox validation: {str(e)}"
+
+        sandbox_error = _sandbox_check(content)
+        if sandbox_error:
+            return f"ERROR: Run File Blocked: AST Sandbox validation failed.\n{sandbox_error}"
+
         res = subprocess.run(
             [sys.executable, str(p)],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            stdin=subprocess.DEVNULL,
             timeout=CODE_EXECUTION_TIMEOUT,
         )
         out = res.stdout.strip()
@@ -594,4 +627,3 @@ def execute_tool(name: str, args: Dict[str, Any]) -> str:
             except Exception as e:
                 return f"ERROR: Execution failed for tool '{name}': {str(e)}"
     return f"ERROR: Unknown tool '{name}'"
-

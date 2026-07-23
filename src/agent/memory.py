@@ -19,25 +19,48 @@ class ConversationMemory:
         self._prune()
 
     def _prune(self):
-        """Enforce sliding window limit cleanly without breaking tool_call / tool_result pairs."""
+        """Enforce sliding window limit cleanly by only slicing at user message boundaries."""
         if len(self.messages) <= self.max_messages:
             return
 
-        # Start looking from -self.max_messages for a safe split point
         target_idx = len(self.messages) - self.max_messages
-        while target_idx < len(self.messages):
-            if self.messages[target_idx].get("role") == "user":
+
+        # Find the nearest 'user' message to target_idx
+        # We scan both forward and backward to locate a user message index.
+        # We want to pick the one that keeps the size reasonably close to max_messages.
+        forward_idx = -1
+        for i in range(target_idx, len(self.messages)):
+            if self.messages[i].get("role") == "user":
+                forward_idx = i
                 break
-            target_idx += 1
 
-        if target_idx >= len(self.messages):
-            # If no user message found in the trailing window, fall back to max_messages
-            target_idx = len(self.messages) - self.max_messages
-            # Adjust forward if it lands on a tool result or inside an active sequence
-            while target_idx < len(self.messages) and self.messages[target_idx].get("role") == "tool":
-                target_idx += 1
+        backward_idx = -1
+        for i in range(target_idx - 1, -1, -1):
+            if self.messages[i].get("role") == "user":
+                backward_idx = i
+                break
 
-        self.messages = self.messages[target_idx:]
+        # Decide which index to use
+        if forward_idx != -1 and backward_idx != -1:
+            # Choose the one closer to target_idx
+            if abs(forward_idx - target_idx) <= abs(backward_idx - target_idx):
+                safe_idx = forward_idx
+            else:
+                safe_idx = backward_idx
+        elif forward_idx != -1:
+            safe_idx = forward_idx
+        elif backward_idx != -1:
+            safe_idx = backward_idx
+        else:
+            # If there are no user messages at all in the entire conversation history,
+            # we cannot safely prune while ensuring it starts with user. We do not prune.
+            return
+
+        # Slicing at safe_idx means the new list starts at safe_idx.
+        # Anthropic and OpenAI require the first message to be user (or system),
+        # so starting with a 'user' message is structurally valid.
+        if safe_idx > 0:
+            self.messages = self.messages[safe_idx:]
 
     def get(self) -> List[Dict[str, Any]]:
         """Retrieve a copy of the current message history."""

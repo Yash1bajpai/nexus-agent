@@ -4,7 +4,17 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.9] - 2026-07-23
+
+### Security & Reliability Patches
+- **Hardened AST Sandbox Check**: Blocked garbage collection introspections (`gc`), dynamic loaders (`pkgutil`, `importlib`), generator frames (`gi_frame`, `f_builtins`), and introspection attributes to prevent sandbox escapes.
+- **Run File Tool Sandbox Scanning**: Enforced the AST sandbox validator on `run_file` tool execution, preventing execution bypasses via temporary script writes.
+- **Resilient Memory Pruning**: Ensured conversation history slices are strictly aligned to `user` message boundaries to prevent API format validation errors on Anthropic and OpenAI.
+- **Path Traversal Fix**: Replaced string-based prefix checking fallback in `_validate_workspace_path` with secure `os.path.commonpath` calculations.
+- **Git subprocess deadlock prevention**: Implemented a git execution helper with timeout limits and blocked stdin redirection.
+
 ## [2.2.8] - 2026-07-15
+
 
 ### Documentation & User Guide Polish
 - **Comprehensive Initial Setup User Guide**: Added a step-by-step initial setup walkthrough directly inside `README.md` explaining automatic first-run onboarding wizard configuration (`nexus-agent`), offline local model pulling (`nexus-agent pull-model`), and manual cloud provider `.env` setup (`cp .env.example .env`).
