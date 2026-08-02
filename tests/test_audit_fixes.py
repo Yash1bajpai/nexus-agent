@@ -47,6 +47,35 @@ def test_sandbox_check_blocks_introspection_and_gc():
         err = _sandbox_check(e)
         assert err is not None, f"Expected exploit '{e}' to be blocked, but was allowed."
 
+def test_sandbox_check_allows_safe_dunders():
+    """Verify safe dunders are allowed while blocked ones are still rejected."""
+    safe_code_snippets = [
+        "if __name__ == '__main__':\n    print('hello')",
+        "def foo():\n    return __name__",
+        "class Bar:\n    def __init__(self):\n        self.x = __len__([1,2,3])",
+        "x = __str__(123)",
+        "assert __repr__(object())",
+        "d = {'a': 1}\nlen(d)",
+        "obj == None",
+    ]
+    for snippet in safe_code_snippets:
+        err = _sandbox_check(snippet)
+        assert err is None, f"Expected '{snippet}' to pass sandbox check, but got: {err}"
+
+    still_blocked = [
+        "(1).__class__",
+        "type.__bases__",
+        "object.__subclasses__()",
+        "[]..__class__.__mro__",
+        "().__globals__",
+        "exit.__builtins__",
+        "print.__code__",
+        "__import__('os')",
+    ]
+    for snippet in still_blocked:
+        err = _sandbox_check(snippet)
+        assert err is not None, f"Expected '{snippet}' to still be blocked, but was allowed."
+
 def test_validate_workspace_path_prefix_containment(tmp_path: Path, monkeypatch):
     """Verify path validation blocks prefix traversal even in fallback case."""
     cwd = tmp_path / "workspace"

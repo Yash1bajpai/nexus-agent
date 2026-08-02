@@ -127,6 +127,21 @@ _FORBIDDEN_ATTRIBUTES = frozenset({
     "cr_frame", "cr_code", "ag_frame", "ag_code", "get_objects", "get_referents"
 })
 
+# Dunders that are safe to use in sandboxed code (e.g. __name__ == "__main__").
+_SAFE_DUNDERS = frozenset({
+    "__name__", "__main__", "__file__", "__doc__", "__init__",
+    "__str__", "__repr__", "__len__", "__eq__", "__hash__",
+    "__bool__", "__iter__", "__next__", "__call__", "__contains__",
+    "__enter__", "__exit__", "__getattr__", "__setattr__",
+})
+
+# Dunders that are explicitly blocked (sandbox escape mechanisms).
+_BLOCKED_DUNDERS = frozenset({
+    "__class__", "__bases__", "__subclasses__", "__mro__",
+    "__globals__", "__builtins__", "__import__", "__code__",
+    "__func__", "__self__", "__weakref__", "__module__",
+})
+
 def _sandbox_check(code: str) -> str | None:
     """
     AST-based static analysis. Returns an error string if forbidden
@@ -160,17 +175,20 @@ def _sandbox_check(code: str) -> str | None:
             # Block forbidden introspection/GC attributes
             elif node.attr in _FORBIDDEN_ATTRIBUTES:
                 violations.append(f"forbidden attribute access (.{node.attr}) — forbidden in sandboxed run_code")
-            # Block dunder attribute access (sandbox escape: ().__class__.__bases__)
+            # Block dunder attribute access that leads to sandbox escape
             elif node.attr.startswith("__") and node.attr.endswith("__"):
-                violations.append(f"dunder attribute access (.{node.attr}) — forbidden in sandboxed run_code")
+                if node.attr in _BLOCKED_DUNDERS:
+                    violations.append(f"blocked dunder access (.{node.attr}) — forbidden in sandboxed run_code")
+                elif node.attr not in _SAFE_DUNDERS:
+                    violations.append(f"unrecognised dunder access (.{node.attr}) — forbidden in sandboxed run_code")
 
         elif isinstance(node, ast.Name):
-            # Block dangerous builtin names and dunder escape hatches
+            # Block dangerous builtin names and blocked dunder names (not safe dunders)
             blocked_names = {
                 "globals", "locals", "vars", "dir", "help", "breakpoint",
                 "license", "credits", "copyright", "exit", "quit", "input",
             }
-            if node.id in blocked_names or (node.id.startswith("__") and node.id.endswith("__")):
+            if node.id in blocked_names or (node.id in _BLOCKED_DUNDERS):
                 violations.append(f"{node.id} is not available in sandboxed run_code")
 
         elif isinstance(node, ast.Call):

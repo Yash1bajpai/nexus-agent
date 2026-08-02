@@ -4,6 +4,20 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-08-02
+
+### Fixed & Improved
+
+- **Sandbox Safe Dunder Allowlist** (`tools.py`): `_sandbox_check` now allows safe dunders (`__name__`, `__main__`, `__file__`, `__doc__`, `__str__`, `__repr__`, `__len__`, `__eq__`, etc.) while still blocking escape mechanisms (`__class__`, `__bases__`, `__subclasses__`, `__mro__`, `__globals__`, `__builtins__`, `__import__`, `__code__`). Legitimate code like `if __name__ == "__main__":` is no longer rejected.
+
+- **Streaming Response Rich Formatting** (`core.py`): When streaming is active and an event callback is absent, the accumulated response text is now rendered through `display.print_response()` — showing a Rich `Panel` with Markdown formatting instead of raw unstyled console output.
+
+- **GitHub Actions CI** (new file: `.github/workflows/ci.yml`): Added Python 3.11 / 3.12 / 3.13 matrix CI pipeline that runs `pip install -e .` and `pytest tests/ -v` on every push and PR to main/master.
+
+### Dependencies
+
+- **google-genai** provider tests now use `unittest.mock.patch` and environment-variable mocking, eliminating the need for real API keys in CI environments.
+
 ## [2.2.9] - 2026-07-23
 
 ### Security & Reliability Patches
