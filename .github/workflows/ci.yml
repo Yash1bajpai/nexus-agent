@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -18,14 +18,23 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e ".[dev]"
+
+      - name: Debug environment
+        run: |
+          python --version
+          python -m pytest --version
+          python -c "import src; print('src OK')"
+          python -c "from src.agent.tools import _sandbox_check; print('tools OK:', _sandbox_check('x=1'))"
+          python -c "from src.agent.core import Agent; print('core OK')"
+          python -c "from src.cli import display; print('display OK')"
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
