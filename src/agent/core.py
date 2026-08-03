@@ -228,12 +228,12 @@ class Agent:
                         self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
                     
                     if stream and not self.event_callback:
-                                            if streamed_text:
-                                                print()  # newline after streamed chunks
-                                                display.print_response(streamed_text)  # Rich panel + Markdown
-                                            else:
-                                                display.print_response(final_text)
-                        
+                        if streamed_text:
+                            print()  # newline after streamed chunks
+                            display.print_response(streamed_text)  # Rich panel + Markdown
+                        else:
+                            display.print_response(final_text)
+
                     self.memory.add("assistant", final_text)
                     return final_text
         finally:
