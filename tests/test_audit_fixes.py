@@ -2,11 +2,11 @@ import os
 import pytest
 import tempfile
 from pathlib import Path
-from src.agent.tools import _sandbox_check, execute_search_web, _validate_workspace_path, execute_run_file
-from src.providers.local_provider import LocalQwenProvider
-from src.agent.core import Agent
-from src.providers.base import BaseProvider, ProviderResponse, Tool
-from src.agent.memory import ConversationMemory
+from nexus_agent_ai.agent.tools import _sandbox_check, execute_search_web, _validate_workspace_path, execute_run_file
+from nexus_agent_ai.providers.local_provider import LocalQwenProvider
+from nexus_agent_ai.agent.core import Agent
+from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, Tool
+from nexus_agent_ai.agent.memory import ConversationMemory
 
 def test_sandbox_check_blocks_bypass():
     """Verify AST static analysis blocks builtins, getattr, and indirect import/exec bypasses."""
@@ -200,6 +200,6 @@ def test_agent_run_stream_true():
 
 def test_onboarding_env_file_path():
     """Verify ENV_FILE is safely contained within the project directory."""
-    from src.cli.onboarding import _find_project_root, ENV_FILE
+    from nexus_agent_ai.cli.onboarding import _find_project_root, ENV_FILE
     root = _find_project_root()
     assert ENV_FILE == root / ".env"

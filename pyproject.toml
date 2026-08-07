@@ -37,11 +37,11 @@ local = [
 ]
 
 [project.scripts]
-nexus-agent = "src.cli.app:app"
-agent = "src.cli.app:app"
+nexus-agent = "nexus_agent_ai.cli.app:app"
+agent = "nexus_agent_ai.cli.app:app"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 exclude = ["venv*", "tests*"]
 
 [tool.pytest.ini_options]

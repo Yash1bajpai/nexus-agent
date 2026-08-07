@@ -1,13 +1,13 @@
 import pytest
 from unittest.mock import MagicMock, patch
 # pyrefly: ignore [missing-import]
-from src.providers.base import Tool
+from nexus_agent_ai.providers.base import Tool
 # pyrefly: ignore [missing-import]
-from src.providers.anthropic_provider import AnthropicProvider
+from nexus_agent_ai.providers.anthropic_provider import AnthropicProvider
 # pyrefly: ignore [missing-import]
-from src.providers.openai_provider import OpenAIProvider
+from nexus_agent_ai.providers.openai_provider import OpenAIProvider
 # pyrefly: ignore [missing-import]
-from src.providers.gemini_provider import GeminiProvider
+from nexus_agent_ai.providers.gemini_provider import GeminiProvider
 
 @pytest.fixture(autouse=True)
 def mock_api_clients(monkeypatch):
@@ -62,8 +62,8 @@ def test_provider_tool_result_format():
     assert res_g["role"] == "tool"
 
 def test_fallback_provider_general_exception():
-    from src.providers.fallback_provider import FallbackProvider
-    from src.providers.base import ProviderResponse
+    from nexus_agent_ai.providers.fallback_provider import FallbackProvider
+    from nexus_agent_ai.providers.base import ProviderResponse
     fb = FallbackProvider(start_provider="gemini")
     
     mock_p1 = MagicMock()

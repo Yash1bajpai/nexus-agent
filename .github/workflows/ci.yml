@@ -31,10 +31,10 @@ jobs:
         run: |
           python --version
           python -m pytest --version
-          python -c "import src; print('src OK')"
-          python -c "from src.agent.tools import _sandbox_check; print('tools OK:', _sandbox_check('x=1'))"
-          python -c "from src.agent.core import Agent; print('core OK')"
-          python -c "from src.cli import display; print('display OK')"
+          python -c "import nexus_agent_ai; print('src OK')"
+          python -c "from nexus_agent_ai.agent.tools import _sandbox_check; print('tools OK:', _sandbox_check('x=1'))"
+          python -c "from nexus_agent_ai.agent.core import Agent; print('core OK')"
+          python -c "from nexus_agent_ai.cli import display; print('display OK')"
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short

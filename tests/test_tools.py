@@ -1,6 +1,6 @@
 import pytest
 from pathlib import Path
-from src.agent.tools import execute_read_file, execute_list_directory, execute_tool
+from nexus_agent_ai.agent.tools import execute_read_file, execute_list_directory, execute_tool
 
 def test_read_file_success(tmp_path: Path):
     test_file = tmp_path / "sample.txt"
@@ -55,7 +55,7 @@ def test_execute_tool_dispatcher():
     assert "ERROR: Unknown tool" in res_unknown
 
 def test_get_readonly_tools():
-    from src.agent.tools import get_readonly_tools
+    from nexus_agent_ai.agent.tools import get_readonly_tools
     ro_tools = get_readonly_tools()
     names = [t.name for t in ro_tools]
     assert "read_file" in names

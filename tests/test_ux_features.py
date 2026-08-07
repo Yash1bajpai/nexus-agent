@@ -2,11 +2,11 @@ import os
 import re
 import pytest
 from typing import Any
-from src.agent.core import parse_at_mentions, Agent
-from src.agent.memory import ConversationMemory
-from src.agent.persistence import SQLiteMemory
-from src.providers.base import BaseProvider, ProviderResponse
-from src.cli import display
+from nexus_agent_ai.agent.core import parse_at_mentions, Agent
+from nexus_agent_ai.agent.memory import ConversationMemory
+from nexus_agent_ai.agent.persistence import SQLiteMemory
+from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse
+from nexus_agent_ai.cli import display
 
 class DummyProvider(BaseProvider):
     @property

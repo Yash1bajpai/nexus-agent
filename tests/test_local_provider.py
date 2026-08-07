@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from src.providers.base import Tool
-from src.providers.local_provider import LocalQwenProvider
+from nexus_agent_ai.providers.base import Tool
+from nexus_agent_ai.providers.local_provider import LocalQwenProvider
 
 
 def test_local_qwen_provider_init():
