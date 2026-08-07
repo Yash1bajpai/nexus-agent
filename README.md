@@ -79,22 +79,23 @@ nexus-agent/
 ├── requirements.txt             ← Core dependencies (Typer, Rich, OpenAI, Anthropic, Gemini, DDGS)
 ├── .env.example                 ← Environment variable configuration template
 └── src/
-    ├── agent/
-    │   ├── core.py              ← Autonomous ReAct agent loop & system instructions
-    │   ├── memory.py            ← Sliding-window conversation buffer (max 20 turns)
-    │   └── tools.py             ← Universal tool schema & execution handlers
-    ├── cli/
-    │   ├── app.py               ← Typer CLI command definitions (chat, repl, review, debug, generate, commit)
-    │   ├── display.py           ← Rich terminal UI components & live cost tracking
-    │   └── onboarding.py        ← First-run wizard (API keys, system spec detection, provider setup)
-    ├── providers/
-    │   ├── base.py              ← Abstract BaseProvider interface & RateLimitError
-    │   ├── fallback_provider.py ← Auto-fallback chain (gemini → anthropic → openai)
-    │   ├── openai_provider.py   ← OpenAI backend implementation
-    │   ├── anthropic_provider.py ← Anthropic claude-sonnet-4-6 backend implementation
-    │   └── gemini_provider.py   ← Google gemini-2.5-flash backend implementation
-    └── utils/
-        └── config.py            ← Environment loader & dynamic token cost calculator
+    └── nexus_agent_ai/
+        ├── agent/
+        │   ├── core.py              ← Autonomous ReAct agent loop & system instructions
+        │   ├── memory.py            ← Sliding-window conversation buffer (max 20 turns)
+        │   └── tools.py             ← Universal tool schema & execution handlers
+        ├── cli/
+        │   ├── app.py               ← Typer CLI command definitions (chat, repl, review, debug, generate, commit)
+        │   ├── display.py           ← Rich terminal UI components & live cost tracking
+        │   └── onboarding.py        ← First-run wizard (API keys, system spec detection, provider setup)
+        ├── providers/
+        │   ├── base.py              ← Abstract BaseProvider interface & RateLimitError
+        │   ├── fallback_provider.py ← Auto-fallback chain (gemini → anthropic → openai)
+        │   ├── openai_provider.py   ← OpenAI backend implementation
+        │   ├── anthropic_provider.py ← Anthropic claude-sonnet-4-6 backend implementation
+        │   └── gemini_provider.py   ← Google gemini-2.5-flash backend implementation
+        └── utils/
+            └── config.py            ← Environment loader & dynamic token cost calculator
 ```
 
 ### Cognitive ReAct Workflow
@@ -246,13 +247,13 @@ nexus-agent chat "Create a python script primes.py that generates the first 20 p
 #### 🔍 3. Read-Only Code Review (`review`)
 Perform a strict read-only audit of any local code file to identify bugs, security vulnerabilities (`SQLi`, path traversal), and performance bottlenecks:
 ```bash
-nexus-agent review src/utils/config.py --provider local
+nexus-agent review src/nexus_agent_ai/utils/config.py --provider local
 ```
 
 #### 🐞 4. Autonomous Error Traceback Repair (`debug`)
 Paste any terminal traceback or error message directly into Nexus-Agent. The agent autonomously reads the problematic file, diagnoses the exact root cause, and applies the corrected fix via `write_file`:
 ```bash
-nexus-agent debug src/app.py --error "ZeroDivisionError: float division by zero when response_times is empty"
+nexus-agent debug src/nexus_agent_ai/cli/app.py --error "ZeroDivisionError: float division by zero when response_times is empty"
 ```
 
 #### 📝 5. Direct Code File Generation (`generate`)
@@ -288,7 +289,7 @@ nexus-agent chat "Refactor utils.py to use dataclasses" --verbose
 ```
 
 #### `@mention` File Context Injection
-Inside REPL mode or chat prompts, mention any file path using `@filename` (e.g. `@src/agent/core.py`). Nexus-Agent automatically attaches the file's exact contents cleanly into its context window before answering.
+Inside REPL mode or chat prompts, mention any file path using `@filename` (e.g. `@src/nexus_agent_ai/agent/core.py`). Nexus-Agent automatically attaches the file's exact contents cleanly into its context window before answering.
 
 ---
 
