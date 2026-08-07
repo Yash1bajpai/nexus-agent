@@ -65,4 +65,4 @@ def get_package_version() -> str:
             pass
     except Exception:
         pass
-    return "2.3.1"
+    return "2.3.2"

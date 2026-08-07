@@ -4,7 +4,7 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.3.1] - 2026-08-07
+## [2.3.2] - 2026-08-07
 
 ### Windows Onboarding & Direct Module Invocation
 - **Direct Module Invocation Entrypoint**: Added `src/__main__.py` to enable launching `nexus-agent` directly via `python -m nexus_agent_ai` or `python -m src` when `PATH` binary registration is skipped.
