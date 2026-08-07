@@ -152,6 +152,31 @@ nexus-agent
 ```
 *(Optional: If you explicitly want Claude (`anthropic`) or ChatGPT (`openai`) models inside Termux, run `pkg install rust python-pydantic -y` before installing via `pip install nexus-agent-ai[all]`)*
 
+#### 🪟 Windows Setup & Troubleshooting Guide
+If installing or running on Windows 10/11, here are standard resolutions for common Windows & PyPI edge cases:
+
+1. **PowerShell Script Execution Restriction (`PSSecurityException`)**:
+   If activating a virtual environment (`venv\Scripts\activate`) fails due to script execution policies, run this in PowerShell:
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+   ```
+2. **File-Locking Bug (`[WinError 2] .deleteme`)**:
+   If upgrading global dependencies triggers Windows binary file-locking errors, upgrade `pip` first:
+   ```powershell
+   python -m pip install --upgrade pip
+   ```
+3. **Executable PATH Isolation Warning (`CommandNotFoundException`)**:
+   If `nexus-agent` is not recognized because `AppData\Roaming\Python\Scripts` is not on system `PATH`, launch directly via Python module invocation:
+   ```powershell
+   python -m nexus_agent_ai
+   ```
+4. **Official PyPI Package Identifier**:
+   Ensure you install using the exact PyPI package name **`nexus-agent-ai`**:
+   ```powershell
+   pip install nexus-agent-ai
+   ```
+
+
 Or clone for local development:
 ```bash
 git clone https://github.com/Yash1bajpai/nexus-agent.git
