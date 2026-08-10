@@ -69,9 +69,9 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
     elif name_clean in ["openai", "gpt", "gpt-4o"]:
         from ..providers.openai_provider import OpenAIProvider
         return OpenAIProvider(), "openai"
-    elif name_clean in ["local", "qwen", "awq", "default", "mock", "demo"]:
-        from ..providers.local_provider import LocalQwenProvider
-        prov = LocalQwenProvider()
+    elif name_clean in ["local", "liquid", "lfm", "default", "demo"]:
+        from ..providers.local_provider import LocalProvider
+        prov = LocalProvider()
         prov.setup_model()
         return prov, "Liquid LFM (2.6B-Q6_K Local)"
     elif name_clean in ["ollama"]:
@@ -86,20 +86,21 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         or_key = os.getenv("OPENROUTER_API_KEY", "")
         if not or_key:
             raise Exception("OPENROUTER_API_KEY not set in .env")
+        model = os.getenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free")
         return OpenAIProvider(
-            model="meta-llama/llama-3.3-70b-instruct:free",
+            model=model,
             base_url="https://openrouter.ai/api/v1",
             api_key=or_key,
-        ), "OpenRouter (llama-3.3-70b:free)"
+        ), f"OpenRouter ({model.split('/')[-1]})"
     elif name_clean == "auto":
         from ..providers.fallback_provider import FallbackProvider
         fb = FallbackProvider(start_provider=DEFAULT_PROVIDER)
         fb._warn_fn = display.print_fallback_switch
         return fb, f"auto ({fb._current_name})"
     else:
-        display.print_warn(f"Unknown provider '{provider_name}'. Using Local Qwen fallback.")
-        from ..providers.local_provider import LocalQwenProvider
-        prov = LocalQwenProvider()
+        display.print_warn(f"Unknown provider '{provider_name}'. Using local Liquid LFM fallback.")
+        from ..providers.local_provider import LocalProvider
+        prov = LocalProvider()
         prov.setup_model()
         return prov, "Liquid LFM (2.6B-Q6_K Local)"
 
@@ -124,7 +125,7 @@ def chat(
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
-        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
 
         start_time = time.time()
@@ -150,6 +151,7 @@ def repl(
     verbose: bool = typer.Option(True, "--verbose/--no-verbose", "-v", help="Show verbose ReAct tool trace (default: ON)."),
     no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (by default OFF in REPL mode for clean multi-turn prompts)."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
+    persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
 ):
     """Start an interactive multi-turn REPL chat session."""
     if hasattr(provider, "default"):
@@ -160,15 +162,26 @@ def repl(
         no_stream = bool(no_stream.default)
     if hasattr(max_iterations, "default"):
         max_iterations = int(max_iterations.default)
+    if hasattr(persist, "default"):
+        persist = bool(persist.default)
     if max_iterations <= 0:
         display.print_error("max-iterations must be a positive integer > 0.")
         raise typer.Exit(code=1)
     try:
         prov, resolved_name = get_provider_instance(provider)
-        memory = ConversationMemory()
+        if persist:
+            try:
+                from ..agent.persistence import SQLiteMemory
+                memory = SQLiteMemory()
+                typer.echo("  [i]Persistent mode: history saved to ~/.nexus-agent/history.db[/i]\n")
+            except Exception as e:
+                display.print_warn(f"SQLite persistence unavailable ({e}), falling back to in-memory.")
+                memory = ConversationMemory()
+        else:
+            memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
-        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         typer.echo("Type 'exit' or 'quit' to end the session.\n")
 
@@ -257,6 +270,10 @@ def repl(
             except (KeyboardInterrupt, EOFError):
                 typer.echo("\nSession ended. Goodbye!")
                 break
+            except Exception as e:
+                display.print_error(f"Error during request: {str(e)}")
+                typer.echo("  (Session continues — try another query or 'exit' to quit.)\n")
+                continue
 
     except ConfigError as e:
         display.print_error(str(e))
@@ -295,7 +312,7 @@ def review(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations, tools=get_readonly_tools())
-        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Please perform a STRICTLY READ-ONLY review of the code in '{file_path}'. Use read_file first, analyze for bugs, security issues, and clean code best practices. Do NOT attempt to modify any files."
         start_time = time.time()
@@ -339,7 +356,7 @@ def debug(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it carefully, explain the root cause, and if appropriate provide the fixed code."
         start_time = time.time()
@@ -380,7 +397,7 @@ def generate(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Generate code based on this instruction: '{prompt}'. Write the final production code to '{output}' using write_file."
         start_time = time.time()
@@ -427,7 +444,7 @@ def commit(
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode="Commit Mode")
 
         query = (
@@ -486,8 +503,8 @@ def commit(
 def pull_model_cmd():
     """Download or verify the built-in local reasoning model."""
     typer.echo("\n🚀 Nexus-Agent — Pulling Built-In Local Quantized Reasoning Model")
-    from ..providers.local_provider import LocalQwenProvider
-    prov = LocalQwenProvider()
+    from ..providers.local_provider import LocalProvider
+    prov = LocalProvider()
     try:
         path = prov.setup_model(verify_download=True)
         typer.echo(f"\n✅ Local Quantized Model Ready at: {path}\n")

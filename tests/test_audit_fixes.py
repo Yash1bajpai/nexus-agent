@@ -3,7 +3,7 @@ import pytest
 import tempfile
 from pathlib import Path
 from nexus_agent_ai.agent.tools import _sandbox_check, execute_search_web, _validate_workspace_path, execute_run_file
-from nexus_agent_ai.providers.local_provider import LocalQwenProvider
+from nexus_agent_ai.providers.local_provider import LocalProvider
 from nexus_agent_ai.agent.core import Agent
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, Tool
 from nexus_agent_ai.agent.memory import ConversationMemory
@@ -163,7 +163,7 @@ def test_search_web_offline_labeling():
 
 def test_local_provider_setup_model_verify(monkeypatch):
     """Verify setup_model(verify_download=True) raises RuntimeError if huggingface_hub is missing or fails."""
-    prov = LocalQwenProvider()
+    prov = LocalProvider()
     
     import builtins
     orig_import = builtins.__import__

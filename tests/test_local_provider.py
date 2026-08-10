@@ -1,17 +1,17 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from nexus_agent_ai.providers.base import Tool
-from nexus_agent_ai.providers.local_provider import LocalQwenProvider
+from nexus_agent_ai.providers.local_provider import LocalProvider
 
 
-def test_local_qwen_provider_init():
-    prov = LocalQwenProvider()
+def test_local_provider_init():
+    prov = LocalProvider()
     assert prov.model_id == "LiquidAI/LFM2.5-2.6B-GGUF"
     assert prov.filename == "LFM2.5-2.6B-Q6_K.gguf"
 
 
-def test_local_qwen_provider_convert_tools():
-    prov = LocalQwenProvider()
+def test_local_provider_convert_tools():
+    prov = LocalProvider()
     sample_tool = Tool(
         name="test_tool",
         description="A dummy test tool.",
@@ -25,8 +25,8 @@ def test_local_qwen_provider_convert_tools():
     assert converted[0]["function"]["parameters"]["type"] == "object"
 
 
-def test_local_qwen_provider_setup_model(monkeypatch, capsys):
-    prov = LocalQwenProvider()
+def test_local_provider_setup_model(monkeypatch, capsys):
+    prov = LocalProvider()
     mock_hub_download = MagicMock(return_value="/mock/path/to/liquid-gguf")
     mock_hf = MagicMock()
     mock_hf.hf_hub_download = mock_hub_download
@@ -46,8 +46,8 @@ def test_local_qwen_provider_setup_model(monkeypatch, capsys):
     assert "Core engine ready!" in captured.out
 
 
-def test_local_qwen_format_tool_result_message():
-    prov = LocalQwenProvider()
+def test_local_provider_format_tool_result_message():
+    prov = LocalProvider()
     res = prov.format_tool_result_message("call_xyz", "Result from tool")
     assert res["role"] == "tool"
     assert res["tool_call_id"] == "call_xyz"

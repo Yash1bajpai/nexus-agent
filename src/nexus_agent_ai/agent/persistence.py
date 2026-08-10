@@ -47,25 +47,46 @@ class SQLiteMemory:
             conn.commit()
 
     def _prune(self, conn):
-        """Enforce sliding window limit cleanly without breaking tool_call / tool_result pairs."""
+        """Enforce sliding window limit cleanly without breaking tool_call / tool_result pairs.
+        Detects Anthropic tool_result (content with type='tool_result'), Gemini function_response
+        (parts with function_response), and OpenAI tool role to avoid orphaned messages."""
         cursor = conn.execute(
-            "SELECT id, role FROM conversation_history WHERE session_id = ? ORDER BY id ASC",
+            "SELECT id, role, message_json FROM conversation_history WHERE session_id = ? ORDER BY id ASC",
             (self.session_id,)
         )
         rows = cursor.fetchall()
         if len(rows) <= self.max_messages:
             return
 
+        def _is_genuine_user_msg(role: str, msg_json: str) -> bool:
+            if role != "user":
+                return False
+            try:
+                msg = json.loads(msg_json)
+            except Exception:
+                return True
+            if "tool_call_id" in msg or "tool_use_id" in msg or "name" in msg:
+                return False
+            parts = msg.get("parts")
+            if isinstance(parts, list):
+                for p in parts:
+                    if isinstance(p, dict) and "function_response" in p:
+                        return False
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        return False
+            return True
+
         target_idx = len(rows) - self.max_messages
         while target_idx < len(rows):
-            if rows[target_idx][1] == "user":
+            if _is_genuine_user_msg(rows[target_idx][1], rows[target_idx][2]):
                 break
             target_idx += 1
 
         if target_idx >= len(rows):
             target_idx = len(rows) - self.max_messages
-            while target_idx < len(rows) and rows[target_idx][1] == "tool":
-                target_idx += 1
 
         if target_idx > 0 and target_idx < len(rows):
             cutoff_id = rows[target_idx][0]

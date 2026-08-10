@@ -2,9 +2,14 @@ include README.md
 include CHANGELOG.md
 include pyproject.toml
 include requirements.txt
-recursive-include src *
+recursive-include src *.py
 prune venv
 prune tests
 prune docs
 prune .git
 prune .github
+prune dist
+prune build
+prune __pycache__
+recursive-exclude src __pycache__
+recursive-exclude src *.pyc

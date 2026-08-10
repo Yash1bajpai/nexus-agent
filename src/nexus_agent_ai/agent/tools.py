@@ -92,8 +92,8 @@ def execute_list_directory(path: str = ".") -> str:
             current_path = Path(current_root)
             depth = len(current_path.parts) - root_depth
 
-            if depth >= 5:
-                dirs[:] = []  # Do not recurse deeper than 5 levels
+            if depth >= 3:
+                dirs[:] = []  # Do not recurse deeper than 2 levels
                 continue
 
             # Filter out ignored directories in-place
@@ -120,16 +120,22 @@ def execute_list_directory(path: str = ".") -> str:
 # Modules that are too dangerous to allow inside agent-generated run_code snippets.
 # Use read_file / write_file tools for file I/O; use git_status / git_diff for shell work.
 _FORBIDDEN_IMPORTS = frozenset({
-    "os", "subprocess", "shutil", "socket", "urllib", "urllib3", "httpx", "requests",
-    "pickle", "ctypes", "multiprocessing", "http", "sys", "platform", "operator",
+    "os", "subprocess", "shutil", "socket", "socketserver", "urllib", "urllib3", "http", "httpx", "requests",
+    "pickle", "shelve", "ctypes", "multiprocessing", "sys", "platform", "operator",
     "pathlib", "pty", "asm", "cffi", "signal", "importlib", "runpy", "builtins", "io", "codecs",
     "gc", "warnings", "pkgutil", "types", "marshal", "smtplib", "ftplib", "telnetlib",
     "threading", "asyncio", "socketio",
+    "linecache", "xmlrpc", "xmlrpc.client", "xmlrpc.server",
+    "winreg", "webbrowser", "email", "json.tool",
+    "zipfile", "tarfile", "tempfile", "glob", "fileinput", "filecmp",
+    "compileall", "zipimport", "pkg_resources",
+    "inspect", "traceback", "__future__",
 })
 
 _FORBIDDEN_ATTRIBUTES = frozenset({
     "gi_frame", "gi_code", "f_builtins", "f_globals", "f_locals",
-    "cr_frame", "cr_code", "ag_frame", "ag_code", "get_objects", "get_referents"
+    "cr_frame", "cr_code", "ag_frame", "ag_code", "get_objects", "get_referents",
+    "__reduce__", "__reduce_ex__", "__getstate__", "__setstate__",
 })
 
 # Dunders that are safe to use in sandboxed code (e.g. __name__ == "__main__").

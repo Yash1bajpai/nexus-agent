@@ -8,14 +8,15 @@ def _make_gemini():
     return GeminiProvider()
 
 def _make_openrouter():
-    """OpenRouter free tier — Llama 3.3 70B free model."""
+    """OpenRouter free tier — env-configurable model with sensible default."""
     import os
     from .openai_provider import OpenAIProvider
     or_key = os.getenv("OPENROUTER_API_KEY", "")
     if not or_key:
         raise ConfigError("OPENROUTER_API_KEY not set in .env")
+    model = os.getenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free")
     return OpenAIProvider(
-        model="meta-llama/llama-3.3-70b-instruct:free",
+        model=model,
         base_url="https://openrouter.ai/api/v1",
         api_key=or_key,
     )
@@ -115,13 +116,28 @@ class FallbackProvider(BaseProvider):
                 self._switch_next(failed, reason=str(e))
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
-        try:
-            if hasattr(self._current_provider, "stream") and self._current_provider is not None:
-                for chunk in self._current_provider.stream(messages, tools, system):
-                    yield chunk
-                return
-        except Exception as e:
-            self._switch_next(self._current_name or "unknown", reason=str(e))
+        """Stream with fallback: yield chunks progressively from the current provider.
+        On failure, switch to next provider and retry from scratch (partial output
+        from the failed provider will already be on screen — acceptable tradeoff
+        for live streaming UX)."""
+        while True:
+            try:
+                if hasattr(self._current_provider, "stream") and self._current_provider is not None:
+                    for chunk in self._current_provider.stream(messages, tools, system):
+                        yield chunk
+                    return  # stream completed successfully
+                else:
+                    break
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                failed = self._current_name or "unknown"
+                try:
+                    self._switch_next(failed, reason=str(e))
+                except RateLimitError:
+                    raise  # no more fallbacks
+                # Switched to next provider — retry from scratch
+        # No stream support — fall back to complete()
         res = self.complete(messages, tools, system)
         if res.text:
             yield res.text

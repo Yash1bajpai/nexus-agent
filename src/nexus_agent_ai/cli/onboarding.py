@@ -183,7 +183,7 @@ def suggest_local_model(specs: dict) -> tuple[str, str]:
     Tier logic:
       GPU any          → 7B+ models
       RAM > 16GB       → 7B models comfortably
-      4 < RAM <= 16GB  → 3B-class models (Phi-3, Qwen2.5-3B, Llama-3.2-3B)
+      4 < RAM <= 16GB  → 3B-class models (Phi-3, Liquid LFM-2.6B, Llama-3.2-3B)
       RAM <= 4GB       → TinyLlama 1.1B only
       RAM unknown (-1) → default to 3B middle tier (don't assume worst)
     """
@@ -207,7 +207,7 @@ def suggest_local_model(specs: dict) -> tuple[str, str]:
     elif ram > 4:
         suggestion = f"Phi-3-Mini-3.8B-Q4_K_M (~2.3GB RAM){avx2_note}"
         note = (
-            f"{ram}GB RAM detected. 3B-class models (Phi-3, Qwen2.5-3B, Llama-3.2-3B) "
+            f"{ram}GB RAM detected. 3B-class models (Phi-3, Liquid LFM-2.6B, Llama-3.2-3B) "
             f"run well at Q4_K_M quantization."
         )
     else:
@@ -268,6 +268,12 @@ def _step_api_keys():
             try:
                 val = _input(f"  Enter {label} API key (or Enter to skip): ").strip()
                 if val:
+                    err = _validate_api_key_format(val, label)
+                    if err:
+                        _print(f"  [yellow][WARN][/yellow] {err}" if console else f"  [WARN] {err}")
+                        confirm = _input("  Save anyway? (y/N): ").strip().lower()
+                        if confirm != "y":
+                            continue
                     _write_env_key(env_key, val)
                     os.environ[env_key] = val
                     _print(f"  [green]Saved {env_key} to .env[/green]" if console else f"  Saved {env_key} to .env")
@@ -291,6 +297,14 @@ def _write_env_key(key: str, value: str):
     if not updated:
         lines.append(f"{key}={value}\n")
     env_path.write_text("".join(lines), encoding="utf-8")
+
+def _validate_api_key_format(key: str, label: str) -> str | None:
+    """Basic format validation for API keys. Returns error string or None."""
+    if not key or len(key.strip()) < 8:
+        return f"Key too short (< 8 chars) — likely invalid for {label}."
+    if key.strip() in ("test_key", "test", "xxx", "placeholder", "your-key-here"):
+        return f"'{key}' is a placeholder, not a real {label} key."
+    return None
 
 def _step_system_specs():
     """[2/4] - Detect RAM, CPU, GPU and recommend a local model."""
@@ -322,8 +336,8 @@ def _step_system_specs():
         print(f"  CPU Cores: {cores or 'Unknown'}")
         _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
                "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
-    _print("  [dim]Local Qwen-2.5-7B-Instruct-AWQ (4-bit) reasoning engine is built-in (`DEFAULT_PROVIDER = 'local'`).[/dim]" if console else
-           "  Local Qwen-2.5-7B-Instruct-AWQ (4-bit) reasoning engine is built-in (`DEFAULT_PROVIDER = 'local'`).")
+    _print("  [dim]Local provider uses LiquidAI/LFM2.5-2.6B-GGUF (Q6_K, ~2.2 GB) for offline CPU inference, or Ollama/Torch for GPU setups.[/dim]" if console else
+           "  Local provider uses LiquidAI/LFM2.5-2.6B-GGUF (Q6_K, ~2.2 GB) for offline CPU inference, or Ollama/Torch for GPU setups.")
 
 
 def _step_default_provider() -> str:
@@ -333,7 +347,9 @@ def _step_default_provider() -> str:
     options = ["local", "gemini", "anthropic", "openai", "auto"]
     _print("  Choose your default AI provider:")
     for i, opt in enumerate(options, 1):
-        note = " (Liquid LFM 2.6B Offline)" if opt == "local" else (" (auto-fallback chain)" if opt == "auto" else "")
+        note = "" if opt == "local" else (" (auto-fallback chain)" if opt == "auto" else "")
+        if opt == "local":
+            note = " (requires GPU + Ollama, or Liquid LFM 2.6B GGUF on CPU)"
         _print(f"    {i}. {opt}{note}")
 
     current = os.getenv("DEFAULT_PROVIDER", "local")
@@ -356,10 +372,20 @@ def _step_default_provider() -> str:
 def _step_local_model_setup():
     """[4/4] - Download/verify the local Liquid LFM 2.6B model weights."""
     _print("\n[bold][[4/4]][/bold] [cyan]Local Liquid LFM Engine Setup (~2.2 GB)[/cyan]" if console else "\n[4/4] Local Liquid LFM Engine Setup (~2.2 GB)")
-    _print("  Checking & downloading built-in LiquidAI/LFM2.5-2.6B-GGUF offline weights...")
+    _print("  The built-in offline reasoning engine (LiquidAI/LFM2.5-2.6B-GGUF) is ~2.2 GB.")
     try:
-        from ..providers.local_provider import LocalQwenProvider
-        prov = LocalQwenProvider()
+        consent = _input("  Download now? Requires ~2.2 GB disk space. (y/N): ").strip().lower()
+        if consent != "y":
+            _print("  [dim]Skipped. Run `nexus-agent pull-model` later to download when needed.[/dim]" if console else
+                   "  Skipped. Run `nexus-agent pull-model` later to download when needed.")
+            return
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    _print("  Checking & downloading built-in Liquid LFM engine weights...")
+    try:
+        from ..providers.local_provider import LocalProvider
+        prov = LocalProvider()
         prov.setup_model()
     except Exception as e:
         _print(f"  [yellow]Note: Model can be downloaded later when running offline mode ({e})[/yellow]" if console else f"  Note: Model can be downloaded later when running offline mode ({e})")

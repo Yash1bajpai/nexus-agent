@@ -19,20 +19,30 @@ class ConversationMemory:
         self._prune()
 
     def _prune(self):
-        """Enforce sliding window limit cleanly by only slicing at genuine user text message boundaries."""
+        """Enforce sliding window limit cleanly by only slicing at genuine user text message boundaries.
+        Avoids cutting at tool_result messages (OpenAI role='tool', Gemini parts with function_response,
+        Anthropic content with tool_result blocks) to prevent orphaned tool_use/tool_result pairs."""
         if len(self.messages) <= self.max_messages:
             return
 
         def _is_genuine_user_msg(msg: Dict[str, Any]) -> bool:
             if msg.get("role") != "user":
                 return False
-            # Check if this user message is actually a tool result
+            # OpenAI tool results use role='tool', not 'user' — already excluded above.
+            # Check for tool_call_id / tool_use_id / name at top level (OpenAI-style)
             if "tool_call_id" in msg or "tool_use_id" in msg or "name" in msg:
                 return False
+            # Gemini: parts containing function_response
             parts = msg.get("parts")
             if isinstance(parts, list):
                 for p in parts:
                     if isinstance(p, dict) and "function_response" in p:
+                        return False
+            # Anthropic: content is a list of blocks with type='tool_result'
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
                         return False
             return True
 

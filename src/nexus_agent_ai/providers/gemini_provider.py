@@ -173,7 +173,10 @@ class GeminiProvider(BaseProvider):
                 in_tokens = int(getattr(last_chunk.usage_metadata, "prompt_token_count", 0) or 0)
                 out_tokens = int(getattr(last_chunk.usage_metadata, "candidates_token_count", 0) or 0)
 
-            raw_msg = {"role": "model", "parts": [{"text": "".join(full_text)}]}
+            raw_parts = [{"text": "".join(full_text)}] if full_text else []
+            for tc in tool_calls:
+                raw_parts.append({"function_call": {"name": tc.name, "args": tc.args}})
+            raw_msg = {"role": "model", "parts": raw_parts}
             yield ProviderResponse(
                 text="".join(full_text),
                 tool_calls=tool_calls,

@@ -36,7 +36,7 @@ MAX_CONVERSATION_MESSAGES = int(os.getenv("MAX_CONVERSATION_MESSAGES", "60"))
 CODE_EXECUTION_TIMEOUT = int(os.getenv("CODE_EXECUTION_TIMEOUT", "10"))
 
 PRICING = {
-    "qwen2.5-7b-instruct-awq": {"input": 0.0, "output": 0.0},
+    "LiquidAI/LFM2.5-2.6B-GGUF": {"input": 0.0, "output": 0.0},
     "claude-3-5-sonnet-20241022": {"input": 0.000003, "output": 0.000015},
     "claude-3-sonnet-20240229": {"input": 0.000003, "output": 0.000015},
     "claude-sonnet-4-6": {"input": 0.000003, "output": 0.000015},

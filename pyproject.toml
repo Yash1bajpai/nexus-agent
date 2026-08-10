@@ -34,7 +34,9 @@ all = [
 local = [
     "transformers>=4.43.0",
     "torch>=2.4.0",
-    "autoawq>=0.2.6",
+]
+cpu = [
+    "llama-cpp-python>=0.2.80",
 ]
 
 [project.scripts]
