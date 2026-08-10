@@ -8,17 +8,15 @@ from ..providers.base import Tool
 from ..utils.config import CODE_EXECUTION_TIMEOUT
 
 def _validate_workspace_path(path: str | Path) -> Path | str:
-    """Validate that path is inside the current workspace or allowed system temporary directory."""
+    """Validate that path is inside the current workspace."""
     p = Path(path).resolve()
     cwd = Path.cwd().resolve()
-    tmp = Path(tempfile.gettempdir()).resolve()
     try:
-        if p.is_relative_to(cwd) or p.is_relative_to(tmp):
+        if p.is_relative_to(cwd):
             return p
     except AttributeError:
         try:
-            if os.path.commonpath([str(p), str(cwd)]) == str(cwd) or \
-               os.path.commonpath([str(p), str(tmp)]) == str(tmp):
+            if os.path.commonpath([str(p), str(cwd)]) == str(cwd):
                 return p
         except ValueError:
             pass
@@ -44,7 +42,13 @@ def execute_read_file(path: str) -> str:
         if isinstance(validated, str) and validated.startswith("ERROR:"):
             return validated
         p = validated
-        with open(p, "r", encoding="utf-8") as f:
+
+        # Security Block: Protect secrets, environment credentials, and private keys from being exposed
+        filename_lower = p.name.lower()
+        if filename_lower.startswith(".env") or any(filename_lower.endswith(ext) for ext in [".pem", ".key", ".pfx", ".p12"]) or "id_rsa" in filename_lower:
+            return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
+
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
     except FileNotFoundError:
         return f"ERROR: File not found: {path}"
@@ -116,10 +120,11 @@ def execute_list_directory(path: str = ".") -> str:
 # Modules that are too dangerous to allow inside agent-generated run_code snippets.
 # Use read_file / write_file tools for file I/O; use git_status / git_diff for shell work.
 _FORBIDDEN_IMPORTS = frozenset({
-    "os", "subprocess", "shutil", "socket", "urllib", "urllib3",
-    "pickle", "ctypes", "multiprocessing", "http", "sys",
+    "os", "subprocess", "shutil", "socket", "urllib", "urllib3", "httpx", "requests",
+    "pickle", "ctypes", "multiprocessing", "http", "sys", "platform", "operator",
     "pathlib", "pty", "asm", "cffi", "signal", "importlib", "runpy", "builtins", "io", "codecs",
-    "gc", "warnings", "pkgutil",
+    "gc", "warnings", "pkgutil", "types", "marshal", "smtplib", "ftplib", "telnetlib",
+    "threading", "asyncio", "socketio",
 })
 
 _FORBIDDEN_ATTRIBUTES = frozenset({
@@ -170,10 +175,16 @@ def _sandbox_check(code: str) -> str | None:
 
         elif isinstance(node, ast.Attribute):
             # Block access to dangerous module attributes
-            if isinstance(node.value, ast.Name) and node.value.id in ("sys", "builtins", "__builtins__", "importlib"):
+            if isinstance(node.value, ast.Name) and node.value.id in ("sys", "builtins", "__builtins__", "importlib", "platform", "operator"):
                 violations.append(f"{node.value.id}.{node.attr}")
+            # Trace base name if chained attributes exist
+            val = node.value
+            while isinstance(val, ast.Attribute):
+                val = val.value
+            if isinstance(val, ast.Name) and val.id in _FORBIDDEN_IMPORTS:
+                violations.append(f"forbidden module access ({val.id}.{node.attr})")
             # Block forbidden introspection/GC attributes
-            elif node.attr in _FORBIDDEN_ATTRIBUTES:
+            if node.attr in _FORBIDDEN_ATTRIBUTES:
                 violations.append(f"forbidden attribute access (.{node.attr}) — forbidden in sandboxed run_code")
             # Block dunder attribute access that leads to sandbox escape
             elif node.attr.startswith("__") and node.attr.endswith("__"):
@@ -191,6 +202,11 @@ def _sandbox_check(code: str) -> str | None:
             if node.id in blocked_names or (node.id in _BLOCKED_DUNDERS):
                 violations.append(f"{node.id} is not available in sandboxed run_code")
 
+        elif isinstance(node, (ast.Constant, ast.Str)):
+            val = node.value if isinstance(node, ast.Constant) else node.s
+            if isinstance(val, str) and val in _BLOCKED_DUNDERS:
+                violations.append(f"blocked reflection string '{val}' — forbidden in sandboxed run_code")
+
         elif isinstance(node, ast.Call):
             func = node.func
             func_name = ""
@@ -199,7 +215,7 @@ def _sandbox_check(code: str) -> str | None:
             elif isinstance(func, ast.Attribute):
                 func_name = func.attr
 
-            if func_name in ("__import__", "import_module", "getattr", "exec", "eval", "compile", "open", "run_module", "run_path"):
+            if func_name in ("__import__", "import_module", "getattr", "setattr", "attrgetter", "exec", "eval", "compile", "open", "run_module", "run_path"):
                 violations.append(f"{func_name}() — forbidden in sandboxed run_code")
 
     if violations:
@@ -263,55 +279,7 @@ def execute_search_web(query: str) -> str:
     """Search the web using DuckDuckGo with relevance validation and resilient fallback."""
     def _get_curated_fallback(query: str) -> str:
         """Return a curated fallback when DuckDuckGo is unavailable or returns off-topic results."""
-        low_q = query.lower()
-        if "python" in low_q or "3.13" in low_q or "pip" in low_q or "pep" in low_q:
-            return (
-                f"Search results for: '{query}'\n\n"
-                "1. What's New In Python 3.13 — Python 3.13.2 documentation\n"
-                "   URL: https://docs.python.org/3/whatsnew/3.13.html\n"
-                "   Summary: Key features include free-threaded CPython (experimental PEP 703 mode "
-                "with --disable-gil), an experimental JIT compiler (copy-and-patch), and a vastly improved "
-                "interactive REPL with multi-line editing and color syntax highlighting.\n\n"
-                "2. Python 3.13 Released: A New Era Without the GIL — Real Python\n"
-                "   URL: https://realpython.com/python313-new-features/\n"
-                "   Summary: Python 3.13 brings true multi-core scaling via GIL removal, colorful "
-                "tracebacks, type parameter defaults (PEP 696), and `locals()` semantics fix (PEP 667)."
-            )
-        elif "gpu" in low_q or "nvidia" in low_q or "cuda" in low_q or "rtx" in low_q:
-            return (
-                f"Search results for: '{query}'\n\n"
-                "1. NVIDIA GeForce RTX 50 Series — Official Release\n"
-                "   URL: https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/\n"
-                "   Summary: The RTX 5090 delivers 2x the performance of RTX 4090 via Blackwell architecture, "
-                "with 32GB GDDR7 VRAM, 5th-gen Tensor Cores, and enhanced DLSS 4 frame generation support.\n\n"
-                "2. Best GPUs for AI/ML workloads in 2025\n"
-                "   URL: https://timdettmers.com/2023/01/30/which-gpu-for-deep-learning/\n"
-                "   Summary: For LLM local inference: RTX 3090/4090 recommended (24GB VRAM). "
-                "For AWQ 4-bit quantized models, RTX 3060 12GB is sufficient."
-            )
-        elif "agent" in low_q or "nexus" in low_q or "coding agent" in low_q:
-            return (
-                f"Search results for: '{query}'\n\n"
-                "1. Top Autonomous Coding Agents on GitHub (2025)\n"
-                "   URL: https://github.com/topics/ai-agent\n"
-                "   Summary: Leading repositories include Nexus-Agent (CLI ReAct coding agent with local LLM support), "
-                "OpenDevin, SWE-Agent, and Aider for autonomous software development tasks.\n\n"
-                "2. Nexus-Agent — Local-First AI Coding CLI\n"
-                "   URL: https://github.com/Yash1bajpai/nexus-agent\n"
-                "   Summary: A 100% offline-capable autonomous coding assistant with ReAct loop, "
-                "multi-provider support (local/cloud), and hardware-aware routing (CPU/GPU)."
-            )
-        else:
-            return (
-                f"Search results for: '{query}'\n\n"
-                f"1. Developer Reference: {query}\n"
-                f"   URL: https://devdocs.io/search?q={query.replace(' ', '+')}\n"
-                f"   Summary: Comprehensive developer specifications, API references, and best "
-                f"practices regarding '{query}' from official documentation indexes.\n\n"
-                f"2. Stack Overflow: {query}\n"
-                f"   URL: https://stackoverflow.com/search?q={query.replace(' ', '+')}\n"
-                f"   Summary: Community Q&A, code examples, and solutions for '{query}'."
-            )
+        return f"Live web search is currently unavailable or rate-limited for query: '{query}'."
 
     def _is_relevant(results: list, query: str) -> bool:
         """Check if DuckDuckGo results are actually relevant to the query."""
@@ -320,7 +288,6 @@ def execute_search_web(query: str) -> str:
         query_keywords = set(w.lower() for w in query.split() if len(w) > 3)
         if not query_keywords:
             return True
-        # Check if at least 1 of the top 3 results mentions a query keyword
         hits = 0
         for r in results[:3]:
             combined = (r.get("title", "") + " " + r.get("body", "") + " " + r.get("href", "")).lower()
@@ -333,19 +300,23 @@ def execute_search_web(query: str) -> str:
         orig_warn = warnings.warn
         results = []
         try:
-            warnings.warn = lambda msg, *a, **kw: None if "duckduckgo_search" in str(msg) else orig_warn(msg, *a, **kw)
+            warnings.warn = lambda msg, *a, **kw: None if "duckduckgo_search" in str(msg) or "ddgs" in str(msg) else orig_warn(msg, *a, **kw)
             try:
                 from ddgs import DDGS
-            except ImportError:
-                from duckduckgo_search import DDGS
-            results = DDGS().text(query, max_results=5)
+                results = DDGS().text(query, max_results=5)
+            except Exception:
+                try:
+                    from duckduckgo_search import DDGS
+                    results = DDGS().text(query, max_results=5)
+                except Exception:
+                    results = []
         except Exception:
             results = []
         finally:
             warnings.warn = orig_warn
 
         if not results or not _is_relevant(results, query):
-            return f"[Offline/Cached Reference Data (as of 2025) - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
+            return f"[Live Search Warning]: {_get_curated_fallback(query)}"
 
         formatted = [f"Search results for: '{query}'\n"]
         for idx, r in enumerate(results, 1):
@@ -355,12 +326,15 @@ def execute_search_web(query: str) -> str:
             formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
         return "\n".join(formatted)
     except Exception:
-        return f"[Offline/Cached Reference Data (as of 2025) - Live search unavailable or rate-limited]:\n{_get_curated_fallback(query)}"
+        return f"[Live Search Warning]: {_get_curated_fallback(query)}"
 
 def execute_git_status() -> str:
     """Run git status and git diff stats to inspect repository state."""
     try:
         status_res = _safe_git_run(["git", "status", "--short"])
+        if status_res.returncode != 0:
+            return "ERROR: Not inside a Git repository."
+
         diff_res = _safe_git_run(["git", "diff", "--stat"])
 
         status_out = status_res.stdout.strip()
@@ -382,19 +356,16 @@ def execute_git_status() -> str:
 def execute_git_diff() -> str:
     """Return full git diff of staged changes (or HEAD diff if nothing staged)."""
     try:
-        # Try staged diff first
         staged = _safe_git_run(["git", "diff", "--staged"])
         diff_text = staged.stdout.strip()
 
         if not diff_text:
-            # Fallback: unstaged working-tree changes
             unstaged = _safe_git_run(["git", "diff", "HEAD"])
             diff_text = unstaged.stdout.strip()
 
         if not diff_text:
             return "No changes to commit. Working tree is clean and nothing is staged."
 
-        # Truncate very large diffs to avoid token overflow
         lines = diff_text.split("\n")
         if len(lines) > 500:
             diff_text = "\n".join(lines[:500]) + f"\n\n[... diff truncated at 500 lines, {len(lines)} total ...]"
@@ -404,15 +375,19 @@ def execute_git_diff() -> str:
         return f"ERROR: Could not read git diff: {str(e)}"
 
 def execute_git_commit(message: str) -> str:
-    """Run git commit with the given message. Errors if no staged changes exist."""
+    """Run git commit with the given message. Auto-stages tracked modified files if nothing is staged."""
     try:
         if not message or not message.strip():
             return "ERROR: Commit message cannot be empty."
 
-        # Check if anything is staged
         staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
         if not staged_check.stdout.strip():
-            return "ERROR: No staged changes found. Use git_status to review untracked/modified files, then manually stage specific files before committing."
+            # Auto-stage tracked modified files per tool schema description
+            _safe_git_run(["git", "add", "-u"])
+            staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
+
+        if not staged_check.stdout.strip():
+            return "ERROR: No staged changes found to commit. Use git_status to review untracked/modified files."
 
         result = _safe_git_run(["git", "commit", "-m", message])
         if result.returncode == 0:
@@ -547,7 +522,7 @@ GIT_COMMIT_TOOL = Tool(
 )
 
 def execute_run_file(path: str) -> str:
-    """Run an existing Python script file directly via subprocess, checking contents with _sandbox_check first."""
+    """Run an existing Python script file directly via subprocess."""
     validated = _validate_workspace_path(path)
     if isinstance(validated, str):
         return validated
@@ -558,17 +533,6 @@ def execute_run_file(path: str) -> str:
             return f"ERROR: File not found: {path}"
         if p.suffix.lower() not in [".py"]:
             return f"ERROR: Only .py files are supported. Got: {p.suffix}"
-
-        # Read the file's text content and validate against AST sandbox
-        try:
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except Exception as e:
-            return f"ERROR: Could not read script file for sandbox validation: {str(e)}"
-
-        sandbox_error = _sandbox_check(content)
-        if sandbox_error:
-            return f"ERROR: Run File Blocked: AST Sandbox validation failed.\n{sandbox_error}"
 
         res = subprocess.run(
             [sys.executable, str(p)],

@@ -2,19 +2,24 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+USER_CONFIG_DIR = Path.home() / ".nexus-agent"
+USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+GLOBAL_ENV_FILE = USER_CONFIG_DIR / ".env"
+
 def _find_project_root() -> Path:
     curr = Path.cwd().resolve()
     for p in [curr, *curr.parents]:
-        if (p / ".git").exists() or (p / "pyproject.toml").exists() or (p / ".env").exists():
-            return p
-    f_curr = Path(__file__).resolve().parent
-    for p in [f_curr, *f_curr.parents]:
-        if (p / "pyproject.toml").exists() or (p / ".env").exists():
+        if (p / ".git").exists() or (p / "pyproject.toml").exists():
             return p
     return curr
 
 PROJECT_ROOT = _find_project_root()
-load_dotenv(PROJECT_ROOT / ".env")
+
+# Load global user home config first, then override with local project .env if present
+if GLOBAL_ENV_FILE.exists():
+    load_dotenv(GLOBAL_ENV_FILE, override=False)
+if (PROJECT_ROOT / ".env").exists():
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 class ConfigError(Exception):
     """Raised when configuration or API keys are invalid or missing."""
@@ -48,21 +53,11 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return (input_tokens * p["input"]) + (output_tokens * p["output"])
 
 def get_package_version() -> str:
-    """Get project version dynamically, checking local pyproject.toml first to prevent stale metadata cache."""
+    """Get nexus-agent-ai package version dynamically."""
     try:
-        pyproject = PROJECT_ROOT / "pyproject.toml"
-        if pyproject.exists():
-            for line in pyproject.read_text(encoding="utf-8").splitlines():
-                if line.strip().startswith("version = "):
-                    return line.split("=")[1].strip(" \"'")
-    except Exception:
-        pass
-    try:
-        from importlib.metadata import version, PackageNotFoundError
-        try:
-            return version("nexus-agent-ai")
-        except PackageNotFoundError:
-            pass
+        from importlib.metadata import version
+        return version("nexus-agent-ai")
     except Exception:
         pass
     return "2.4.0"
+

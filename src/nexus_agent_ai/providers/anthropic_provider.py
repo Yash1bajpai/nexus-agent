@@ -6,7 +6,7 @@ from ..utils.config import get_env_or_raise
 class AnthropicProvider(BaseProvider):
     """LLM Provider implementation for Anthropic Claude models."""
 
-    def __init__(self, model: str = "claude-3-5-sonnet-20241022"):
+    def __init__(self, model: str = "claude-3-7-sonnet-20250219"):
         api_key = get_env_or_raise("ANTHROPIC_API_KEY")
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model

@@ -67,126 +67,6 @@ class LocalQwenProvider(BaseProvider):
         except Exception:
             self._model_instance = "cpu_ollama_or_fallback"
 
-    def _run_local_cpu_inference(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
-        """Safe non-destructive fallback processing that mimics basic reasoning without hardcoded overrides."""
-        last_role = messages[-1].get("role", "") if messages else ""
-        last_content = messages[-1].get("content", "") if messages else ""
-
-        # Check if real API / free fallback providers are available to answer naturally and accurately
-        try:
-            import os as _os
-            if any(_os.getenv(k) for k in ["GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]):
-                from .fallback_provider import FallbackProvider
-                fb = FallbackProvider()
-                return fb.complete(messages, tools, system)
-        except Exception:
-            pass
-
-        # Turn 2: We just got an observation from a tool call
-        if last_role == "tool" or "[OBSERVE]" in str(last_content):
-            tool_data = str(last_content)
-            # Dynamic descriptive summary of whatever data was ACTUALLY observed
-            preview = tool_data[:1500] + "\n..." if len(tool_data) > 1500 else tool_data
-            return ProviderResponse(
-                text=f"### Workspace Observation Report\n\n```\n{preview}\n```\n\nI have verified and processed the real execution results directly from the local environment above.",
-                raw_assistant_message={"role": "assistant", "content": f"Observation processed:\n{preview}"}
-            )
-
-        # Turn 1: Analyze user request intent safely without blindly overwriting files
-        user_msg = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                user_msg = str(m.get("content", ""))
-                break
-        
-        lower_msg = user_msg.lower().strip()
-
-        # 1. Check if the user is asking for real-time web search
-        if any(w in lower_msg for w in ["search the web", "search online", "look up online", "latest features", "search for"]):
-            query_clean = user_msg
-            for pfx in ["search the web for", "search the web", "search online for", "search for", "look up online"]:
-                if lower_msg.startswith(pfx):
-                    query_clean = user_msg[len(pfx):].strip(" .?\"'")
-                    break
-            tc_id = f"call_{uuid.uuid4().hex[:8]}"
-            return ProviderResponse(
-                text=f"[THINKING]\nUser requested live internet search for `{query_clean}`. Invoking `search_web` to retrieve accurate results.",
-                tool_calls=[ToolCall(id=tc_id, name="search_web", args={"query": query_clean or user_msg})],
-                raw_assistant_message={"role": "assistant", "content": f"Searching web for: {query_clean}"}
-            )
-
-        # 2. Check if the user is asking to read/review/inspect a file
-        if any(ext in lower_msg for ext in [".py", ".json", ".toml", ".md", ".txt"]) or any(w in lower_msg for w in ["review ", "read ", "inspect ", "check file"]):
-            if "generate" not in lower_msg and "create" not in lower_msg and "write" not in lower_msg:
-                target = "src/cli/app.py"
-                for word in user_msg.split():
-                    clean_w = word.strip(".,'\"`@")
-                    if any(clean_w.endswith(ext) for ext in [".py", ".toml", ".json", ".md", ".txt"]):
-                        target = clean_w
-                        break
-                tc_id = f"call_{uuid.uuid4().hex[:8]}"
-                return ProviderResponse(
-                    text=f"[THINKING]\nUser requested inspection on `{target}`. Launching `read_file` to inspect the source structure accurately.",
-                    tool_calls=[ToolCall(id=tc_id, name="read_file", args={"path": target})],
-                    raw_assistant_message={"role": "assistant", "content": "Reading file for analysis."}
-                )
-
-        # 3. Check if the user asks about git status or directory listing
-        if any(w in lower_msg for w in ["git status", "git diff", "what files are modified", "list directory", "list files"]):
-            tc_id = f"call_{uuid.uuid4().hex[:8]}"
-            if "git" in lower_msg or "modified" in lower_msg:
-                return ProviderResponse(
-                    text="[THINKING]\nInspecting git repository modifications via `git_status`.",
-                    tool_calls=[ToolCall(id=tc_id, name="git_status", args={})],
-                    raw_assistant_message={"role": "assistant", "content": "Checking git status."}
-                )
-            return ProviderResponse(
-                text="[THINKING]\nInspecting workspace context via `list_directory` to map current files safely.",
-                tool_calls=[ToolCall(id=tc_id, name="list_directory", args={"path": "."})],
-                raw_assistant_message={"role": "assistant", "content": "Listing directory structure."}
-            )
-
-        # 4. Check for code generation requests (e.g., from `generate` CLI command or write_file requests)
-        if "generate code based on this instruction:" in lower_msg or ("write_file" in lower_msg and "generate" in lower_msg):
-            target_file = "generated_code.py"
-            match = re.search(r"to '([^']+)'|to \"([^\"]+)\"|--output\s+([^\s]+)", user_msg)
-            if match:
-                target_file = next(g for g in match.groups() if g)
-            
-            prompt_instr = user_msg
-            instr_match = re.search(r"instruction:\s*'([^']+)'|instruction:\s*\"([^\"]+)\"", user_msg)
-            if instr_match:
-                prompt_instr = next(g for g in instr_match.groups() if g)
-                
-            sample_code = f'"""\nGenerated code for: {prompt_instr}\n"""\n\ndef main():\n    print("Running generated code for: {prompt_instr}")\n\nif __name__ == "__main__":\n    main()\n'
-            tc_id = f"call_{uuid.uuid4().hex[:8]}"
-            return ProviderResponse(
-                text=f"[THINKING]\nUser requested code generation for target `{target_file}`. Invoking `write_file` with the generated structure.",
-                tool_calls=[ToolCall(id=tc_id, name="write_file", args={"path": target_file, "content": sample_code})],
-                raw_assistant_message={"role": "assistant", "content": f"Writing generated code to {target_file}"}
-            )
-
-        # 5. General chat/math evaluation without hardcoding specific numbers
-        math_match = re.match(r'^\s*(what is\s+)?([0-9\.\s\+\-\*\/\(\)]+)\s*([\?\=]*)\s*$', lower_msg)
-        if math_match:
-            expr = math_match.group(2).strip()
-            try:
-                # Safe basic arithmetic evaluation
-                if all(c in "0123456789. +-*/()" for c in expr):
-                    val = eval(expr, {"__builtins__": None}, {})
-                    return ProviderResponse(
-                        text=f"The calculation for `{expr}` yields:\n\n$${expr} = {val}$$",
-                        raw_assistant_message={"role": "assistant", "content": f"{expr} = {val}"}
-                    )
-            except Exception:
-                pass
-
-        # General conversational response on pure CPU offline mode
-        return ProviderResponse(
-            text="I am ready to assist with your software project! You can ask me to read/write files, review code, run terminal commands, or search the web for live documentation.",
-            raw_assistant_message={"role": "assistant", "content": "Agent ready."}
-        )
-
     def _convert_tools(self, tools: List[Tool]) -> List[Dict[str, Any]]:
         return [{"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}} for t in tools]
 
@@ -211,7 +91,7 @@ class LocalQwenProvider(BaseProvider):
                         return ollama_prov.complete(messages, tools, system)
             except Exception:
                 pass
-            return self._run_local_cpu_inference(messages, tools, system)
+            raise RuntimeError("No dedicated GPU detected and Ollama is not running. Real local inference requires either a GPU or a running Ollama instance.")
 
         # GPU Engine processing logic remains intact below
         formatted_messages = []

@@ -34,14 +34,21 @@ This applies to every single tool call in every iteration."""
 
 def parse_at_mentions(user_input: str) -> str:
     """Detect @filename mentions, synchronously read files, attach context invisibly, and clean prompt."""
-    matches = re.findall(r'(?:^|\s)@\s*([\w\.\-\/\\:]+)', user_input)
+    matches = re.findall(r'(?:^|\s)@\s*(?:"([^"]+)"|\'([^\']+)\'|([\w\.\-\/\\:]+))', user_input)
     if not matches:
         return user_input
 
     clean_input = user_input
     attachments = []
-    for raw_fpath in sorted(set(matches), key=len, reverse=True):
+    extracted = [m[0] or m[1] or m[2] for m in matches if (m[0] or m[1] or m[2])]
+    for raw_fpath in sorted(set(extracted), key=len, reverse=True):
         fpath = raw_fpath.rstrip('.!,?;:')
+        # Block credential files from being attached via @mention
+        filename_lower = Path(fpath).name.lower()
+        if filename_lower.startswith(".env") or any(filename_lower.endswith(ext) for ext in [".pem", ".key", ".pfx", ".p12"]) or "id_rsa" in filename_lower:
+            attachments.append(f"[Warning: Security blocked attaching secret file @{fpath}]")
+            continue
+
         try:
             resolved_path = Path(fpath).resolve()
         except Exception:
@@ -50,11 +57,11 @@ def parse_at_mentions(user_input: str) -> str:
         if resolved_path.exists() and resolved_path.is_file():
             from .tools import _validate_workspace_path
             validated = _validate_workspace_path(resolved_path)
-            if isinstance(validated, str):
+            if isinstance(validated, str) and validated.startswith("ERROR:"):
                 attachments.append(f"[Warning: Security blocked reading @{fpath}: {validated}]")
                 continue
 
-            pattern = r'(?:^|\s)@\s*' + re.escape(raw_fpath) + r'(?=\s|$|[.!,?;:])'
+            pattern = r'(?:^|\s)@\s*(?:"' + re.escape(raw_fpath) + r'"|\'' + re.escape(raw_fpath) + r'\'|' + re.escape(raw_fpath) + r')(?=\s|$|[.!,?;:])'
             clean_input = re.sub(pattern, ' ', clean_input).strip()
             try:
                 with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
@@ -230,7 +237,6 @@ class Agent:
                     if stream and not self.event_callback:
                         if streamed_text:
                             print()  # newline after streamed chunks
-                            display.print_response(streamed_text)  # Rich panel + Markdown
                         else:
                             display.print_response(final_text)
 

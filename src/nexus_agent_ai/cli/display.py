@@ -22,7 +22,7 @@ console = Console()
 
 def print_header(provider_name: str, model_name: str, mode: str = ""):
     """Print the assistant start panel."""
-    content = f"Provider: {provider_name.capitalize()} ({model_name})"
+    content = f"Provider: {provider_name} ({model_name})"
     if mode:
         content += f"\nMode: {mode}"
     panel = Panel(content, title="Nexus-Agent", border_style="cyan")

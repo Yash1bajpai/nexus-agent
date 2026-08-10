@@ -9,11 +9,11 @@ class OpenAIProvider(BaseProvider):
 
     def __init__(self, model: str = "gpt-4o-mini", base_url: Optional[str] = None, api_key: Optional[str] = None):
         import os
-        base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("OLLAMA_HOST")
+        base_url = base_url or os.getenv("OPENAI_BASE_URL")
         if api_key:
             pass  # use the provided key directly
         elif base_url:
-            api_key = os.getenv("OPENAI_API_KEY", "ollama")
+            api_key = os.getenv("OPENAI_API_KEY", "local-key")
         else:
             api_key = get_env_or_raise("OPENAI_API_KEY")
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)

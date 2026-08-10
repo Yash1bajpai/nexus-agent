@@ -22,16 +22,22 @@ class GeminiProvider(BaseProvider):
             if not isinstance(msg, dict):
                 formatted.append(msg)
             elif "parts" in msg:
-                formatted.append(msg)
+                msg_copy = dict(msg)
+                if msg_copy.get("role") == "tool":
+                    msg_copy["role"] = "user"
+                formatted.append(msg_copy)
             else:
-                role = msg.get("role", "user")  
+                role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if role == "assistant":
                     role = "model"
                 elif role == "tool":
+                    role = "user"
                     tool_name = msg.get("name") or msg.get("tool_call_id", "unknown_tool")
+                    if "_" in tool_name and not tool_name.startswith("call_"):
+                        tool_name = tool_name.rsplit("_", 1)[0]
                     formatted.append({
-                        "role": "model",
+                        "role": "user",
                         "parts": [{
                             "function_response": {
                                 "name": tool_name,
@@ -102,7 +108,6 @@ class GeminiProvider(BaseProvider):
                         )
                     )
 
-        # Fallback: some Gemini Lite responses put text directly on response.text
         if not text and not tool_calls:
             try:
                 fallback = response.text
@@ -148,7 +153,6 @@ class GeminiProvider(BaseProvider):
                 if hasattr(chunk, "text") and chunk.text:
                     full_text.append(chunk.text)
                     yield chunk.text
-                # Collect function_call parts from streamed chunks
                 if hasattr(chunk, "candidates") and chunk.candidates:
                     for candidate in chunk.candidates:
                         if candidate.content and candidate.content.parts:
@@ -169,9 +173,11 @@ class GeminiProvider(BaseProvider):
                 in_tokens = int(getattr(last_chunk.usage_metadata, "prompt_token_count", 0) or 0)
                 out_tokens = int(getattr(last_chunk.usage_metadata, "candidates_token_count", 0) or 0)
 
+            raw_msg = {"role": "model", "parts": [{"text": "".join(full_text)}]}
             yield ProviderResponse(
                 text="".join(full_text),
                 tool_calls=tool_calls,
+                raw_assistant_message=raw_msg,
                 input_tokens=in_tokens,
                 output_tokens=out_tokens,
             )
@@ -182,12 +188,13 @@ class GeminiProvider(BaseProvider):
             raise
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
+        func_name = tool_call_id.rsplit("_", 1)[0] if ("_" in tool_call_id and not tool_call_id.startswith("call_")) else tool_call_id
         return {
-            "role": "tool",
+            "role": "user",
             "parts": [
                 {
                     "function_response": {
-                        "name": tool_call_id,
+                        "name": func_name,
                         "response": {"result": result},
                     }
                 }

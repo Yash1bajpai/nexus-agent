@@ -59,7 +59,7 @@ def test_provider_tool_result_format():
 
     gemini = GeminiProvider()
     res_g = gemini.format_tool_result_message("call_3", "ok result")
-    assert res_g["role"] == "tool"
+    assert res_g["role"] == "user"
 
 def test_fallback_provider_general_exception():
     from nexus_agent_ai.providers.fallback_provider import FallbackProvider

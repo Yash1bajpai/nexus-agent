@@ -87,10 +87,10 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         if not or_key:
             raise Exception("OPENROUTER_API_KEY not set in .env")
         return OpenAIProvider(
-            model="poolside/laguna-m.1:free",
+            model="meta-llama/llama-3.3-70b-instruct:free",
             base_url="https://openrouter.ai/api/v1",
             api_key=or_key,
-        ), "OpenRouter (laguna-m.1:free)"
+        ), "OpenRouter (llama-3.3-70b:free)"
     elif name_clean == "auto":
         from ..providers.fallback_provider import FallbackProvider
         fb = FallbackProvider(start_provider=DEFAULT_PROVIDER)
@@ -116,12 +116,15 @@ def chat(
     if not query or not query.strip():
         display.print_error("Query cannot be empty.")
         raise typer.Exit(code=1)
+    if max_iterations <= 0:
+        display.print_error("max-iterations must be a positive integer > 0.")
+        raise typer.Exit(code=1)
     try:
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
-        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
 
         start_time = time.time()
@@ -135,6 +138,8 @@ def chat(
     except ConfigError as e:
         display.print_error(str(e))
         raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
     except Exception as e:
         display.print_error(f"Fatal execution error: {str(e)}")
         raise typer.Exit(code=1)
@@ -155,12 +160,15 @@ def repl(
         no_stream = bool(no_stream.default)
     if hasattr(max_iterations, "default"):
         max_iterations = int(max_iterations.default)
+    if max_iterations <= 0:
+        display.print_error("max-iterations must be a positive integer > 0.")
+        raise typer.Exit(code=1)
     try:
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
-        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         typer.echo("Type 'exit' or 'quit' to end the session.\n")
 
@@ -181,14 +189,34 @@ def repl(
                     except typer.Exit:
                         pass
                     continue
+                elif lower_input == "pull-model" or lower_input.startswith("pull-model"):
+                    try:
+                        pull_model_cmd()
+                    except typer.Exit:
+                        pass
+                    continue
+                elif lower_input.startswith("generate "):
+                    parts = user_input[9:].strip().rsplit("--output", 1)
+                    if len(parts) == 1:
+                        parts = user_input[9:].strip().rsplit("-o", 1)
+                    prompt_str = parts[0].strip().strip('"').strip("'")
+                    out_str = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "generated_code.py"
+                    try:
+                        generate(prompt=prompt_str, output=out_str, provider=provider, verbose=verbose, no_stream=no_stream, max_iterations=max_iterations)
+                    except typer.Exit:
+                        pass
+                    continue
                 elif lower_input.startswith("chat "):
                     user_input = user_input[5:].strip().strip('"').strip("'")
                 elif lower_input.startswith("review "):
                     file_to_rev = user_input[7:].strip().strip('"').strip("'")
                     try:
-                        import os as _os
-                        fpath = _os.path.join(_os.getcwd(), file_to_rev) if not _os.path.isabs(file_to_rev) else file_to_rev
-                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                        from ..agent.tools import _validate_workspace_path
+                        validated = _validate_workspace_path(file_to_rev)
+                        if isinstance(validated, str) and validated.startswith("ERROR:"):
+                            display.print_error(validated)
+                            continue
+                        with open(validated, "r", encoding="utf-8", errors="replace") as _f:
                             file_contents = _f.read()
                         user_input = (
                             f"Here is the content of '{file_to_rev}':\n\n```\n{file_contents}\n```\n\n"
@@ -203,9 +231,12 @@ def repl(
                     file_to_dbg = parts[0].strip().strip('"').strip("'")
                     err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
                     try:
-                        import os as _os
-                        fpath = _os.path.join(_os.getcwd(), file_to_dbg) if not _os.path.isabs(file_to_dbg) else file_to_dbg
-                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                        from ..agent.tools import _validate_workspace_path
+                        validated = _validate_workspace_path(file_to_dbg)
+                        if isinstance(validated, str) and validated.startswith("ERROR:"):
+                            display.print_error(validated)
+                            continue
+                        with open(validated, "r", encoding="utf-8", errors="replace") as _f:
                             file_contents = _f.read()
                         user_input = (
                             f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
@@ -223,13 +254,15 @@ def repl(
                 if no_stream:
                     display.print_response(response_text)
                 display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
-            except KeyboardInterrupt:
-                typer.echo("\nSession interrupted. Type 'exit' to quit.")
-                continue
+            except (KeyboardInterrupt, EOFError):
+                typer.echo("\nSession ended. Goodbye!")
+                break
 
     except ConfigError as e:
         display.print_error(str(e))
         raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
     except Exception as e:
         display.print_error(f"Fatal execution error: {str(e)}")
         raise typer.Exit(code=1)
@@ -246,12 +279,23 @@ def review(
     if not file_path or not file_path.strip():
         display.print_error("File path cannot be empty.")
         raise typer.Exit(code=1)
+    if max_iterations <= 0:
+        display.print_error("max-iterations must be a positive integer > 0.")
+        raise typer.Exit(code=1)
     try:
-        from ..agent.tools import get_readonly_tools
+        from ..agent.tools import get_readonly_tools, _validate_workspace_path
+        validated = _validate_workspace_path(file_path)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            display.print_error(validated)
+            raise typer.Exit(code=1)
+        if not Path(file_path).exists():
+            display.print_error(f"File not found: {file_path}")
+            raise typer.Exit(code=1)
+
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations, tools=get_readonly_tools())
-        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Please perform a STRICTLY READ-ONLY review of the code in '{file_path}'. Use read_file first, analyze for bugs, security issues, and clean code best practices. Do NOT attempt to modify any files."
         start_time = time.time()
@@ -260,6 +304,8 @@ def review(
         if no_stream:
             display.print_response(response_text)
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+    except typer.Exit:
+        raise
     except Exception as e:
         display.print_error(str(e))
         raise typer.Exit(code=1)
@@ -273,19 +319,27 @@ def debug(
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
-    """Diagnose and fix an error in a local codebase.
-
-    Example:
-        agent debug src/app.py --error "AttributeError: 'NoneType' object has no attribute 'stream'"
-    """
+    """Diagnose and fix an error in a local codebase."""
     if not file_path or not file_path.strip() or not error or not error.strip():
         display.print_error("File path and error message cannot be empty.")
         raise typer.Exit(code=1)
+    if max_iterations <= 0:
+        display.print_error("max-iterations must be a positive integer > 0.")
+        raise typer.Exit(code=1)
     try:
+        from ..agent.tools import _validate_workspace_path
+        validated = _validate_workspace_path(file_path)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            display.print_error(validated)
+            raise typer.Exit(code=1)
+        if not Path(file_path).exists():
+            display.print_error(f"File not found: {file_path}")
+            raise typer.Exit(code=1)
+
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it carefully, explain the root cause, and if appropriate provide the fixed code."
         start_time = time.time()
@@ -294,6 +348,8 @@ def debug(
         if no_stream:
             display.print_response(response_text)
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+    except typer.Exit:
+        raise
     except Exception as e:
         display.print_error(str(e))
         raise typer.Exit(code=1)
@@ -307,19 +363,24 @@ def generate(
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
-    """Generate code autonomously and save directly to file.
-
-    Example:
-        agent generate "Create an async web scraper using aiohttp" --output scraper.py
-    """
+    """Generate code autonomously and save directly to file."""
     if not prompt or not prompt.strip() or not output or not output.strip():
         display.print_error("Prompt and output path cannot be empty.")
         raise typer.Exit(code=1)
+    if max_iterations <= 0:
+        display.print_error("max-iterations must be a positive integer > 0.")
+        raise typer.Exit(code=1)
     try:
+        from ..agent.tools import _validate_workspace_path
+        validated = _validate_workspace_path(output)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            display.print_error(validated)
+            raise typer.Exit(code=1)
+
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Generate code based on this instruction: '{prompt}'. Write the final production code to '{output}' using write_file."
         start_time = time.time()
@@ -328,10 +389,13 @@ def generate(
         if no_stream:
             display.print_response(response_text)
         if not Path(output).exists():
-            display.print_error(f"Warning: The agent completed execution but target file '{output}' was not verified on disk.")
+            display.print_error(f"Error: Target file '{output}' was not generated on disk.")
+            raise typer.Exit(code=1)
         else:
             typer.echo(f"\n✅ Verified generated file created: {output}\n")
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+    except typer.Exit:
+        raise
     except Exception as e:
         display.print_error(str(e))
         raise typer.Exit(code=1)
@@ -344,15 +408,9 @@ def commit(
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
 ):
-    """Read git diff, generate a conventional commit message, and commit.
-
-    Example:
-        agent commit
-        agent commit --yes   # skip confirmation prompt
-    """
+    """Read git diff, generate a conventional commit message, and commit."""
     import subprocess
 
-    # Quick pre-check: is this even a git repo?
     check = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check.returncode != 0:
@@ -360,23 +418,22 @@ def commit(
         raise typer.Exit(code=1)
 
     try:
-        prov, resolved_name = get_provider_instance(provider)
-        memory = ConversationMemory()
-        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
-        model_display = "Auto-detecting GPU/Ollama/CPU" if resolved_name == "local" else getattr(prov, "model", "unknown")
-        display.print_header(resolved_name, model_display, mode="Commit Mode")
-
         from ..agent.tools import execute_git_diff
         diff_text = execute_git_diff()
         if not diff_text or "No changes" in diff_text:
             display.print_error("No staged or unstaged changes found to commit.")
             raise typer.Exit(code=1)
 
+        prov, resolved_name = get_provider_instance(provider)
+        memory = ConversationMemory()
+        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
+        model_display = getattr(prov, "model", getattr(prov, "model_id", "local-qwen"))
+        display.print_header(resolved_name, model_display, mode="Commit Mode")
+
         query = (
-            f"Here is the git diff:\n```\n{diff_text[:3000]}\n```\n\n"
-            "Generate ONE single line conventional commit message (format: type(scope): description). "
-            "Keep it under 72 characters. "
-            "Reply ONLY with the commit message line itself. Do NOT output JSON, do NOT output explanations or markdown."
+            f"Please inspect the pending changes and produce a single-line conventional commit message.\n"
+            f"Diff summary:\n```\n{diff_text[:3000]}\n```\n\n"
+            "Format: type(scope): description. Under 72 chars. Output ONLY the commit message string."
         )
 
         display.print_warn("Generating commit message...")
@@ -407,7 +464,6 @@ def commit(
                 typer.echo("  Commit aborted.")
                 raise typer.Exit(code=0)
 
-        # Execute the commit
         from ..agent.tools import execute_git_commit
         result = execute_git_commit(commit_message)
 
@@ -420,13 +476,15 @@ def commit(
 
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
 
+    except typer.Exit:
+        raise
     except Exception as e:
         display.print_error(f"Commit failed: {str(e)}")
         raise typer.Exit(code=1)
 
 @app.command("pull-model")
 def pull_model_cmd():
-    """Download or verify the built-in 4-bit AWQ local reasoning model (~4.5 GB)."""
+    """Download or verify the built-in local reasoning model."""
     typer.echo("\n🚀 Nexus-Agent — Pulling Built-In Local Quantized Reasoning Model")
     from ..providers.local_provider import LocalQwenProvider
     prov = LocalQwenProvider()
@@ -448,12 +506,17 @@ def main(
         typer.echo(f"Nexus-Agent CLI v{get_package_version()}")
         raise typer.Exit()
 
-    # Run onboarding wizard on first launch regardless of subcommand
+    # Bypass onboarding wizard if --help or -h is passed anywhere
+    if any(arg in sys.argv for arg in ["--help", "-h"]):
+        if ctx.invoked_subcommand is None:
+            ctx.invoke(repl)
+        return
+
     try:
         from .onboarding import run_if_first_time
         run_if_first_time()
     except Exception:
-        pass  # Never block startup on onboarding errors
+        pass
 
     if ctx.invoked_subcommand is None:
         ctx.invoke(repl)

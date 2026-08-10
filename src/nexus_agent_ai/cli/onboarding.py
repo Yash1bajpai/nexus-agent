@@ -43,8 +43,22 @@ def _find_project_root() -> Path:
             return p
     return curr
 
-_pkg_root = _find_project_root()
-ENV_FILE = _pkg_root / ".env"
+USER_CONFIG_DIR = Path.home() / ".nexus-agent"
+USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+ENV_FILE = USER_CONFIG_DIR / ".env"
+
+def _ensure_gitignore_protection():
+    """Ensure .env is listed in local workspace .gitignore if present."""
+    try:
+        curr = Path.cwd().resolve()
+        gitignore = curr / ".gitignore"
+        if gitignore.exists():
+            content = gitignore.read_text(encoding="utf-8", errors="replace")
+            if ".env" not in content.splitlines() and ".env*" not in content.splitlines():
+                with open(gitignore, "a", encoding="utf-8") as f:
+                    f.write("\n# Added by Nexus-Agent onboarding\n.env\n")
+    except Exception:
+        pass
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 

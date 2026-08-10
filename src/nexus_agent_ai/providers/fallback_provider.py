@@ -8,14 +8,14 @@ def _make_gemini():
     return GeminiProvider()
 
 def _make_openrouter():
-    """OpenRouter free tier — Laguna M.1 free model (no per-minute rate limit)."""
+    """OpenRouter free tier — Llama 3.3 70B free model."""
     import os
     from .openai_provider import OpenAIProvider
     or_key = os.getenv("OPENROUTER_API_KEY", "")
     if not or_key:
         raise ConfigError("OPENROUTER_API_KEY not set in .env")
     return OpenAIProvider(
-        model="poolside/laguna-m.1:free",
+        model="meta-llama/llama-3.3-70b-instruct:free",
         base_url="https://openrouter.ai/api/v1",
         api_key=or_key,
     )
