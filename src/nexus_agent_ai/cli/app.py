@@ -73,7 +73,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         from ..providers.local_provider import LocalQwenProvider
         prov = LocalQwenProvider()
         prov.setup_model()
-        return prov, "Qwen 2.5 (7B-AWQ Local)"
+        return prov, "Liquid LFM (2.6B-Q6_K Local)"
     elif name_clean in ["ollama"]:
         import os
         from ..providers.openai_provider import OpenAIProvider
@@ -101,7 +101,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         from ..providers.local_provider import LocalQwenProvider
         prov = LocalQwenProvider()
         prov.setup_model()
-        return prov, "Qwen 2.5 (7B-AWQ Local)"
+        return prov, "Liquid LFM (2.6B-Q6_K Local)"
 
 
 @app.command()

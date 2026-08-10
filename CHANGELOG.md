@@ -4,6 +4,13 @@ All notable changes to the Nexus-Agent project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-08-10
+
+### Changed
+- **Local Engine Swap**: Upgraded the default offline local reasoning engine from `Qwen2.5-7B-Instruct-AWQ` to `LiquidAI/LFM2.5-2.6B-GGUF` (Q6_K).
+- **Reduced Footprint**: Local model footprint reduced from ~4.5 GB to ~2.2 GB.
+- **Native GGUF Loading**: Local provider now natively supports GGUF via `transformers` `AutoModelForCausalLM(gguf_file=...)`.
+
 ## [2.3.2] - 2026-08-07
 
 ### Windows Onboarding & Direct Module Invocation

@@ -319,7 +319,7 @@ def _step_default_provider() -> str:
     options = ["local", "gemini", "anthropic", "openai", "auto"]
     _print("  Choose your default AI provider:")
     for i, opt in enumerate(options, 1):
-        note = " (Qwen 2.5 7B-AWQ Offline)" if opt == "local" else (" (auto-fallback chain)" if opt == "auto" else "")
+        note = " (Liquid LFM 2.6B Offline)" if opt == "local" else (" (auto-fallback chain)" if opt == "auto" else "")
         _print(f"    {i}. {opt}{note}")
 
     current = os.getenv("DEFAULT_PROVIDER", "local")
@@ -340,9 +340,9 @@ def _step_default_provider() -> str:
 
 
 def _step_local_model_setup():
-    """[4/4] - Download/verify the local Qwen 2.5 4-bit AWQ model weights."""
-    _print("\n[bold][[4/4]][/bold] [cyan]Local Qwen Engine Setup (~4.5 GB)[/cyan]" if console else "\n[4/4] Local Qwen Engine Setup (~4.5 GB)")
-    _print("  Checking & downloading built-in Qwen/Qwen2.5-7B-Instruct-AWQ offline weights...")
+    """[4/4] - Download/verify the local Liquid LFM 2.6B model weights."""
+    _print("\n[bold][[4/4]][/bold] [cyan]Local Liquid LFM Engine Setup (~2.2 GB)[/cyan]" if console else "\n[4/4] Local Liquid LFM Engine Setup (~2.2 GB)")
+    _print("  Checking & downloading built-in LiquidAI/LFM2.5-2.6B-GGUF offline weights...")
     try:
         from ..providers.local_provider import LocalQwenProvider
         prov = LocalQwenProvider()

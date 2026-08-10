@@ -199,13 +199,13 @@ The wizard auto-detects your system specifications (CPU threads, total RAM, and 
 #### B. Offline Local Model Download (`pull-model`)
 Nexus-Agent includes built-in support for autonomous local reasoning (`LocalQwenProvider`) — allowing you to generate, review, and debug code completely offline with **zero API keys required**.
 
-To download or verify the quantized reasoning model (`Qwen2.5-Coder` 4-bit AWQ / GGUF engine):
+To download or verify the highly efficient reasoning model (`LiquidAI/LFM2.5-2.6B` Q6_K GGUF engine):
 ```bash
 nexus-agent pull-model
 ```
 *What this does:*
 - Checks your system environment and verifies `huggingface_hub` availability.
-- Downloads the optimized local quantized model weights (~4.5 GB) directly to your local cache (`~/.cache/huggingface/hub/...`).
+- Downloads the highly optimized local quantized model weights (~2 GB) directly to your local cache (`~/.cache/huggingface/hub/...`).
 - Validates model integrity (`verify_download=True`) and confirms readiness (`✅ Local Quantized Model Ready`).
 - Once pulled, you can run offline any time using: `nexus-agent --provider local`.
 

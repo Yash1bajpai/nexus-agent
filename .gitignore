@@ -30,3 +30,4 @@ __test_scan.py
 *.sqlite
 *.sqlite3
 *.log
+CHANGELOG.md

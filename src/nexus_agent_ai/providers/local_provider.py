@@ -11,9 +11,9 @@ class LocalQwenProvider(BaseProvider):
     Provides 100% offline, real local inference without cloud API dependencies.
     """
 
-    def __init__(self, model_id: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"):
+    def __init__(self, model_id: str = "LiquidAI/LFM2.5-2.6B-GGUF"):
         self.model_id = model_id
-        self.model = "qwen2.5-7b-instruct-awq"
+        self.filename = "LFM2.5-2.6B-Q6_K.gguf"
         self._tokenizer = None
         self._model_instance = None
         self._model_path = None
@@ -26,14 +26,10 @@ class LocalQwenProvider(BaseProvider):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         print("🚀 Initializing nexus-agent...")
         try:
-            from huggingface_hub import snapshot_download, constants as hf_constants
+            from huggingface_hub import hf_hub_download
             import os as _os
-            cached_dir = _os.path.join(hf_constants.HF_HUB_CACHE, "models--" + self.model_id.replace("/", "--"))
-            if not _os.path.isdir(cached_dir):
-                print("⬇️  First run: Downloading Local Qwen 2.5 reasoning engine (~4.5 GB)...")
-            else:
-                print("⚡ Local engine cache found. Loading model weights...")
-            model_path = snapshot_download(repo_id=self.model_id, local_files_only=False)
+            print(f"⚡ Downloading/Verifying Local Liquid LFM engine ({self.filename})...")
+            model_path = hf_hub_download(repo_id=self.model_id, filename=self.filename, local_files_only=False)
             print("✅ Core engine ready! Booting up...")
             self._model_path = model_path
             return model_path
@@ -59,11 +55,11 @@ class LocalQwenProvider(BaseProvider):
             import torch
             if torch.cuda.is_available():
                 gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "CUDA GPU"
-                print(f"🟢 Dedicated GPU Detected ({gpu_name}). Using Qwen 4-bit AWQ Engine...")
+                print(f"🟢 Dedicated GPU Detected ({gpu_name}). Using Transformers GGUF Engine...")
                 from transformers import AutoTokenizer, AutoModelForCausalLM
-                self._tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, gguf_file=self.filename, trust_remote_code=True)
                 self._model_instance = AutoModelForCausalLM.from_pretrained(
-                    model_path, device_map="auto", trust_remote_code=True
+                    self.model_id, gguf_file=self.filename, device_map="auto", trust_remote_code=True
                 )
             else:
                 print("💻 CPU-Only Hardware Detected. Routing to Local Fallback Engine...")

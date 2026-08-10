@@ -6,8 +6,8 @@ from nexus_agent_ai.providers.local_provider import LocalQwenProvider
 
 def test_local_qwen_provider_init():
     prov = LocalQwenProvider()
-    assert prov.model_id == "Qwen/Qwen2.5-7B-Instruct-AWQ"
-    assert prov.model == "qwen2.5-7b-instruct-awq"
+    assert prov.model_id == "LiquidAI/LFM2.5-2.6B-GGUF"
+    assert prov.filename == "LFM2.5-2.6B-Q6_K.gguf"
 
 
 def test_local_qwen_provider_convert_tools():
@@ -27,23 +27,22 @@ def test_local_qwen_provider_convert_tools():
 
 def test_local_qwen_provider_setup_model(monkeypatch, capsys):
     prov = LocalQwenProvider()
-    mock_snapshot = MagicMock(return_value="/mock/path/to/qwen-awq")
+    mock_hub_download = MagicMock(return_value="/mock/path/to/liquid-gguf")
     mock_hf = MagicMock()
-    mock_hf.snapshot_download = mock_snapshot
+    mock_hf.hf_hub_download = mock_hub_download
     
     with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
         path = prov.setup_model()
-        assert path == "/mock/path/to/qwen-awq"
-        mock_snapshot.assert_called_once_with(
-            repo_id="Qwen/Qwen2.5-7B-Instruct-AWQ",
+        assert path == "/mock/path/to/liquid-gguf"
+        mock_hub_download.assert_called_once_with(
+            repo_id="LiquidAI/LFM2.5-2.6B-GGUF",
+            filename="LFM2.5-2.6B-Q6_K.gguf",
             local_files_only=False
         )
         
     captured = capsys.readouterr()
     assert "Initializing nexus-agent..." in captured.out
-    # Either a fresh download message or a cached load message is acceptable
-    assert ("Downloading Local Qwen 2.5 reasoning engine" in captured.out or
-            "Local engine cache found" in captured.out)
+    assert "Local Liquid LFM engine" in captured.out
     assert "Core engine ready!" in captured.out
 
 
