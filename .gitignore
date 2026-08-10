@@ -21,7 +21,10 @@ BUG_REPORT.md
 DEMO_RECORDING_CHECKLIST.md
 EDGE_CASE_TEST_REPORT.md
 RECRUITER_REVIEW.md
-demo_local_qwen.py
+AUDIT_BUGS_REPORT.md
+DEEP_AUDIT_REPORT.md
+*_REPORT.md
+demo_*.py
 Programmer_Assistant/
 __test_scan.py
 
