@@ -5,6 +5,7 @@
 
   ![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)
   ![CLI Framework](https://img.shields.io/badge/CLI-Typer%20%7C%20Rich-purple.svg)
+  ![Local Model](https://img.shields.io/badge/Local-Liquid%20AI%20LFM%202.6B-ff6b6b.svg)
   ![OpenAI Support](https://img.shields.io/badge/Model-OpenAI%20GPT--4o-green.svg)
   ![Anthropic Support](https://img.shields.io/badge/Model-claude--sonnet--4--6-orange.svg)
   ![Gemini Support](https://img.shields.io/badge/Model-Gemini%202.5%20Flash-blue.svg)
@@ -39,6 +40,7 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built f
 
 | Feature | Nexus-Agent | Copilot CLI | Cursor | Aider |
 | :--- | :---: | :---: | :---: | :---: |
+| **100% Offline Local Model** (Liquid AI LFM 2.6B) | ✅ | ❌ | ❌ | ❌ |
 | **Multi-Provider Support** (Claude, Gemini, OpenAI) | ✅ | ❌ | ❌ | ✅ |
 | **Auto-Provider Fallback** (rate limit resilient) | ✅ | ❌ | ❌ | ❌ |
 | **Autonomous Local Tool Execution** | ✅ | ❌ | ✅ | ✅ |
@@ -93,7 +95,8 @@ nexus-agent/
         │   ├── fallback_provider.py ← Auto-fallback chain (gemini → anthropic → openai)
         │   ├── openai_provider.py   ← OpenAI backend implementation
         │   ├── anthropic_provider.py ← Anthropic claude-sonnet-4-6 backend implementation
-        │   └── gemini_provider.py   ← Google gemini-2.5-flash backend implementation
+        │   ├── gemini_provider.py   ← Google gemini-2.5-flash backend implementation
+        │   └── local_provider.py    ← Liquid AI LFM 2.6B local inference (llama-server)
         └── utils/
             └── config.py            ← Environment loader & dynamic token cost calculator
 ```
@@ -196,18 +199,17 @@ nexus-agent
 ```
 The wizard auto-detects your system specifications (CPU threads, total RAM, and GPU capabilities on Desktop or Termux), helps you choose a default provider (`local`, `gemini`, `anthropic`, or `openai`), and saves your preferences cleanly to a local `.env` file in your workspace or home directory (`~/.nexus_agent_initialized`).
 
-#### B. Offline Local Model Download (`pull-model`)
-Nexus-Agent includes built-in support for autonomous local reasoning (`LocalQwenProvider`) — allowing you to generate, review, and debug code completely offline with **zero API keys required**.
+#### B. Offline Local Model (Liquid AI LFM 2.6B)
+Nexus-Agent includes a built-in **Liquid AI LFM 2.6B** local model (`LocalProvider`) — allowing you to generate, review, and debug code completely offline with **zero API keys required**.
 
-To download or verify the highly efficient reasoning model (`LiquidAI/LFM2.5-2.6B` Q6_K GGUF engine):
+To download or verify the model (`LiquidAI/LFM2.5-2.6B-GGUF`, Q6_K quantization, ~2 GB):
 ```bash
 nexus-agent pull-model
 ```
 *What this does:*
-- Checks your system environment and verifies `huggingface_hub` availability.
-- Downloads the highly optimized local quantized model weights (~2 GB) directly to your local cache (`~/.cache/huggingface/hub/...`).
-- Validates model integrity (`verify_download=True`) and confirms readiness (`✅ Local Quantized Model Ready`).
-- Once pulled, you can run offline any time using: `nexus-agent --provider local`.
+- Downloads the Liquid AI LFM 2.6B model to your local HuggingFace cache (`~/.cache/huggingface/hub/...`).
+- Validates model integrity and confirms readiness.
+- Once pulled, run offline anytime: `nexus-agent -p local "your question"`
 
 #### C. Manual API Key Configuration (Cloud Providers)
 If you prefer manual configuration or want to use cloud LLMs (`Anthropic Claude 3.5 Sonnet`, `OpenAI GPT-4o`, `Google Gemini 2.5 Flash`), copy the example environment file:
@@ -221,6 +223,84 @@ GEMINI_API_KEY=AIzaSy...
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-proj-...
 ```
+
+---
+
+### 2.5 Complete Setup Guide (Step-by-Step)
+
+New to Nexus-Agent? Follow this complete walkthrough to get running in under 5 minutes:
+
+**Step 1: Install the package**
+```bash
+pip install nexus-agent-ai
+```
+
+**Step 2: Choose your mode**
+
+| Mode | Command | Best For |
+|------|---------|----------|
+| **Local (no API key)** | `nexus-agent -p local` | Offline, private, free |
+| **Gemini (free tier)** | `nexus-agent -p gemini` | Cloud quality, free quota |
+| **Claude/OpenAI** | `nexus-agent -p anthropic` | Premium quality |
+| **Auto-fallback** | `nexus-agent -p auto` | Maximum reliability |
+
+**Step 3: Run your first command**
+```bash
+# Interactive mode (REPL)
+nexus-agent
+
+# One-shot task
+nexus-agent chat "Create a Flask API with a /health endpoint"
+
+# Code review
+nexus-agent review my_script.py
+```
+
+**Step 4: (Optional) Download local model for offline use**
+```bash
+nexus-agent pull-model
+```
+This downloads the Liquid AI LFM 2.6B model (~2 GB). Once downloaded, you can use `-p local` without internet.
+
+---
+
+### 2.6 Tips & Suggestions
+
+**Faster model downloads with HuggingFace token:**
+The local model downloads from HuggingFace. For faster speeds and higher rate limits, set a free HF token:
+
+```bash
+# Get your free token at https://huggingface.co/settings/tokens
+# Then add to your .env file:
+HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
+```
+
+With a token, download speeds can improve significantly and you avoid anonymous rate limits.
+
+**Ollama as an alternative local backend:**
+If `llama-server` fails on your system (common on college/corporate networks), install [Ollama](https://ollama.com) instead:
+
+```bash
+# 1. Install Ollama from https://ollama.com
+# 2. Pull a coding model:
+ollama run llama3.2:3b
+
+# 3. Use with nexus-agent:
+nexus-agent -p ollama "your question"
+```
+
+**PATH issues on Windows?**
+If `nexus-agent` command is not found, use Python module invocation instead:
+```powershell
+python -m nexus_agent_ai
+```
+This always works without manual PATH setup.
+
+**Firewall/antivirus blocking downloads?**
+If `llama-server` download fails:
+1. Download manually from the [llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases)
+2. Extract to `~/.nexus-agent/llama-server/`
+3. Or use `-p ollama` or `-p gemini` as alternatives
 
 ---
 
@@ -315,10 +395,10 @@ tests/test_audit_fixes.py::test_search_web_offline_labeling PASSED       [ 19%]
 tests/test_audit_fixes.py::test_local_provider_setup_model_verify PASSED [ 22%]
 tests/test_audit_fixes.py::test_agent_run_stream_true PASSED             [ 25%]
 tests/test_audit_fixes.py::test_onboarding_env_file_path PASSED          [ 27%]
-tests/test_local_provider.py::test_local_qwen_provider_init PASSED       [ 30%]
-tests/test_local_provider.py::test_local_qwen_provider_convert_tools PASSED [ 33%]
-tests/test_local_provider.py::test_local_qwen_provider_setup_model PASSED [ 36%]
-tests/test_local_provider.py::test_local_qwen_format_tool_result_message PASSED [ 38%]
+tests/test_local_provider.py::test_local_provider_init PASSED            [ 30%]
+tests/test_local_provider.py::test_local_provider_convert_tools PASSED     [ 33%]
+tests/test_local_provider.py::test_local_provider_setup_model PASSED       [ 36%]
+tests/test_local_provider.py::test_local_provider_format_tool_result_message PASSED [ 38%]
 tests/test_providers.py::test_anthropic_provider_schema PASSED           [ 41%]
 tests/test_providers.py::test_openai_provider_schema PASSED              [ 44%]
 tests/test_providers.py::test_gemini_provider_schema PASSED              [ 47%]

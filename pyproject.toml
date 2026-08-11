@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-agent-ai"
-version = "2.4.1"
+version = "2.5.0"
 description = "Autonomous terminal-first AI software engineering assistant with ReAct tool loops and multi-provider fallback"
 readme = "README.md"
 authors = [{name = "Yash Bajpai"}]
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "typer>=0.12.0",
