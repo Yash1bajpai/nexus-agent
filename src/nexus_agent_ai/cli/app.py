@@ -78,7 +78,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         import os
         from ..providers.openai_provider import OpenAIProvider
         base_url = os.getenv("OLLAMA_HOST", "http://localhost:11434/v1")
-        local_model = os.getenv("LOCAL_MODEL", "qwen2.5-coder:7b")
+        local_model = os.getenv("LOCAL_MODEL", "llama3.2:3b")
         return OpenAIProvider(model=local_model, base_url=base_url), f"ollama ({local_model})"
     elif name_clean in ["openrouter", "laguna", "free"]:
         import os

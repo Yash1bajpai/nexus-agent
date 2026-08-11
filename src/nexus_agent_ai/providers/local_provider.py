@@ -148,9 +148,11 @@ class LocalProvider(BaseProvider):
                 return
             except Exception as e:
                 print(f"⚠️ llama-server failed: {e}")
+                print(f"   Log: {_SERVER_DIR / 'server.log'}")
 
         # Path 4: Ollama (external HTTP API)
-        print("💻 Falling back to Ollama...")
+        print("💻 CPU Mode: llama-server unavailable. Checking Ollama...")
+        print("   If you don't have Ollama, install it from: https://ollama.com")
         self._model_instance = "cpu_ollama_or_fallback"
 
     # ── llama-server subprocess management ────────────────────────────────
@@ -168,7 +170,23 @@ class LocalProvider(BaseProvider):
         if not zip_path.is_file():
             print(f"⬇️  Downloading llama-server (~50 MB) for CPU inference...")
             import urllib.request
-            urllib.request.urlretrieve(bin_url, str(zip_path))
+            try:
+                urllib.request.urlretrieve(bin_url, str(zip_path))
+            except Exception as dl_err:
+                # Clean up partial download
+                zip_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Failed to download llama-server from:\n  {bin_url}\n"
+                    f"Error: {dl_err}\n\n"
+                    f"This usually happens due to:\n"
+                    f"  - College/corporate firewall blocking GitHub downloads\n"
+                    f"  - No internet connection\n\n"
+                    f"Alternatives:\n"
+                    f"  1. Download manually from: {bin_url}\n"
+                    f"     Extract to: {_SERVER_DIR}\n"
+                    f"  2. Install Ollama instead: https://ollama.com\n"
+                    f"  3. Use a cloud provider: -p openrouter (free tier available)"
+                ) from dl_err
             print("✅ Download complete.")
 
         print("📦 Extracting llama-server...")
@@ -228,11 +246,28 @@ class LocalProvider(BaseProvider):
                 self._model_instance = "llama_server"
                 return
             if self._server_proc.poll() is not None:
-                # Process exited
-                stderr = self._server_proc.stderr.read().decode("utf-8", errors="replace") if self._server_proc.stderr else ""
-                raise RuntimeError(f"llama-server exited immediately: {stderr[:500]}")
+                # Process exited — read log file for error details
+                log_path = _SERVER_DIR / "server.log"
+                log_tail = ""
+                try:
+                    if log_path.is_file():
+                        log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-800:]
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"llama-server exited immediately (exit code {self._server_proc.returncode}).\n"
+                    f"Server log:\n{log_tail.strip()}"
+                )
 
-        raise RuntimeError("llama-server did not become ready within 30 seconds.")
+        raise RuntimeError(
+            f"llama-server did not become ready within 30 seconds.\n"
+            f"Check the log at: {_SERVER_DIR / 'server.log'}\n"
+            f"This can happen if:\n"
+            f"  - Another program is using port {self._server_port}\n"
+            f"  - Antivirus blocked the binary\n"
+            f"  - The model file is corrupted\n"
+            f"Try: Install Ollama instead (https://ollama.com) and use -p ollama"
+        )
 
     def _is_server_alive(self) -> bool:
         """Check if llama-server is responding."""
@@ -332,9 +367,10 @@ class LocalProvider(BaseProvider):
                     if resp.status == 200:
                         data = json.loads(resp.read().decode())
                         models = [m.get("name", "") for m in data.get("models", [])]
-                        target_model = os.getenv("LOCAL_MODEL", "qwen2.5-coder:7b")
+                        target_model = os.getenv("LOCAL_MODEL", "llama3.2:3b")
+                        # Auto-detect Liquid LFM or any coding model
                         for m in models:
-                            if "qwen" in m.lower():
+                            if "liquid" in m.lower() or "lfm" in m.lower():
                                 target_model = m
                                 break
                         from .openai_provider import OpenAIProvider
@@ -343,11 +379,25 @@ class LocalProvider(BaseProvider):
             except Exception:
                 pass
             raise RuntimeError(
-                "Local inference unavailable. Install one of:\n"
-                "  1. pip install llama-cpp-python  (CPU GGUF, no GPU needed)\n"
-                "  2. pip install torch transformers  (GPU required)\n"
-                "  3. Start Ollama: https://ollama.com\n"
-                "Or use a cloud provider: -p gemini / -p openrouter / -p auto"
+                "\n"
+                "━" * 60 + "\n"
+                "  Local model inference unavailable.\n"
+                "━" * 60 + "\n"
+                "  The Liquid LFM 2.6B model is downloaded but no inference\n"
+                "  engine could start. Choose one of these options:\n\n"
+                "  Option A — Install Ollama (easiest, recommended):\n"
+                "    1. Download from https://ollama.com\n"
+                "    2. Run: ollama run llama3.2:3b (or any coding model)\n"
+                "    3. Then: nexus-agent -p ollama \"your question\"\n\n"
+                "  Option B — Use a free cloud provider instead:\n"
+                "    1. Get a free key at https://openrouter.ai\n"
+                "    2. Add OPENROUTER_API_KEY=your_key to your .env file\n"
+                "    3. Then: nexus-agent -p openrouter \"your question\"\n\n"
+                "  Option C — Fix llama-server:\n"
+                "    Check the log at: " + str(_SERVER_DIR / 'server.log') + "\n"
+                "    Common fixes: disable antivirus for ~/.nexus-agent,\n"
+                "    or install Visual C++ Redistributable.\n"
+                "━" * 60
             )
 
         # GPU Engine processing logic (torch + transformers)
