@@ -132,6 +132,38 @@ graph TD
 
 ---
 
+## 🔄 How It Works (User Flow)
+
+Getting productive with Nexus-Agent takes exactly three steps:
+
+```
+1. pip install nexus-agent-ai
+            ↓
+2. Choose your backend:
+   • Local (free, offline):  nexus-agent pull-model   ← downloads Liquid AI LFM 2.6B
+   • Cloud (API key):        set GEMINI / OPENAI / ANTHROPIC key in .env
+            ↓
+3. Start working — the agent autonomously handles:
+   • 🔍 Web search      (search_web — live docs & error lookups)
+   • 🐞 Debugging       (reads your traceback, finds the bug)
+   • 🔧 Fixing errors   (applies the fix via write_file)
+   • 📖 Reading files   (read_file, @mention context injection)
+   • ✍️ Writing files   (creates/modifies code in your workspace)
+   • 📂 Project tours   (list_directory, git_status, git_diff, git_commit)
+```
+
+No extra configuration needed — pick a backend and start asking. Example sessions:
+
+```bash
+# Offline with the local Liquid AI model:
+nexus-agent -p local "read main.py and fix the import error"
+
+# With a cloud key:
+nexus-agent -p gemini "search web for the latest requests library API and write a demo script"
+```
+
+---
+
 ## 🚀 Getting Started
 
 ### 1. Installation
@@ -436,6 +468,14 @@ tests/test_ux_features.py::test_sqlite_memory PASSED                     [100%]
 - **AST Sandbox with Safe-Dunder Allowlist**: The `run_code` sandbox uses AST static analysis to block dangerous imports (`os`, `subprocess`, `socket`, `importlib`, etc.), execution calls (`exec`, `eval`, `compile`, `open`, `__import__`), and introspection attributes (`__class__`, `__bases__`, `__mro__`, `__globals__`, `__builtins__`). Safe dunders (`__name__`, `__main__`, `__file__`, `__str__`, `__repr__`, `__len__`, `__eq__`) are explicitly allowed so standard Python patterns like `if __name__ == "__main__":` are not blocked.
 - **Subprocess Isolation**: Code execution (`run_code`) runs in dedicated subprocess threads with mandatory timeouts to prevent infinite loops.
 - **GitHub Actions CI**: Automated Python 3.11/3.12/3.13 matrix testing on every push and PR — no manual QA gates needed.
+
+---
+
+## 📜 License
+
+Nexus-Agent is released under the [MIT License](LICENSE) — free to use, modify, and distribute.
+
+The local backend uses the [Liquid AI LFM 2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF) model, which is distributed by Liquid AI under its own license terms on HuggingFace.
 
 ---
 
