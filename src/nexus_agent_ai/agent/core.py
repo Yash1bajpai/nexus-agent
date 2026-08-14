@@ -23,6 +23,11 @@ RULES_PROMPT = """RULES:
 9. After every tool call, reason about the result before deciding next action.
 10. Never make up file contents, function signatures, or library APIs.
 11. Be direct. Skip unnecessary preamble.
+12. STOP using tools once you have enough information to answer. Give your final
+    answer as plain text. Do NOT keep calling the same tool repeatedly.
+13. For simple math or factual questions, answer directly WITHOUT using tools.
+14. If a duplicate tool call warning appears, immediately synthesize your final
+    answer from the results you already have. Do NOT call any more tools.
 
 THINKING PROTOCOL (MANDATORY):
 Before making ANY tool call, you MUST first output at least one sentence of plain
@@ -31,6 +36,50 @@ regular text BEFORE the tool call — never silent, never skipped.
 Good example: "I'll read the file first to understand its current structure."
 Bad example: [silent tool call with no prior text]
 This applies to every single tool call in every iteration."""
+
+# ── Smart Tool Routing for Local Models ──────────────────────────────────
+
+# Keywords/patterns that indicate a query NEEDS tool access
+_TOOL_PATTERNS = [
+    # File operations
+    r'\b(read|open|show|view|display|print)\b.*\b(file|\.py|\.js|\.ts|\.java|\.cpp|\.c\b|\.h\b|\.go|\.rs|\.rb|\.html|\.css|\.json|\.yaml|\.yml|\.toml|\.md|\.txt|\.csv|\.xml|\.sql)',
+    r'\b(write|create|generate|make|build)\b.*\b(file|class|function|script|module|program)',
+    r'\b(modify|edit|update|change|refactor|fix|patch)\b.*\b(file|code|function|class)',
+    r'\b(delete|remove)\b.*\b(file|line|function)',
+    r'@\S+',  # @mention file references
+    # Code execution
+    r'\b(run|execute|test|evaluate)\b.*\b(code|script|function|program)',
+    # Git operations
+    r'\b(git|commit|diff|branch|merge|stash|rebase|cherry)',
+    # Web search
+    r'\b(search|look up|find online|google|browse|latest version)',
+    # Directory
+    r'\b(list|show|explore)\b.*\b(dir|directory|folder|files|structure)',
+    # Debug
+    r'\b(debug|error|traceback|exception|bug|crash|broken|failing)',
+    # Review
+    r'\b(review|audit|analyze|check|inspect|scan)\b.*\b(code|file|project|repo)',
+    # File path references
+    r'[\w./\\]+\.\w{1,5}\b',  # anything that looks like a file path
+]
+
+def _is_local_provider(provider: BaseProvider) -> bool:
+    """Check if the provider is a local model (needs smart tool routing)."""
+    model = getattr(provider, 'model', '') or ''
+    provider_name = type(provider).__name__.lower()
+    return ('local' in provider_name or
+            'liquid' in model.lower() or
+            'lfm' in model.lower() or
+            hasattr(provider, '_server_proc'))
+
+def _query_needs_tools(user_input: str) -> bool:
+    """Determine if a query likely needs tool access (file ops, code, git, etc.)."""
+    q = user_input.lower().strip()
+    for pattern in _TOOL_PATTERNS:
+        if re.search(pattern, q, re.IGNORECASE):
+            return True
+    return False
+
 
 def parse_at_mentions(user_input: str) -> str:
     """Detect @filename mentions, synchronously read files, attach context invisibly, and clean prompt."""
@@ -124,12 +173,23 @@ class Agent:
         self.memory.add("user", processed_input)
         messages = self.memory.get()
 
+        # Smart Tool Routing: for local models, only pass tools when the query
+        # actually needs file/code/git/web operations. This prevents the local
+        # model from looping on tools for simple questions.
+        use_tools = self.tools
+        local_mode = _is_local_provider(self.provider)
+        if local_mode and not _query_needs_tools(processed_input):
+            use_tools = []  # no tools → model answers directly
+            effective_max_iter = 1
+        else:
+            effective_max_iter = self.max_iterations
+
         status = display.create_status("Thinking...") if self.verbose else None
 
         iteration = 0
         executed_tools = set()
         try:
-            while iteration < self.max_iterations:
+            while iteration < effective_max_iter:
                 iteration += 1
                 display.update_status(status, "Thinking...")
 
@@ -140,7 +200,7 @@ class Agent:
                             status = None
                         response = None
                         streamed_text = ""
-                        for item in self.provider.stream(messages=messages, tools=self.tools, system=self.system):
+                        for item in self.provider.stream(messages=messages, tools=use_tools, system=self.system):
                             if isinstance(item, ProviderResponse):
                                 response = item
                             elif isinstance(item, str):
@@ -157,7 +217,7 @@ class Agent:
                     else:
                         response = self.provider.complete(
                             messages=messages,
-                            tools=self.tools,
+                            tools=use_tools,
                             system=self.system
                         )
                 except RateLimitError as e:

@@ -207,9 +207,12 @@ To download or verify the model (`LiquidAI/LFM2.5-2.6B-GGUF`, Q6_K quantization,
 nexus-agent pull-model
 ```
 *What this does:*
-- Downloads the Liquid AI LFM 2.6B model to your local HuggingFace cache (`~/.cache/huggingface/hub/...`).
+- Downloads the Liquid AI LFM 2.6B post-trained agentic model to your local HuggingFace cache (`~/.cache/huggingface/hub/...`).
 - Validates model integrity and confirms readiness.
 - Once pulled, run offline anytime: `nexus-agent -p local "your question"`
+
+**Smart Tool Routing (v2.6.0+):**
+The local model uses intelligent tool routing. For simple questions (math, explanations, facts), it answers directly without tools. For coding tasks (reading/writing files, running code, git, web search), it automatically enables the full toolset. This keeps the small local model focused and prevents tool-call looping.
 
 #### C. Manual API Key Configuration (Cloud Providers)
 If you prefer manual configuration or want to use cloud LLMs (`Anthropic Claude 3.5 Sonnet`, `OpenAI GPT-4o`, `Google Gemini 2.5 Flash`), copy the example environment file:

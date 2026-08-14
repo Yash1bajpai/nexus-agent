@@ -227,6 +227,9 @@ class LocalProvider(BaseProvider):
             "--host", "127.0.0.1",
             "-t", "4",  # threads
             "--jinja",  # required for tool calling support
+            "--temp", "0.1",  # recommended by model card
+            "--top-k", "50",  # recommended by model card
+            "--repeat-penalty", "1.1",  # recommended by model card
         ]
         print(f"🔧 Starting llama-server on port {port}...")
         self._server_proc = subprocess.Popen(
