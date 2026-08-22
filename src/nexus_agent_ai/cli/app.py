@@ -473,6 +473,11 @@ def commit(
         ]
         commit_message = clean_lines[0] if clean_lines else (lines[-1] if lines else "chore: update codebase")
 
+        _failure_markers = ("max tool iterations", "fatal execution error", "execution failed", "timed out")
+        if not commit_message.strip() or any(marker in commit_message.lower() for marker in _failure_markers):
+            display.print_error("Could not generate a valid commit message. Commit aborted.")
+            raise typer.Exit(code=1)
+
         typer.echo(f"\n  Generated message: {commit_message}")
 
         if not yes:

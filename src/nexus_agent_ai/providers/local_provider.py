@@ -34,6 +34,11 @@ _SERVER_DIR = _NEXUS_HOME / "llama-server"
 _DEFAULT_PORT = 8099  # avoid collision with 8080
 
 
+def system_machine_is_arm_linux() -> bool:
+    """True on ARM/aarch64 Linux (e.g. Termux, Raspberry Pi) where prebuilt x86_64 llama-server binaries cannot run."""
+    return platform.system() == "Linux" and platform.machine().lower() in ("aarch64", "arm64", "armv7l", "armv8l")
+
+
 def _find_llama_server_exe() -> Optional[str]:
     """Find llama-server binary in the extracted directory (handles both flat and nested layouts)."""
     _, exe_name = _get_llama_server_info()
@@ -143,6 +148,22 @@ class LocalProvider(BaseProvider):
 
         # Path 3: llama-server subprocess (auto-downloads pre-built binary — best for Windows CPU)
         if isinstance(model_path, str) and os.path.isfile(model_path):
+            # A server may already be running (e.g. started manually) — use it
+            # before attempting any binary download.
+            if self._is_server_alive():
+                print(f"✅ llama-server already running on port {self._server_port}")
+                self._model_instance = "llama_server"
+                return
+            machine = platform.machine().lower()
+            if system_machine_is_arm_linux() and not _find_llama_server_exe():
+                print("⚠️ No native llama-server found for ARM Linux (aarch64).")
+                print("   The auto-downloader only ships x86_64 binaries.")
+                print("   Build llama.cpp locally or install Ollama, then retry:")
+                print("     https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md")
+                raise RuntimeError(
+                    "Local inference on ARM Linux requires a natively built llama-server "
+                    "(or Ollama). See https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md"
+                )
             try:
                 self._start_llama_server(model_path)
                 return
@@ -208,13 +229,13 @@ class LocalProvider(BaseProvider):
 
     def _start_llama_server(self, model_path: str):
         """Download llama-server if needed and start it with the GGUF model."""
-        exe_path = self._download_llama_server()
-
-        # Check if already running on our port
+        # Check if already running on our port (avoids a needless binary download)
         if self._is_server_alive():
             print(f"✅ llama-server already running on port {self._server_port}")
             self._model_instance = "llama_server"
             return
+
+        exe_path = self._download_llama_server()
 
         port = self._server_port
         log_path = _SERVER_DIR / "server.log"
@@ -283,7 +304,11 @@ class LocalProvider(BaseProvider):
             return False
 
     def _run_via_server(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
-        """Send a request to the local llama-server via OpenAI-compatible API."""
+        """Send a request to the local llama-server via OpenAI-compatible API.
+
+        Uses streaming (SSE) so that tokens flow continuously — this avoids
+        client-side socket timeouts during slow CPU-bound local generation.
+        """
         import urllib.request
 
         formatted_messages = []
@@ -297,6 +322,7 @@ class LocalProvider(BaseProvider):
             "temperature": 0.2,
             "top_p": 0.95,
             "max_tokens": 2048,
+            "stream": True,
         }
         if tools:
             payload["tools"] = self._convert_tools(tools)
@@ -309,34 +335,85 @@ class LocalProvider(BaseProvider):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            response = json.loads(resp.read().decode("utf-8"))
 
-        # Parse response
-        choice = response["choices"][0]
-        msg = choice.get("message", {})
-        text = msg.get("content", "") or ""
-        raw_tool_calls = msg.get("tool_calls", []) or []
+        text_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        raw_tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
+        raw_tool_call_order: List[str] = []
+        usage: Dict[str, Any] = {}
+
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk_str = line[len("data:"):].strip()
+                if not chunk_str or chunk_str == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(chunk_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+
+                content_delta = delta.get("content")
+                if content_delta:
+                    text_parts.append(content_delta)
+
+                reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
+                if reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
+
+                for rtc in delta.get("tool_calls") or []:
+                    # Key strictly by index: the id may only appear in the first
+                    # chunk, while name/arguments arrive as later fragments.
+                    idx = rtc.get("index", 0)
+                    key = f"idx_{idx}"
+                    if key not in raw_tool_calls_by_id:
+                        raw_tool_calls_by_id[key] = {"id": "", "name": "", "arguments": ""}
+                        raw_tool_call_order.append(key)
+                    entry = raw_tool_calls_by_id[key]
+                    if rtc.get("id"):
+                        entry["id"] = rtc["id"]
+                    func = rtc.get("function", {}) or {}
+                    if func.get("name"):
+                        entry["name"] += func["name"]
+                    if func.get("arguments"):
+                        entry["arguments"] += func["arguments"]
+
+        text = "".join(text_parts)
+        # Reasoning models (LFM2.5 etc.) may emit only thinking tokens when the
+        # answer is cut short — surface whatever we have rather than empty text.
+        if not text and reasoning_parts:
+            text = "".join(reasoning_parts)
 
         tool_calls = []
-        for rtc in raw_tool_calls:
-            func = rtc.get("function", {})
-            func_name = func.get("name", "")
+        for key in raw_tool_call_order:
+            entry = raw_tool_calls_by_id[key]
+            func_name = entry["name"]
+            if not func_name:
+                continue  # skip empty fragments
             try:
-                func_args = json.loads(func.get("arguments", "{}")) if isinstance(func.get("arguments"), str) else func.get("arguments", {})
+                func_args = json.loads(entry["arguments"]) if entry["arguments"] else {}
             except json.JSONDecodeError:
                 func_args = {}
-            tc_id = rtc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+            tc_id = entry["id"] or f"call_{uuid.uuid4().hex[:8]}"
             tool_calls.append(ToolCall(id=tc_id, name=func_name, args=func_args))
 
         raw_msg = {"role": "assistant", "content": text}
-        if raw_tool_calls:
+        if tool_calls:
             raw_msg["tool_calls"] = [
                 {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.args)}}
                 for tc in tool_calls
             ]
 
-        usage = response.get("usage", {})
         return ProviderResponse(
             text=text,
             tool_calls=tool_calls,

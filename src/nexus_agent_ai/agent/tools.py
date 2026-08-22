@@ -208,8 +208,8 @@ def _sandbox_check(code: str) -> str | None:
             if node.id in blocked_names or (node.id in _BLOCKED_DUNDERS):
                 violations.append(f"{node.id} is not available in sandboxed run_code")
 
-        elif isinstance(node, (ast.Constant, ast.Str)):
-            val = node.value if isinstance(node, ast.Constant) else node.s
+        elif isinstance(node, ast.Constant):
+            val = node.value
             if isinstance(val, str) and val in _BLOCKED_DUNDERS:
                 violations.append(f"blocked reflection string '{val}' — forbidden in sandboxed run_code")
 

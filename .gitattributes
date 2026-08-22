@@ -1,0 +1,19 @@
+# Normalize all text files to LF in the repository
+* text=auto eol=lf
+
+# Explicit source/script types
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.bat text eol=crlf
+
+# Binary assets
+*.gguf binary
+*.whl binary
+*.tar.gz binary
+*.png binary
+*.jpg binary
+*.sqlite binary
