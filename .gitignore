@@ -40,5 +40,8 @@ CHANGELOG.md
 enrich_graph.py
 enrich_graph.bat
 
+# PyPI uploader (twine replacement for Termux; token passed via PYPI_TOKEN env)
+upload_pypi.py
+
 # IDE-generated docs (Qoder repowiki)
 .qoder/
