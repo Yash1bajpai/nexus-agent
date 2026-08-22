@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/73e78850-8669-40e9-aec3-3a355e975c1f
 
 ## 🌟 Overview
 
-**Nexus-Agent** is an autonomous command-line coding agent designed to pair-program with developers directly inside their local workspace. Built from the ground up to showcase modern **Agentic AI Engineering** principles, Nexus-Agent doesn't just generate text—it autonomously inspects files, modifies codebases, executes scripts inside secure local sandboxes, searches live web documentation, and inspects Git repositories.
+**Nexus-Agent** is an autonomous command-line coding agent designed to pair-program with developers directly inside their local workspace. Built from the ground up to showcase modern **Agentic AI Engineering** principles, Nexus-Agent inspects files, modifies codebases, executes restricted pure-computation snippets, searches live web documentation, and inspects Git repositories.
 
 Built with a clean **ReAct (Reasoning + Acting)** cognitive architecture, Nexus-Agent reasons step-by-step after every tool execution before deciding its next move.
 
@@ -115,7 +115,7 @@ graph TD
     subgraph Sandbox Tools
         Dispatcher --> RF["read_file / list_directory"]
         Dispatcher --> WF["write_file"]
-        Dispatcher --> RC["run_code / run_file"]
+        Dispatcher --> RC["run_code"]
         Dispatcher --> WEB["search_web (DuckDuckGo / Offline Cache)"]
         Dispatcher --> GIT["git_status / git_diff / git_commit"]
     end
@@ -238,6 +238,8 @@ To download or verify the model (`LiquidAI/LFM2.5-2.6B-GGUF`, Q6_K quantization,
 ```bash
 nexus-agent pull-model
 ```
+nexus-agent-ai installs local mode by default. Cloud providers and live web search are optional integrations; install `nexus-agent-ai[all,web]` only when those SDKs are available on your platform.
+Automatic llama-server downloads are fail-closed: set `NEXUS_AGENT_LLAMA_SERVER_SHA256` to the official release ZIP SHA-256 before first download. On Termux/ARM, build a native llama-server locally and set `NEXUS_AGENT_MODEL_FILENAME` to a phone-safe quant such as `LFM2.5-2.6B-Q4_K_M.gguf`.
 *What this does:*
 - Downloads the Liquid AI LFM 2.6B post-trained agentic model to your local HuggingFace cache (`~/.cache/huggingface/hub/...`).
 - Validates model integrity and confirms readiness.
@@ -247,9 +249,10 @@ nexus-agent pull-model
 The local model uses intelligent tool routing. For simple questions (math, explanations, facts), it answers directly without tools. For coding tasks (reading/writing files, running code, git, web search), it automatically enables the full toolset. This keeps the small local model focused and prevents tool-call looping.
 
 #### C. Manual API Key Configuration (Cloud Providers)
-If you prefer manual configuration or want to use cloud LLMs (`Anthropic Claude 3.5 Sonnet`, `OpenAI GPT-4o`, `Google Gemini 2.5 Flash`), copy the example environment file:
+If you prefer manual configuration or want to use cloud LLMs (`Anthropic Claude 3.5 Sonnet`, `OpenAI GPT-4o`, `Google Gemini 2.5 Flash`), copy the example environment file into the user-owned config directory:
 ```bash
-cp .env.example .env
+mkdir -p ~/.nexus-agent
+cp .env.example ~/.nexus-agent/.env
 ```
 Open `.env` and set your desired default provider and API keys:
 ```ini
@@ -410,7 +413,7 @@ Inside REPL mode or chat prompts, mention any file path using `@filename` (e.g. 
 
 ## 🧪 Testing & Verification
 
-Nexus-Agent maintains a **100% passing automated regression & security test suite** (`36 unit tests`) covering all tool dispatchers, AST sandbox boundaries, safe-dunder allowlisting, streaming mechanics, provider mocking, and filesystem handlers:
+Nexus-Agent maintains an automated regression and security test suite covering tool dispatchers, restricted code execution, streaming mechanics, provider mocking, and filesystem handlers:
 
 ```bash
 pytest tests/ -v --tb=short
@@ -424,7 +427,7 @@ tests/test_audit_fixes.py::test_sandbox_check_blocks_bypass PASSED       [  2%]
 tests/test_audit_fixes.py::test_sandbox_check_blocks_introspection_and_gc PASSED [  5%]
 tests/test_audit_fixes.py::test_sandbox_check_allows_safe_dunders PASSED   [  8%]
 tests/test_audit_fixes.py::test_validate_workspace_path_prefix_containment PASSED [ 11%]
-tests/test_audit_fixes.py::test_execute_run_file_sandbox_validation PASSED [ 13%]
+tests/test_audit_fixes.py::test_execute_run_file_is_disabled PASSED
 tests/test_audit_fixes.py::test_memory_pruning_user_boundaries PASSED    [ 16%]
 tests/test_audit_fixes.py::test_search_web_offline_labeling PASSED       [ 19%]
 tests/test_audit_fixes.py::test_local_provider_setup_model_verify PASSED [ 22%]

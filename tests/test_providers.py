@@ -1,4 +1,8 @@
 import pytest
+
+anthropic = pytest.importorskip("anthropic", reason="anthropic SDK optional")
+openai = pytest.importorskip("openai", reason="openai SDK optional")
+genai = pytest.importorskip("google.genai", reason="google-genai SDK optional")
 from unittest.mock import MagicMock, patch
 # pyrefly: ignore [missing-import]
 from nexus_agent_ai.providers.base import Tool

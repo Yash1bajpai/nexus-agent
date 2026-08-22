@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import subprocess
+import ast
 from pathlib import Path
 from typing import Any, Dict, List
 from ..providers.base import Tool
@@ -43,9 +44,15 @@ def execute_read_file(path: str) -> str:
             return validated
         p = validated
 
-        # Security Block: Protect secrets, environment credentials, and private keys from being exposed
+        # Do not let an agent copy common credential/config files into prompts.
         filename_lower = p.name.lower()
-        if filename_lower.startswith(".env") or any(filename_lower.endswith(ext) for ext in [".pem", ".key", ".pfx", ".p12"]) or "id_rsa" in filename_lower:
+        sensitive_names = {".git", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc"}
+        sensitive_suffixes = (".pem", ".key", ".pfx", ".p12", ".crt", ".token", ".secret")
+        if (filename_lower.startswith(".env") or filename_lower in sensitive_names
+                or any(part.lower() in sensitive_names for part in p.parts)
+                or any(filename_lower.endswith(ext) for ext in sensitive_suffixes)
+                or any(marker in filename_lower for marker in ("credential", "secret", "token", "password", "passwd"))
+                or "id_rsa" in filename_lower):
             return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
 
         with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -153,76 +160,49 @@ _BLOCKED_DUNDERS = frozenset({
     "__func__", "__self__", "__weakref__", "__module__",
 })
 
+_SAFE_CALLS = frozenset({
+    "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float", "int",
+    "len", "list", "map", "max", "min", "print", "range", "repr", "reversed",
+    "round", "set", "sorted", "str", "sum", "tuple", "zip",
+})
+
+
 def _sandbox_check(code: str) -> str | None:
     """
     AST-based static analysis. Returns an error string if forbidden
     constructs or indirect import bypass mechanisms are detected, or None if safe.
     """
-    import ast
-
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
         return f"ERROR: Code has a syntax error: {e}"
 
     violations = []
-
+    allowed_nodes = (
+        ast.Module, ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Name, ast.Load,
+        ast.Store, ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.ListComp,
+        ast.SetComp, ast.DictComp, ast.comprehension, ast.BinOp, ast.UnaryOp, ast.BoolOp,
+        ast.Compare, ast.If, ast.For, ast.While, ast.Break, ast.Continue, ast.Pass,
+        ast.Return, ast.FunctionDef, ast.arguments, ast.arg, ast.Call, ast.keyword,
+        ast.IfExp, ast.Subscript, ast.Slice, ast.Index, ast.Assert, ast.Lambda,
+        ast.operator, ast.unaryop, ast.boolop, ast.cmpop,
+    )
+    blocked_names = {"__import__", "eval", "exec", "compile", "open", "getattr", "setattr",
+                     "delattr", "globals", "locals", "vars", "dir", "help", "input",
+                     "breakpoint", "exit", "quit", "license", "credits", "copyright"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in _FORBIDDEN_IMPORTS:
-                    violations.append(f"import {alias.name}")
-
-        elif isinstance(node, ast.ImportFrom):
-            module = (node.module or "").split(".")[0]
-            if module in _FORBIDDEN_IMPORTS:
-                violations.append(f"from {node.module} import ...")
-
-        elif isinstance(node, ast.Attribute):
-            # Block access to dangerous module attributes
-            if isinstance(node.value, ast.Name) and node.value.id in ("sys", "builtins", "__builtins__", "importlib", "platform", "operator"):
-                violations.append(f"{node.value.id}.{node.attr}")
-            # Trace base name if chained attributes exist
-            val = node.value
-            while isinstance(val, ast.Attribute):
-                val = val.value
-            if isinstance(val, ast.Name) and val.id in _FORBIDDEN_IMPORTS:
-                violations.append(f"forbidden module access ({val.id}.{node.attr})")
-            # Block forbidden introspection/GC attributes
-            if node.attr in _FORBIDDEN_ATTRIBUTES:
-                violations.append(f"forbidden attribute access (.{node.attr}) — forbidden in sandboxed run_code")
-            # Block dunder attribute access that leads to sandbox escape
-            elif node.attr.startswith("__") and node.attr.endswith("__"):
-                if node.attr in _BLOCKED_DUNDERS:
-                    violations.append(f"blocked dunder access (.{node.attr}) — forbidden in sandboxed run_code")
-                elif node.attr not in _SAFE_DUNDERS:
-                    violations.append(f"unrecognised dunder access (.{node.attr}) — forbidden in sandboxed run_code")
-
-        elif isinstance(node, ast.Name):
-            # Block dangerous builtin names and blocked dunder names (not safe dunders)
-            blocked_names = {
-                "globals", "locals", "vars", "dir", "help", "breakpoint",
-                "license", "credits", "copyright", "exit", "quit", "input",
-            }
-            if node.id in blocked_names or (node.id in _BLOCKED_DUNDERS):
-                violations.append(f"{node.id} is not available in sandboxed run_code")
-
-        elif isinstance(node, ast.Constant):
-            val = node.value
-            if isinstance(val, str) and val in _BLOCKED_DUNDERS:
-                violations.append(f"blocked reflection string '{val}' — forbidden in sandboxed run_code")
-
-        elif isinstance(node, ast.Call):
-            func = node.func
-            func_name = ""
-            if isinstance(func, ast.Name):
-                func_name = func.id
-            elif isinstance(func, ast.Attribute):
-                func_name = func.attr
-
-            if func_name in ("__import__", "import_module", "getattr", "setattr", "attrgetter", "exec", "eval", "compile", "open", "run_module", "run_path"):
-                violations.append(f"{func_name}() — forbidden in sandboxed run_code")
+        if not isinstance(node, allowed_nodes):
+            violations.append(f"{type(node).__name__} is not allowed in sandboxed run_code")
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Attribute)):
+            violations.append(f"{type(node).__name__} is not allowed in sandboxed run_code")
+        if isinstance(node, ast.Name) and (node.id in blocked_names or (node.id.startswith("__") and node.id not in {"__name__", "__file__"})):
+            violations.append(f"{node.id} is not available in sandboxed run_code")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_CALLS:
+                violations.append("only approved pure functions may be called in sandboxed run_code")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if ("__" in node.value and node.value not in {"__main__"}) or any(word in node.value.lower() for word in ("import", "subprocess", "system", "password", "token")):
+                violations.append("sensitive reflection or command text is not allowed in sandboxed run_code")
 
     if violations:
         bullet_list = "\n  - ".join(violations)
@@ -232,7 +212,7 @@ def _sandbox_check(code: str) -> str | None:
             f"run_code is for pure computation only (math, algorithms, data processing).\n"
             f"For file I/O -> use read_file / write_file tools.\n"
             f"For shell commands -> use git_status / git_diff tools.\n"
-            f"If you need to run an existing script -> use the run_file tool."
+            f"Existing scripts cannot be executed by the agent."
         )
     return None
 
@@ -252,13 +232,32 @@ def execute_run_code(code: str, language: str = "python") -> str:
             temp_path = tf.name
 
         try:
+            safe_env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
+            preexec_fn = None
+            # Android/Termux applies process resource limits differently; the
+            # subprocess timeout and stripped environment remain active there.
+            if os.name == "posix" and not os.getenv("ANDROID_ROOT"):
+                def _limit_child_resources():
+                    try:
+                        import resource
+                        resource.setrlimit(resource.RLIMIT_CPU, (CODE_EXECUTION_TIMEOUT, CODE_EXECUTION_TIMEOUT + 1))
+                        resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+                        resource.setrlimit(resource.RLIMIT_FSIZE, (1 * 1024 * 1024, 1 * 1024 * 1024))
+                        if hasattr(resource, "RLIMIT_NOFILE"):
+                            resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
+                    except (ImportError, OSError, ValueError):
+                        pass
+                preexec_fn = _limit_child_resources
             res = subprocess.run(
                 [sys.executable, temp_path],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=CODE_EXECUTION_TIMEOUT
+                timeout=CODE_EXECUTION_TIMEOUT,
+                cwd=tempfile.gettempdir(),
+                env=safe_env,
+                preexec_fn=preexec_fn,
             )
         finally:
             try:
@@ -528,45 +527,15 @@ GIT_COMMIT_TOOL = Tool(
 )
 
 def execute_run_file(path: str) -> str:
-    """Run an existing Python script file directly via subprocess."""
-    validated = _validate_workspace_path(path)
-    if isinstance(validated, str):
-        return validated
-        
-    try:
-        p = Path(path).resolve()
-        if not p.exists():
-            return f"ERROR: File not found: {path}"
-        if p.suffix.lower() not in [".py"]:
-            return f"ERROR: Only .py files are supported. Got: {p.suffix}"
-
-        res = subprocess.run(
-            [sys.executable, str(p)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdin=subprocess.DEVNULL,
-            timeout=CODE_EXECUTION_TIMEOUT,
-        )
-        out = res.stdout.strip()
-        err = res.stderr.strip()
-        output = ""
-        if out:
-            output += f"STDOUT:\n{out}\n"
-        if err:
-            output += f"STDERR:\n{err}\n"
-        if not output:
-            output = f"[{path} executed successfully with no output]"
-        return output.strip()
-    except subprocess.TimeoutExpired:
-        return f"ERROR: Script timed out after {CODE_EXECUTION_TIMEOUT} seconds."
-    except Exception as e:
-        return f"ERROR: Could not run file: {str(e)}"
+    """Reject unrestricted script execution."""
+    return (
+        "ERROR: Running existing files is disabled because it would execute arbitrary code "
+        "with the user's permissions. Use run_code for pure computation instead."
+    )
 
 RUN_FILE_TOOL = Tool(
     name="run_file",
-    description="Run an existing Python script file directly. Use this when you need to execute a file already on disk (e.g. to verify generated code). No import restrictions unlike run_code.",
+    description="Disabled for security: existing files must not be executed with the user's full permissions.",
     input_schema={
         "type": "object",
         "properties": {
@@ -587,7 +556,6 @@ def get_all_tools() -> List[Tool]:
         WRITE_FILE_TOOL,
         LIST_DIRECTORY_TOOL,
         RUN_CODE_TOOL,
-        RUN_FILE_TOOL,
         SEARCH_WEB_TOOL,
         GIT_STATUS_TOOL,
         GIT_DIFF_TOOL,

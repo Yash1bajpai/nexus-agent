@@ -1,4 +1,3 @@
-import anthropic
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 from ..utils.config import get_env_or_raise
@@ -7,8 +6,13 @@ class AnthropicProvider(BaseProvider):
     """LLM Provider implementation for Anthropic Claude models."""
 
     def __init__(self, model: str = "claude-sonnet-4-6"):
+        try:
+            import anthropic
+        except ImportError as e:
+            raise RuntimeError("Anthropic provider requires the 'anthropic' package. Install nexus-agent-ai[all].") from e
+        self._anthropic = anthropic
         api_key = get_env_or_raise("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = self._anthropic.Anthropic(api_key=api_key)
         self.model = model
 
     def _convert_tools(self, tools: List[Tool]) -> List[Dict[str, Any]]:
@@ -35,7 +39,7 @@ class AnthropicProvider(BaseProvider):
 
         try:
             response = self.client.messages.create(**kwargs)
-        except anthropic.RateLimitError as e:
+        except self._anthropic.RateLimitError as e:
             raise RateLimitError("Anthropic", str(e))
         except Exception as e:
             err_str = str(e).lower()
@@ -109,7 +113,7 @@ class AnthropicProvider(BaseProvider):
                 input_tokens=in_tokens,
                 output_tokens=out_tokens,
             )
-        except anthropic.RateLimitError as e:
+        except self._anthropic.RateLimitError as e:
             raise RateLimitError("Anthropic", str(e))
         except Exception as e:
             err_str = str(e).lower()

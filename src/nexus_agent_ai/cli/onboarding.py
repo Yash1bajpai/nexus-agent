@@ -336,8 +336,8 @@ def _step_system_specs():
         print(f"  CPU Cores: {cores or 'Unknown'}")
         _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
                "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
-    _print("  [dim]Local provider uses LiquidAI/LFM2.5-2.6B-GGUF (Q6_K, ~2.2 GB) for offline CPU inference, or Ollama/Torch for GPU setups.[/dim]" if console else
-           "  Local provider uses LiquidAI/LFM2.5-2.6B-GGUF (Q6_K, ~2.2 GB) for offline CPU inference, or Ollama/Torch for GPU setups.")
+    _print("  [dim]Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. Q4_K_M is recommended on phones; Q6_K needs about 2.2 GB and may cause OOM. A native llama-server is required on ARM.[/dim]" if console else
+           "  Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. Q4_K_M is recommended on phones; Q6_K needs about 2.2 GB and may cause OOM. A native llama-server is required on ARM.")
 
 
 def _step_default_provider() -> str:
@@ -371,8 +371,8 @@ def _step_default_provider() -> str:
 
 def _step_local_model_setup():
     """[4/4] - Download/verify the local Liquid LFM 2.6B model weights."""
-    _print("\n[bold][[4/4]][/bold] [cyan]Local Liquid LFM Engine Setup (~2.2 GB)[/cyan]" if console else "\n[4/4] Local Liquid LFM Engine Setup (~2.2 GB)")
-    _print("  The built-in offline reasoning engine (LiquidAI/LFM2.5-2.6B-GGUF) is ~2.2 GB.")
+    _print("\n[bold][[4/4]][/bold] [cyan]Local Liquid LFM Engine Setup[/cyan]" if console else "\n[4/4] Local Liquid LFM Engine Setup")
+    _print("  The built-in offline reasoning engine is configurable with NEXUS_AGENT_MODEL_FILENAME; use Q4_K_M on phones to reduce memory use.")
     try:
         consent = _input("  Download now? Requires ~2.2 GB disk space. (y/N): ").strip().lower()
         if consent != "y":

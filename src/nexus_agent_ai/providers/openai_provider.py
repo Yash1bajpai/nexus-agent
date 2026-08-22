@@ -1,5 +1,4 @@
 import json
-import openai
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 from ..utils.config import get_env_or_raise
@@ -8,6 +7,11 @@ class OpenAIProvider(BaseProvider):
     """LLM Provider implementation for OpenAI GPT models and local OpenAI-compatible servers (Ollama/LM Studio)."""
 
     def __init__(self, model: str = "gpt-4o-mini", base_url: Optional[str] = None, api_key: Optional[str] = None):
+        try:
+            import openai
+        except ImportError as e:
+            raise RuntimeError("OpenAI-compatible provider requires the 'openai' package. Install nexus-agent-ai[all].") from e
+        self._openai = openai
         import os
         base_url = base_url or os.getenv("OPENAI_BASE_URL")
         if api_key:
@@ -16,7 +20,7 @@ class OpenAIProvider(BaseProvider):
             api_key = os.getenv("OPENAI_API_KEY", "local-key")
         else:
             api_key = get_env_or_raise("OPENAI_API_KEY")
-        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        self.client = self._openai.OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
 
     def _convert_tools(self, tools: List[Tool]) -> List[Dict[str, Any]]:
@@ -54,7 +58,7 @@ class OpenAIProvider(BaseProvider):
         response = None
         try:
             response = self.client.chat.completions.create(**kwargs)
-        except openai.RateLimitError as e:
+        except self._openai.RateLimitError as e:
             raise RateLimitError("OpenAI", str(e))
         except Exception as e:
             err_str = str(e).lower()
@@ -218,7 +222,7 @@ class OpenAIProvider(BaseProvider):
                 output_tokens=out_tokens,
             )
 
-        except openai.RateLimitError as e:
+        except self._openai.RateLimitError as e:
             raise RateLimitError("OpenAI", str(e))
         except Exception as e:
             err_str = str(e).lower()

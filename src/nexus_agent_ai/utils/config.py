@@ -15,10 +15,11 @@ def _find_project_root() -> Path:
 
 PROJECT_ROOT = _find_project_root()
 
-# Load global user home config first, then override with local project .env if present
+# Load only the user-owned config by default. A repository-controlled .env must
+# not be able to redirect API traffic or replace credentials implicitly.
 if GLOBAL_ENV_FILE.exists():
     load_dotenv(GLOBAL_ENV_FILE, override=False)
-if (PROJECT_ROOT / ".env").exists():
+if os.getenv("NEXUS_AGENT_ALLOW_PROJECT_ENV", "").lower() in {"1", "true", "yes"} and (PROJECT_ROOT / ".env").exists():
     load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 class ConfigError(Exception):
@@ -59,5 +60,5 @@ def get_package_version() -> str:
         return version("nexus-agent-ai")
     except Exception:
         pass
-    return "2.4.0"
+    return "2.6.3"
 

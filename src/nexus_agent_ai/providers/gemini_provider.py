@@ -1,7 +1,4 @@
 import uuid
-from google import genai
-# pyrefly: ignore [missing-import]
-from google.genai import types
 from typing import Any, Dict, List
 # pyrefly: ignore [missing-import]
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
@@ -12,8 +9,15 @@ class GeminiProvider(BaseProvider):
     """LLM Provider implementation for Google Gemini models via google-genai SDK."""
 
     def __init__(self, model: str = "gemini-2.5-flash-lite"):
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as e:
+            raise RuntimeError("Gemini provider requires the 'google-genai' package.") from e
+        self._genai = genai
+        self._types = types
         api_key = get_env_or_raise("GEMINI_API_KEY")
-        self.client = genai.Client(api_key=api_key)
+        self.client = self._genai.Client(api_key=api_key)
         self.model = model
 
     def _format_messages(self, messages: List[Dict[str, Any]]) -> List[Any]:
@@ -57,18 +61,18 @@ class GeminiProvider(BaseProvider):
         declarations = []
         for t in tools:
             declarations.append(
-                types.FunctionDeclaration(
+                self._types.FunctionDeclaration(
                     name=t.name,
                     description=t.description,
                     parameters=t.input_schema,
                 )
             )
-        return [types.Tool(function_declarations=declarations)]
+        return [self._types.Tool(function_declarations=declarations)]
 
     def complete(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
         genai_tools = self._convert_tools(tools)
 
-        config = types.GenerateContentConfig(
+        config = self._types.GenerateContentConfig(
             system_instruction=system if system else None,
             tools=genai_tools if genai_tools else None,
         )
@@ -134,7 +138,7 @@ class GeminiProvider(BaseProvider):
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
         genai_tools = self._convert_tools(tools)
-        config = types.GenerateContentConfig(
+        config = self._types.GenerateContentConfig(
             system_instruction=system if system else None,
             tools=genai_tools if genai_tools else None,
         )

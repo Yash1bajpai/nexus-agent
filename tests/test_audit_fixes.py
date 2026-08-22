@@ -52,9 +52,6 @@ def test_sandbox_check_allows_safe_dunders():
     safe_code_snippets = [
         "if __name__ == '__main__':\n    print('hello')",
         "def foo():\n    return __name__",
-        "class Bar:\n    def __init__(self):\n        self.x = __len__([1,2,3])",
-        "x = __str__(123)",
-        "assert __repr__(object())",
         "d = {'a': 1}\nlen(d)",
         "obj == None",
     ]
@@ -117,25 +114,16 @@ def test_validate_workspace_path_prefix_containment(tmp_path: Path, monkeypatch)
     assert isinstance(res_clean, Path)
     assert res_clean.resolve() == clean_file.resolve()
 
-def test_execute_run_file_sandbox_validation(tmp_path: Path, monkeypatch):
-    """Verify execute_run_file scans files with sandbox check before running."""
-    cwd = tmp_path / "workspace"
-    cwd.mkdir()
-    monkeypatch.setattr(Path, "cwd", lambda: cwd)
-    monkeypatch.setattr(os, "getcwd", lambda: str(cwd))
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "fake_temp"))
+def test_execute_run_file_is_disabled():
+    """Existing files must not execute with the user's full OS permissions."""
+    res = execute_run_file("anything.py")
+    assert "disabled" in res.lower()
 
-    # Safe file should pass and run
-    safe_file = cwd / "safe.py"
-    safe_file.write_text("print('All safe')", encoding="utf-8")
-    res_safe = execute_run_file(str(safe_file))
-    assert "STDOUT:\nAll safe" in res_safe
 
-    # Script containing standard imports like os should execute successfully without sandbox block
-    script_file = cwd / "script.py"
-    script_file.write_text("import os\nprint(os.name)", encoding="utf-8")
-    res_script = execute_run_file(str(script_file))
-    assert "STDOUT:\n" in res_script
+def test_sandbox_blocks_dynamic_attribute_escape():
+    """Dynamic getattr/subclass tricks must be rejected by the allowlist."""
+    exploit = 'g=getattr\nu="__"+"class__"\nprint(g((), u))'
+    assert _sandbox_check(exploit) is not None
 
 def test_memory_pruning_user_boundaries():
     """Verify ConversationMemory prune preserves user boundary structure."""

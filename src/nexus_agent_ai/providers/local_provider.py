@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import uuid
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall
@@ -32,6 +33,7 @@ def _get_llama_server_info() -> tuple:
 _NEXUS_HOME = Path.home() / ".nexus-agent"
 _SERVER_DIR = _NEXUS_HOME / "llama-server"
 _DEFAULT_PORT = 8099  # avoid collision with 8080
+_DEFAULT_FILENAME = "LFM2.5-2.6B-Q6_K.gguf"
 
 
 def system_machine_is_arm_linux() -> bool:
@@ -70,7 +72,7 @@ class LocalProvider(BaseProvider):
 
     def __init__(self, model_id: str = "LiquidAI/LFM2.5-2.6B-GGUF"):
         self.model_id = model_id
-        self.filename = "LFM2.5-2.6B-Q6_K.gguf"
+        self.filename = os.getenv("NEXUS_AGENT_MODEL_FILENAME", _DEFAULT_FILENAME)
         self._tokenizer = None
         self._model_instance = None
         self._llama = None  # llama-cpp-python instance
@@ -187,6 +189,12 @@ class LocalProvider(BaseProvider):
         _SERVER_DIR.mkdir(parents=True, exist_ok=True)
         zip_path = _SERVER_DIR / "llama-server.zip"
         bin_url, exe_name = _get_llama_server_info()
+        expected_sha256 = os.getenv("NEXUS_AGENT_LLAMA_SERVER_SHA256", "").strip().lower()
+        if not expected_sha256 or len(expected_sha256) != 64 or any(c not in "0123456789abcdef" for c in expected_sha256):
+            raise RuntimeError(
+                "Refusing to execute an unverified llama-server download. "
+                "Set NEXUS_AGENT_LLAMA_SERVER_SHA256 to the official 64-character SHA-256 digest."
+            )
 
         if not zip_path.is_file():
             print(f"⬇️  Downloading llama-server (~50 MB) for CPU inference...")
@@ -210,10 +218,20 @@ class LocalProvider(BaseProvider):
                 ) from dl_err
             print("✅ Download complete.")
 
+        digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+        if digest != expected_sha256:
+            zip_path.unlink(missing_ok=True)
+            raise RuntimeError("llama-server download checksum mismatch; refusing to execute it.")
+
         print("📦 Extracting llama-server...")
         import zipfile
         with zipfile.ZipFile(str(zip_path), "r") as zf:
-            zf.extractall(str(_SERVER_DIR))
+            destination = _SERVER_DIR.resolve()
+            for member in zf.infolist():
+                target = (destination / member.filename).resolve()
+                if not target.is_relative_to(destination):
+                    raise RuntimeError(f"Unsafe archive member path: {member.filename}")
+            zf.extractall(str(destination))
 
         exe_path = _find_llama_server_exe()
         if not exe_path:

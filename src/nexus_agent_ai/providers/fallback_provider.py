@@ -61,17 +61,19 @@ class FallbackProvider(BaseProvider):
 
     def _init_first(self):
         """Try to initialize the first available provider in the chain."""
+        failures = []
         for name, factory in self._chain:
             try:
                 provider = factory()
                 self._current_name = name
                 self._current_provider = provider
                 return
-            except Exception:
+            except Exception as e:
+                failures.append(f"{name}: {e}")
                 continue
         raise ConfigError(
-            "No valid API keys found or initialization failed for all providers (gemini, anthropic, openai). "
-            "Please check your .env file."
+            "No fallback provider could be initialized. "
+            + "; ".join(failures)
         )
 
     def _switch_next(self, failed_name: str, reason: str = ""):
