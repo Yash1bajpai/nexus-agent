@@ -34,3 +34,11 @@ __test_scan.py
 *.sqlite3
 *.log
 CHANGELOG.md
+
+# Local graph memory (personal use only)
+.agents/
+enrich_graph.py
+enrich_graph.bat
+
+# IDE-generated docs (Qoder repowiki)
+.qoder/
