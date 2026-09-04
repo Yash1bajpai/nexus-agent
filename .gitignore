@@ -45,3 +45,4 @@ upload_pypi.py
 
 # IDE-generated docs (Qoder repowiki)
 .qoder/
+test_college.md

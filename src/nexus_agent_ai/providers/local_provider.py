@@ -14,6 +14,19 @@ from .base import BaseProvider, ProviderResponse, Tool, ToolCall
 _LLAMA_RELEASE = "b7075"
 _LLAMA_BASE_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{_LLAMA_RELEASE}"
 
+# Official SHA-256 digests of the b7075 release ZIPs (from the GitHub release
+# API). The download stays fail-closed: it is only executed if the digest
+# matches. NEXUS_AGENT_LLAMA_SERVER_SHA256 overrides this table (e.g. for a
+# new llama.cpp release after a manual review).
+_LLAMA_SERVER_SHA256 = {
+    "llama-b7075-bin-win-cpu-x64.zip": "ee57177a13347b386e8c097908fbb7f37c814f8a9c2948aef64f843a93221f13",
+    "llama-b7075-bin-win-cpu-arm64.zip": "d01596413d704cbc66db01b1f686133d22749664d8516e9d56d6c5d540e5b2a4",
+    "llama-b7075-bin-macos-arm64.zip": "d13d0654776e3e9e17ee77410d8622a1ca9858c5c3c0dbf96330b74d7332dd51",
+    "llama-b7075-bin-macos-x64.zip": "4adb027ebc5508d899c2fd6ade65fb7b74aaeef14a898aadc146b320c504d744",
+    # NOTE: b7075 publishes the Linux build as "ubuntu-x64" (there is no linux-x64 asset)
+    "llama-b7075-bin-ubuntu-x64.zip": "eda853db069c545218eefb24afa126b557a5545ce19631e2f2a42ee7bce407d6",
+}
+
 def _get_llama_server_info() -> tuple:
     """Return (download_url, exe_name) for the current platform."""
     system = platform.system().lower()
@@ -27,13 +40,49 @@ def _get_llama_server_info() -> tuple:
         if machine == "arm64":
             return f"{_LLAMA_BASE_URL}/llama-{_LLAMA_RELEASE}-bin-macos-arm64.zip", "llama-server"
         return f"{_LLAMA_BASE_URL}/llama-{_LLAMA_RELEASE}-bin-macos-x64.zip", "llama-server"
-    else:  # Linux
-        return f"{_LLAMA_BASE_URL}/llama-{_LLAMA_RELEASE}-bin-linux-x64.zip", "llama-server"
+    else:  # Linux (asset is named ubuntu-x64 in the b7075 release)
+        return f"{_LLAMA_BASE_URL}/llama-{_LLAMA_RELEASE}-bin-ubuntu-x64.zip", "llama-server"
 
 _NEXUS_HOME = Path.home() / ".nexus-agent"
 _SERVER_DIR = _NEXUS_HOME / "llama-server"
 _DEFAULT_PORT = 8099  # avoid collision with 8080
+_DEFAULT_REPO = "LiquidAI/LFM2.5-2.6B-GGUF"
 _DEFAULT_FILENAME = "LFM2.5-2.6B-Q6_K.gguf"
+
+
+def ensure_llama_server_binary(verbose: bool = True) -> Optional[str]:
+    """Pre-install the llama-server inference engine for the current platform.
+
+    Called during onboarding / pull-model so the engine is ready before the
+    first chat instead of downloading lazily mid-query. No-op (returns None)
+    when a binary already exists, on ARM Linux where prebuilts cannot run,
+    or when the download fails — never raises.
+    """
+    existing = _find_llama_server_exe()
+    if existing:
+        if verbose:
+            print("✅ llama-server engine already installed.")
+        return existing
+    if system_machine_is_arm_linux():
+        if verbose:
+            print("ℹ️ ARM Linux detected — prebuilt llama-server cannot run here.")
+            print("   Build it natively: https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md")
+        return None
+    try:
+        prov = LocalProvider()
+        path = prov._download_llama_server()
+        if verbose and path:
+            print(f"✅ Inference engine installed at: {path}")
+        return path
+    except Exception as e:
+        if verbose:
+            print(f"⚠️ llama-server pre-install skipped (will retry on first use): {e}")
+        return None
+
+
+def _startup_timeout_s(model_gb: float) -> int:
+    """llama-server readiness budget: 90s floor, +45s per GB of model, 300s cap."""
+    return int(min(300, max(90, 60 + 45 * model_gb)))
 
 
 def system_machine_is_arm_linux() -> bool:
@@ -70,9 +119,14 @@ class LocalProvider(BaseProvider):
       4. Ollama (external HTTP API, must be pre-installed)
     """
 
-    def __init__(self, model_id: str = "LiquidAI/LFM2.5-2.6B-GGUF"):
-        self.model_id = model_id
-        self.filename = os.getenv("NEXUS_AGENT_MODEL_FILENAME", _DEFAULT_FILENAME)
+    def __init__(self, model_id: str = None, filename: str = None):
+        """Create a local provider for any HuggingFace GGUF repo.
+
+        Priority: explicit args > NEXUS_AGENT_MODEL_REPO / NEXUS_AGENT_MODEL_FILENAME
+        env vars > built-in LiquidAI LFM2.5-2.6B defaults.
+        """
+        self.model_id = model_id or os.getenv("NEXUS_AGENT_MODEL_REPO", _DEFAULT_REPO)
+        self.filename = filename or os.getenv("NEXUS_AGENT_MODEL_FILENAME", _DEFAULT_FILENAME)
         self._tokenizer = None
         self._model_instance = None
         self._llama = None  # llama-cpp-python instance
@@ -89,7 +143,15 @@ class LocalProvider(BaseProvider):
         try:
             from huggingface_hub import hf_hub_download
             print(f"⚡ Downloading/Verifying Local Liquid LFM engine ({self.filename})...")
-            model_path = hf_hub_download(repo_id=self.model_id, filename=self.filename, local_files_only=False)
+            # Check the local HF cache first: avoids a network round-trip (and
+            # the unauthenticated-request warning) when the model is cached.
+            model_path = None
+            try:
+                model_path = hf_hub_download(repo_id=self.model_id, filename=self.filename, local_files_only=True)
+            except Exception:
+                pass
+            if not model_path or not os.path.isfile(model_path):
+                model_path = hf_hub_download(repo_id=self.model_id, filename=self.filename, local_files_only=False)
             # Resolve symlinks to get the real file (needed on Windows where HF cache uses symlinks)
             if os.path.isfile(model_path):
                 model_path = os.path.realpath(model_path)
@@ -189,11 +251,16 @@ class LocalProvider(BaseProvider):
         _SERVER_DIR.mkdir(parents=True, exist_ok=True)
         zip_path = _SERVER_DIR / "llama-server.zip"
         bin_url, exe_name = _get_llama_server_info()
+        asset_name = bin_url.rsplit("/", 1)[-1]
+        # Env var override first, then the pinned official digest table.
         expected_sha256 = os.getenv("NEXUS_AGENT_LLAMA_SERVER_SHA256", "").strip().lower()
-        if not expected_sha256 or len(expected_sha256) != 64 or any(c not in "0123456789abcdef" for c in expected_sha256):
+        if not (expected_sha256 and len(expected_sha256) == 64 and all(c in "0123456789abcdef" for c in expected_sha256)):
+            expected_sha256 = _LLAMA_SERVER_SHA256.get(asset_name, "")
+        if not expected_sha256:
             raise RuntimeError(
-                "Refusing to execute an unverified llama-server download. "
-                "Set NEXUS_AGENT_LLAMA_SERVER_SHA256 to the official 64-character SHA-256 digest."
+                f"No pinned SHA-256 digest for {asset_name}. "
+                "Set NEXUS_AGENT_LLAMA_SERVER_SHA256 to the official 64-character digest "
+                "to allow this download."
             )
 
         if not zip_path.is_file():
@@ -279,9 +346,18 @@ class LocalProvider(BaseProvider):
         )
         self._server_log = log_file
 
-        # Wait for server to be ready (model loading takes a few seconds)
+        # Wait for server to be ready. Model loading is CPU/IO bound and can
+        # take well over a minute for ~2 GB quant files on slow laptop CPUs,
+        # so scale the wait budget with model size instead of a fixed 30s.
+        try:
+            model_gb = os.path.getsize(model_path) / (1024 ** 3)
+        except OSError:
+            model_gb = 2.0
+        timeout_s = _startup_timeout_s(model_gb)
+        print(f"   Loading model ({model_gb:.1f} GB) — waiting up to {timeout_s}s...")
         import time
-        for attempt in range(30):
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
             time.sleep(1.0)
             if self._is_server_alive():
                 print(f"✅ llama-server ready on http://127.0.0.1:{port}")
@@ -302,7 +378,7 @@ class LocalProvider(BaseProvider):
                 )
 
         raise RuntimeError(
-            f"llama-server did not become ready within 30 seconds.\n"
+            f"llama-server did not become ready within {timeout_s} seconds.\n"
             f"Check the log at: {_SERVER_DIR / 'server.log'}\n"
             f"This can happen if:\n"
             f"  - Another program is using port {self._server_port}\n"
@@ -341,6 +417,8 @@ class LocalProvider(BaseProvider):
             "top_p": 0.95,
             "max_tokens": 2048,
             "stream": True,
+            # Ask the server to include real token counts in the final chunk
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = self._convert_tools(tools)
@@ -408,9 +486,11 @@ class LocalProvider(BaseProvider):
 
         text = "".join(text_parts)
         # Reasoning models (LFM2.5 etc.) may emit only thinking tokens when the
-        # answer is cut short — surface whatever we have rather than empty text.
+        # answer is cut short. Never leak the full chain-of-thought as the
+        # answer — surface only the last line, which is usually the answer.
         if not text and reasoning_parts:
-            text = "".join(reasoning_parts)
+            lines = [l.strip() for l in "".join(reasoning_parts).splitlines() if l.strip()]
+            text = lines[-1] if lines else ""
 
         tool_calls = []
         for key in raw_tool_call_order:
@@ -477,25 +557,11 @@ class LocalProvider(BaseProvider):
             except Exception:
                 pass
             raise RuntimeError(
-                "\n"
-                "━" * 60 + "\n"
-                "  Local model inference unavailable.\n"
-                "━" * 60 + "\n"
-                "  The Liquid LFM 2.6B model is downloaded but no inference\n"
-                "  engine could start. Choose one of these options:\n\n"
-                "  Option A — Install Ollama (easiest, recommended):\n"
-                "    1. Download from https://ollama.com\n"
-                "    2. Run: ollama run llama3.2:3b (or any coding model)\n"
-                "    3. Then: nexus-agent -p ollama \"your question\"\n\n"
-                "  Option B — Use a free cloud provider instead:\n"
-                "    1. Get a free key at https://openrouter.ai\n"
-                "    2. Add OPENROUTER_API_KEY=your_key to your .env file\n"
-                "    3. Then: nexus-agent -p openrouter \"your question\"\n\n"
-                "  Option C — Fix llama-server:\n"
-                "    Check the log at: " + str(_SERVER_DIR / 'server.log') + "\n"
-                "    Common fixes: disable antivirus for ~/.nexus-agent,\n"
-                "    or install Visual C++ Redistributable.\n"
-                "━" * 60
+                "Local model inference unavailable - no engine could start. "
+                "Options: (A) install Ollama from https://ollama.com then retry with: "
+                "nexus-agent -p ollama \"your question\"; "
+                "(B) use a free cloud key from https://openrouter.ai (set OPENROUTER_API_KEY, then -p openrouter); "
+                "(C) check the llama-server log at ~/.nexus-agent/llama-server/server.log"
             )
 
         # GPU Engine processing logic (torch + transformers)

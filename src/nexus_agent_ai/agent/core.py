@@ -188,6 +188,8 @@ class Agent:
 
         iteration = 0
         executed_tools = set()
+        duplicate_counts = {}
+        force_final = False
         try:
             while iteration < effective_max_iter:
                 iteration += 1
@@ -267,11 +269,20 @@ class Agent:
                         start = time.time()
                         
                         if tool_sig in executed_tools:
-                            result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
+                            duplicate_counts[tool_sig] = duplicate_counts.get(tool_sig, 0) + 1
+                            if duplicate_counts[tool_sig] >= 2:
+                                # Hard stop: the model is stuck in a loop.
+                                # Strip tools on the next request and force a direct answer.
+                                force_final = True
+                                result = ("[SYSTEM: TOOL BUDGET EXHAUSTED] You have repeated this exact tool call "
+                                          "multiple times. Do NOT call any more tools. Answer the user's original "
+                                          "question directly now using the information you already have.")
+                            else:
+                                result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
                         else:
                             executed_tools.add(tool_sig)
                             result = execute_tool(tool_call.name, tool_call.args)
-                            
+
                         duration = time.time() - start
 
                         if self.event_callback:
@@ -281,6 +292,14 @@ class Agent:
                             display.print_tool_result(result, duration, tool_call.name)
 
                         self.memory.add_raw(self.provider.format_tool_result_message(tool_call.id, result))
+
+                    if force_final:
+                        # Anti-loop: no tools next round, model must answer directly
+                        self.memory.add("user", "[SYSTEM] Tool budget exhausted: the same tool call was repeated. "
+                                                 "Do not call any more tools. Give your final answer to the user's "
+                                                 "original question now.")
+                        use_tools = []
+                        effective_max_iter = max(effective_max_iter, iteration + 1)
 
                     messages = self.memory.get()
 

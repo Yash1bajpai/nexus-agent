@@ -73,7 +73,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         from ..providers.local_provider import LocalProvider
         prov = LocalProvider()
         prov.setup_model()
-        return prov, "Liquid LFM (2.6B-Q6_K Local)"
+        return prov, f"Local ({prov.filename})"
     elif name_clean in ["ollama"]:
         import os
         from ..providers.openai_provider import OpenAIProvider
@@ -98,11 +98,11 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         fb._warn_fn = display.print_fallback_switch
         return fb, f"auto ({fb._current_name})"
     else:
-        display.print_warn(f"Unknown provider '{provider_name}'. Using local Liquid LFM fallback.")
+        display.print_warn(f"Unknown provider '{provider_name}'. Using local fallback.")
         from ..providers.local_provider import LocalProvider
         prov = LocalProvider()
         prov.setup_model()
-        return prov, "Liquid LFM (2.6B-Q6_K Local)"
+        return prov, f"Local ({prov.filename})"
 
 
 @app.command()
@@ -505,17 +505,35 @@ def commit(
         raise typer.Exit(code=1)
 
 @app.command("pull-model")
-def pull_model_cmd():
-    """Download or verify the built-in local reasoning model."""
-    typer.echo("\n🚀 Nexus-Agent — Pulling Built-In Local Quantized Reasoning Model")
-    from ..providers.local_provider import LocalProvider
-    prov = LocalProvider()
+def pull_model_cmd(
+    repo: str = typer.Option("", "--repo", "-r", help="HuggingFace GGUF repo id to pull from (default: built-in Liquid model or NEXUS_AGENT_MODEL_REPO)."),
+    file: str = typer.Option("", "--file", "-f", help="GGUF filename inside the repo (default: built-in quant or NEXUS_AGENT_MODEL_FILENAME)."),
+):
+    """Download or verify a local GGUF model from any HuggingFace repo."""
+    import os
+    from ..providers.local_provider import LocalProvider, _DEFAULT_REPO, _DEFAULT_FILENAME
+    repo = repo.strip() or os.getenv("NEXUS_AGENT_MODEL_REPO", _DEFAULT_REPO)
+    file = file.strip() or os.getenv("NEXUS_AGENT_MODEL_FILENAME", _DEFAULT_FILENAME)
+    typer.echo(f"\n🚀 Nexus-Agent — Pulling local model")
+    typer.echo(f"   repo: {repo}")
+    typer.echo(f"   file: {file}")
+    prov = LocalProvider(model_id=repo, filename=file)
     try:
         path = prov.setup_model(verify_download=True)
-        typer.echo(f"\n✅ Local Quantized Model Ready at: {path}\n")
+        typer.echo(f"\n✅ Local Model Ready at: {path}\n")
+        typer.echo("To use it as your default local model, add to ~/.nexus-agent/.env:")
+        typer.echo(f"  NEXUS_AGENT_MODEL_REPO={repo}")
+        typer.echo(f"  NEXUS_AGENT_MODEL_FILENAME={file}")
     except Exception as e:
         display.print_error(f"Failed to download local model: {e}")
         raise typer.Exit(code=1)
+
+    # Also pre-install the llama-server engine (skipped on ARM Linux / if present)
+    try:
+        from ..providers.local_provider import ensure_llama_server_binary
+        ensure_llama_server_binary()
+    except Exception:
+        pass
 
 
 @app.callback(invoke_without_command=True)

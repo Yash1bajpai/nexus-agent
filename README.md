@@ -1,5 +1,11 @@
 # ⚡ Nexus-Agent: Autonomous Agentic AI Coding Assistant
 
+> [!WARNING]
+> **The PyPI package name is `nexus-agent-ai`** (with `-ai`).
+> `pip install nexus-agent` installs an unrelated empty placeholder by another author — that is **not** this project.
+>
+> ✅ `pip install nexus-agent-ai`
+
 <div align="center">
   <p><strong>A production-grade, terminal-first AI Software Engineering Companion powered by autonomous ReAct tool loops and multi-provider backend switching.</strong></p>
 
@@ -9,7 +15,7 @@
   ![OpenAI Support](https://img.shields.io/badge/Model-OpenAI%20GPT--4o-green.svg)
   ![Anthropic Support](https://img.shields.io/badge/Model-claude--sonnet--4--6-orange.svg)
   ![Gemini Support](https://img.shields.io/badge/Model-Gemini%202.5%20Flash-blue.svg)
-  ![Tests](https://img.shields.io/badge/tests-36%20passed%20%F0%9F%9A%80-brightgreen.svg)
+  ![Tests](https://img.shields.io/badge/tests-41%20passed%20%F0%9F%9A%80-brightgreen.svg)
   ![PyPI Version](https://img.shields.io/pypi/v/nexus-agent-ai.svg?color=blue)
   [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2.svg?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/yash-bajpai-b5a86332a/)
   ![License](https://img.shields.io/badge/License-MIT-teal.svg)
@@ -238,8 +244,27 @@ To download or verify the model (`LiquidAI/LFM2.5-2.6B-GGUF`, Q6_K quantization,
 ```bash
 nexus-agent pull-model
 ```
+
+**Pull any HuggingFace GGUF model** (verified examples):
+```bash
+# Qwen2.5 Coder 3B
+nexus-agent pull-model --repo Qwen/Qwen2.5-Coder-3B-Instruct-GGUF --file qwen2.5-coder-3b-instruct-q4_k_m.gguf
+
+# Mistral 7B (16GB+ RAM)
+nexus-agent pull-model --repo bartowski/Mistral-7B-Instruct-v0.3-GGUF --file Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
+
+# TinyLlama 1.1B (low-RAM devices)
+nexus-agent pull-model --repo TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF --file tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+```
+Then make it your default by adding to `~/.nexus-agent/.env`:
+```ini
+NEXUS_AGENT_MODEL_REPO=Qwen/Qwen2.5-Coder-3B-Instruct-GGUF
+NEXUS_AGENT_MODEL_FILENAME=qwen2.5-coder-3b-instruct-q4_k_m.gguf
+```
+
+**Hardware-aware auto-configuration:** on first run, the onboarding wizard detects your RAM, GPU, and platform, then automatically writes the safest model quantization for your machine to `~/.nexus-agent/.env` — Q4_0 on phones/low-RAM, Q4_K_M up to 8GB, Q5_K_M up to 16GB, Q6_K above. It also prints the exact `pull-model` command for bigger models when your hardware can handle them.
 nexus-agent-ai installs local mode by default. Cloud providers and live web search are optional integrations; install `nexus-agent-ai[all,web]` only when those SDKs are available on your platform.
-Automatic llama-server downloads are fail-closed: set `NEXUS_AGENT_LLAMA_SERVER_SHA256` to the official release ZIP SHA-256 before first download. On Termux/ARM, build a native llama-server locally and set `NEXUS_AGENT_MODEL_FILENAME` to a phone-safe quant such as `LFM2.5-2.6B-Q4_K_M.gguf`.
+Automatic llama-server downloads are verified against pinned official SHA-256 digests of the llama.cpp `b7075` release and fail closed on mismatch (no configuration needed). Advanced users can override the digest with `NEXUS_AGENT_LLAMA_SERVER_SHA256`. On Termux/ARM, build a native llama-server locally and set `NEXUS_AGENT_MODEL_FILENAME` to a phone-safe quant such as `LFM2.5-2.6B-Q4_K_M.gguf`.
 *What this does:*
 - Downloads the Liquid AI LFM 2.6B post-trained agentic model to your local HuggingFace cache (`~/.cache/huggingface/hub/...`).
 - Validates model integrity and confirms readiness.
@@ -460,7 +485,7 @@ tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 94%]
 tests/test_ux_features.py::test_status_spinner_helpers PASSED            [ 97%]
 tests/test_ux_features.py::test_sqlite_memory PASSED                     [100%]
 
-============================= 36 passed in 5.25s ==============================
+============================= 41 passed ==============================
 ```
 
 ---

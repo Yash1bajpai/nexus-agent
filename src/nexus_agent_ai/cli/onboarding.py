@@ -176,6 +176,84 @@ def detect_system_specs() -> dict:
 
     return specs
 
+def _is_android() -> bool:
+    """Detect Android/Termux so phone-safe model defaults are used."""
+    if os.environ.get("ANDROID_ROOT"):
+        return True
+    return Path("/system/build.prop").exists()
+
+
+# (max_ram_gb, filename, approx size) — all files verified in LiquidAI/LFM2.5-2.6B-GGUF
+# Android is kept conservative (the OS OOM-killer reboots the phone);
+# desktops get a higher quant for the same RAM (swap + no aggressive OOM killing).
+_LIQUID_TIERS_ANDROID = [
+    (4,    "LFM2.5-2.6B-Q4_0.gguf",  "~1.5 GB"),
+    (6,    "LFM2.5-2.6B-Q4_K_M.gguf", "~1.6 GB"),
+    (None, "LFM2.5-2.6B-Q5_K_M.gguf", "~1.9 GB"),
+]
+_LIQUID_TIERS_DESKTOP = [
+    (4,    "LFM2.5-2.6B-Q4_0.gguf",  "~1.5 GB"),
+    (8,    "LFM2.5-2.6B-Q5_K_M.gguf", "~1.9 GB"),
+    (None, "LFM2.5-2.6B-Q6_K.gguf",  "~2.2 GB"),
+]
+
+# Optional bigger/coder models for beefy machines (repos + files verified on HF)
+_ALTERNATIVE_MODELS = {
+    "gpu_or_16gb": ("Qwen/Qwen2.5-Coder-3B-Instruct-GGUF", "qwen2.5-coder-3b-instruct-q4_k_m.gguf"),
+    "large": ("bartowski/Mistral-7B-Instruct-v0.3-GGUF", "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"),
+}
+
+
+def recommended_model_config(specs: dict) -> dict:
+    """Pick a hardware-appropriate model config.
+
+    Returns {"repo", "filename", "size", "note"} based on RAM/GPU/platform.
+    Android gets conservative tiers (OOM-killer safe); desktops get higher
+    quants for the same RAM. Only verified files from the built-in Liquid
+    repo are auto-selected; bigger third-party models are offered as an
+    explicit pull-model command.
+    """
+    ram = specs.get("ram_gb", 0)
+    gpu = specs.get("gpu")
+    android = _is_android()
+
+    if android and ram == 0:
+        ram = 6  # assume modern phone if RAM unknown
+
+    # Desktop with unknown RAM: assume a middle-tier machine (≥8GB), not worst case
+    if not android and ram <= 0:
+        ram = 8
+
+    tiers = _LIQUID_TIERS_ANDROID if android else _LIQUID_TIERS_DESKTOP
+    filename, size = tiers[-1][1], tiers[-1][2]
+    for max_ram, fn, sz in tiers:
+        if max_ram is None or (ram > 0 and ram <= max_ram):
+            filename, size = fn, sz
+            break
+
+    note = f"{ram}GB RAM detected" if ram and ram > 0 else "RAM unknown"
+    if gpu:
+        note = f"GPU detected ({gpu})"
+    if android:
+        note += ", Android" if ram and ram > 0 else "Android"
+
+    alt_cmd = ""
+    if gpu or (ram > 16):
+        repo, fn = _ALTERNATIVE_MODELS["gpu_or_16gb"]
+        alt_cmd = f"nexus-agent pull-model --repo {repo} --file {fn}"
+    elif ram > 8 and (specs.get("cpu_cores") or 0) >= 8:
+        repo, fn = _ALTERNATIVE_MODELS["large"]
+        alt_cmd = f"nexus-agent pull-model --repo {repo} --file {fn}"
+
+    return {
+        "repo": "LiquidAI/LFM2.5-2.6B-GGUF",
+        "filename": filename,
+        "size": size,
+        "note": note,
+        "alt_cmd": alt_cmd,
+    }
+
+
 def suggest_local_model(specs: dict) -> tuple[str, str]:
     """
     Returns (model_suggestion, note) based on detected hardware.
@@ -336,8 +414,20 @@ def _step_system_specs():
         print(f"  CPU Cores: {cores or 'Unknown'}")
         _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
                "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
-    _print("  [dim]Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. Q4_K_M is recommended on phones; Q6_K needs about 2.2 GB and may cause OOM. A native llama-server is required on ARM.[/dim]" if console else
-           "  Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. Q4_K_M is recommended on phones; Q6_K needs about 2.2 GB and may cause OOM. A native llama-server is required on ARM.")
+    _print("  [dim]Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. A native llama-server is required on ARM.[/dim]" if console else
+           "  Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. A native llama-server is required on ARM.")
+
+    # Auto-configure the model choice based on detected hardware
+    cfg = recommended_model_config(specs)
+    _write_env_key("NEXUS_AGENT_MODEL_REPO", cfg["repo"])
+    _write_env_key("NEXUS_AGENT_MODEL_FILENAME", cfg["filename"])
+    os.environ["NEXUS_AGENT_MODEL_REPO"] = cfg["repo"]
+    os.environ["NEXUS_AGENT_MODEL_FILENAME"] = cfg["filename"]
+    _print(f"  [green]✓ Auto-configured model: {cfg['filename']} ({cfg['size']}) — {cfg['note']}[/green]" if console else
+           f"  ✓ Auto-configured model: {cfg['filename']} ({cfg['size']}) — {cfg['note']}")
+    if cfg["alt_cmd"]:
+        _print(f"  [dim]Want a bigger model? Run:[/dim] {cfg['alt_cmd']}" if console else
+               f"  Want a bigger model? Run: {cfg['alt_cmd']}")
 
 
 def _step_default_provider() -> str:
@@ -370,11 +460,12 @@ def _step_default_provider() -> str:
 
 
 def _step_local_model_setup():
-    """[4/4] - Download/verify the local Liquid LFM 2.6B model weights."""
-    _print("\n[bold][[4/4]][/bold] [cyan]Local Liquid LFM Engine Setup[/cyan]" if console else "\n[4/4] Local Liquid LFM Engine Setup")
-    _print("  The built-in offline reasoning engine is configurable with NEXUS_AGENT_MODEL_FILENAME; use Q4_K_M on phones to reduce memory use.")
+    """[4/4] - Download/verify the auto-configured local model weights."""
+    _print("\n[bold][[4/4]][/bold] [cyan]Local Model Setup[/cyan]" if console else "\n[4/4] Local Model Setup")
+    cfg = recommended_model_config(detect_system_specs())
+    _print(f"  Model selected for your hardware: {cfg['filename']} ({cfg['size']})")
     try:
-        consent = _input("  Download now? Requires ~2.2 GB disk space. (y/N): ").strip().lower()
+        consent = _input(f"  Download now? Requires ~{cfg['size']} disk space. (y/N): ").strip().lower()
         if consent != "y":
             _print("  [dim]Skipped. Run `nexus-agent pull-model` later to download when needed.[/dim]" if console else
                    "  Skipped. Run `nexus-agent pull-model` later to download when needed.")
@@ -382,13 +473,23 @@ def _step_local_model_setup():
     except (EOFError, KeyboardInterrupt):
         return
 
-    _print("  Checking & downloading built-in Liquid LFM engine weights...")
+    _print("  Checking & downloading local model weights...")
     try:
         from ..providers.local_provider import LocalProvider
-        prov = LocalProvider()
+        prov = LocalProvider(model_id=cfg["repo"], filename=cfg["filename"])
         prov.setup_model()
     except Exception as e:
         _print(f"  [yellow]Note: Model can be downloaded later when running offline mode ({e})[/yellow]" if console else f"  Note: Model can be downloaded later when running offline mode ({e})")
+        return
+
+    # Pre-install the llama-server inference engine so the first chat doesn't
+    # have to download ~50 MB mid-query.
+    _print("  Pre-installing llama-server inference engine (~50 MB, first time only)...")
+    try:
+        from ..providers.local_provider import ensure_llama_server_binary
+        ensure_llama_server_binary()
+    except Exception:
+        pass
 
 
 # --- Main Entry ---
