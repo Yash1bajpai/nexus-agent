@@ -669,14 +669,18 @@ class LocalProvider(BaseProvider):
 
     def __del__(self):
         """Clean up llama-server subprocess on garbage collection."""
-        if self._server_proc is not None:
+        # getattr: providers built via __new__ (or mid-init) have no attrs —
+        # raising here would surface as an unraisable exception during GC.
+        server_proc = getattr(self, "_server_proc", None)
+        if server_proc is not None:
             try:
-                self._server_proc.terminate()
-                self._server_proc.wait(timeout=5)
+                server_proc.terminate()
+                server_proc.wait(timeout=5)
             except Exception:
                 pass
-        if hasattr(self, '_server_log') and self._server_log:
+        log_file = getattr(self, "_server_log", None)
+        if log_file:
             try:
-                self._server_log.close()
+                log_file.close()
             except Exception:
                 pass

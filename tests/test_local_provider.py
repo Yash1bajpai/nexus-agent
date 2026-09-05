@@ -103,15 +103,21 @@ def test_pull_model_arbitrary_repo(monkeypatch):
     from nexus_agent_ai.cli.app import app as cli_app
     monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
 
-    captured = {}
+    built = []
 
     class FakeProv:
         def __init__(self, model_id=None, filename=None):
-            captured["repo"] = model_id
-            captured["file"] = filename
+            # Record every construction: pull-model builds the provider with
+            # args, then the trailing engine pre-install may build a bare one
+            # (no llama-server on clean CI machines). The pull-model call is
+            # always the first construction.
+            built.append({"repo": model_id, "file": filename})
 
         def setup_model(self, verify_download=False):
             return "/mock/model.gguf"
+
+        def _download_llama_server(self):
+            return "/mock/llama-server"
 
     monkeypatch.setattr("nexus_agent_ai.providers.local_provider.LocalProvider", FakeProv)
     runner = CliRunner()
@@ -121,8 +127,8 @@ def test_pull_model_arbitrary_repo(monkeypatch):
         "--file", "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
     ])
     assert result.exit_code == 0, result.output
-    assert captured["repo"] == "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF"
-    assert captured["file"] == "qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+    assert built[0]["repo"] == "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF"
+    assert built[0]["file"] == "qwen2.5-coder-3b-instruct-q4_k_m.gguf"
     assert "NEXUS_AGENT_MODEL_REPO=Qwen/Qwen2.5-Coder-3B-Instruct-GGUF" in result.output
 
 
@@ -133,19 +139,21 @@ def test_pull_model_env_fallback(monkeypatch):
     monkeypatch.setenv("NEXUS_AGENT_MODEL_REPO", "env/repo")
     monkeypatch.setenv("NEXUS_AGENT_MODEL_FILENAME", "env-file.gguf")
 
-    captured = {}
+    built = []
 
     class FakeProv:
         def __init__(self, model_id=None, filename=None):
-            captured["repo"] = model_id
-            captured["file"] = filename
+            built.append({"repo": model_id, "file": filename})
 
         def setup_model(self, verify_download=False):
             return "/mock/model.gguf"
+
+        def _download_llama_server(self):
+            return "/mock/llama-server"
 
     monkeypatch.setattr("nexus_agent_ai.providers.local_provider.LocalProvider", FakeProv)
     runner = CliRunner()
     result = runner.invoke(cli_app, ["pull-model"])
     assert result.exit_code == 0, result.output
-    assert captured["repo"] == "env/repo"
-    assert captured["file"] == "env-file.gguf"
+    assert built[0]["repo"] == "env/repo"
+    assert built[0]["file"] == "env-file.gguf"
