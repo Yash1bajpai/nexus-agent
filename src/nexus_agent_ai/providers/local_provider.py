@@ -53,10 +53,11 @@ _DEFAULT_FILENAME = "LFM2.5-2.6B-Q6_K.gguf"
 def ensure_llama_server_binary(verbose: bool = True) -> Optional[str]:
     """Pre-install the llama-server inference engine for the current platform.
 
-    Called during onboarding / pull-model so the engine is ready before the
-    first chat instead of downloading lazily mid-query. No-op (returns None)
-    when a binary already exists, on ARM Linux where prebuilts cannot run,
-    or when the download fails — never raises.
+    Called during onboarding / pull-model and before every local-provider
+    session so the engine is ready before the first chat instead of
+    downloading lazily mid-query. No-op (returns None) when a binary already
+    exists, on ARM Linux where prebuilts cannot run, or when the download
+    fails — never raises.
     """
     existing = _find_llama_server_exe()
     if existing:
@@ -71,12 +72,13 @@ def ensure_llama_server_binary(verbose: bool = True) -> Optional[str]:
     try:
         prov = LocalProvider()
         path = prov._download_llama_server()
-        if verbose and path:
+        if path:
+            # Download progress prints regardless of verbose — keep the final
+            # status visible too so quiet pre-flights still explain the wait.
             print(f"✅ Inference engine installed at: {path}")
         return path
     except Exception as e:
-        if verbose:
-            print(f"⚠️ llama-server pre-install skipped (will retry on first use): {e}")
+        print(f"⚠️ llama-server pre-install skipped (will retry on first use): {e}")
         return None
 
 

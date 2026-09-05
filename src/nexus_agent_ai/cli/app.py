@@ -48,6 +48,23 @@ app = typer.Typer(
 )
 
 
+def _make_local_provider() -> Tuple[Any, str]:
+    """Build the default local provider and pre-flight the inference engine.
+
+    Downloads/verifies llama-server up front (idempotent, ~50 MB once) so a
+    missing engine never fails the LFM model mid-query — the failure the
+    pre-flight prevents is only discoverable after the agent loop starts.
+    """
+    from ..providers.local_provider import LocalProvider, ensure_llama_server_binary
+    prov = LocalProvider()
+    prov.setup_model()
+    try:
+        ensure_llama_server_binary(verbose=False)
+    except Exception:
+        pass
+    return prov, f"Local ({prov.filename})"
+
+
 def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
     """
     Factory to return (provider_instance, resolved_name).
@@ -70,10 +87,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         from ..providers.openai_provider import OpenAIProvider
         return OpenAIProvider(), "openai"
     elif name_clean in ["local", "liquid", "lfm", "default", "demo"]:
-        from ..providers.local_provider import LocalProvider
-        prov = LocalProvider()
-        prov.setup_model()
-        return prov, f"Local ({prov.filename})"
+        return _make_local_provider()
     elif name_clean in ["ollama"]:
         import os
         from ..providers.openai_provider import OpenAIProvider
@@ -99,10 +113,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         return fb, f"auto ({fb._current_name})"
     else:
         display.print_warn(f"Unknown provider '{provider_name}'. Using local fallback.")
-        from ..providers.local_provider import LocalProvider
-        prov = LocalProvider()
-        prov.setup_model()
-        return prov, f"Local ({prov.filename})"
+        return _make_local_provider()
 
 
 @app.command()

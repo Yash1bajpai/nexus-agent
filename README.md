@@ -15,7 +15,7 @@
   ![OpenAI Support](https://img.shields.io/badge/Model-OpenAI%20GPT--4o-green.svg)
   ![Anthropic Support](https://img.shields.io/badge/Model-claude--sonnet--4--6-orange.svg)
   ![Gemini Support](https://img.shields.io/badge/Model-Gemini%202.5%20Flash-blue.svg)
-  ![Tests](https://img.shields.io/badge/tests-41%20passed%20%F0%9F%9A%80-brightgreen.svg)
+  ![Tests](https://img.shields.io/badge/tests-57%20passed%20%F0%9F%9A%80-brightgreen.svg)
   ![PyPI Version](https://img.shields.io/pypi/v/nexus-agent-ai.svg?color=blue)
   [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2.svg?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/yash-bajpai-b5a86332a/)
   ![License](https://img.shields.io/badge/License-MIT-teal.svg)
@@ -235,7 +235,7 @@ On your very first `nexus-agent` invocation from the terminal, the built-in **In
 ```bash
 nexus-agent
 ```
-The wizard auto-detects your system specifications (CPU threads, total RAM, and GPU capabilities on Desktop or Termux), helps you choose a default provider (`local`, `gemini`, `anthropic`, or `openai`), and saves your preferences cleanly to a local `.env` file in your workspace or home directory (`~/.nexus_agent_initialized`).
+The wizard auto-detects your system specifications (CPU threads, total RAM, and GPU capabilities on Desktop or Termux), helps you choose a default provider (`local`, `gemini`, `anthropic`, or `openai`), **checks and installs the llama-server inference engine automatically**, and saves your preferences cleanly to a local `.env` file in your workspace or home directory (`~/.nexus_agent_initialized`).
 
 #### B. Offline Local Model (Liquid AI LFM 2.6B)
 Nexus-Agent includes a built-in **Liquid AI LFM 2.6B** local model (`LocalProvider`) — allowing you to generate, review, and debug code completely offline with **zero API keys required**.
@@ -265,6 +265,8 @@ NEXUS_AGENT_MODEL_FILENAME=qwen2.5-coder-3b-instruct-q4_k_m.gguf
 **Hardware-aware auto-configuration:** on first run, the onboarding wizard detects your RAM, GPU, and platform, then automatically writes the safest model quantization for your machine to `~/.nexus-agent/.env` — Q4_0 on phones/low-RAM, Q4_K_M up to 8GB, Q5_K_M up to 16GB, Q6_K above. It also prints the exact `pull-model` command for bigger models when your hardware can handle them.
 nexus-agent-ai installs local mode by default. Cloud providers and live web search are optional integrations; install `nexus-agent-ai[all,web]` only when those SDKs are available on your platform.
 Automatic llama-server downloads are verified against pinned official SHA-256 digests of the llama.cpp `b7075` release and fail closed on mismatch (no configuration needed). Advanced users can override the digest with `NEXUS_AGENT_LLAMA_SERVER_SHA256`. On Termux/ARM, build a native llama-server locally and set `NEXUS_AGENT_MODEL_FILENAME` to a phone-safe quant such as `LFM2.5-2.6B-Q4_K_M.gguf`.
+
+**Engine pre-flight (v2.7.1+):** the llama-server engine is checked at the initial stage — during first-run onboarding and before every local-provider session. If it is missing, the ~50 MB download starts automatically *before* your query runs, so the LFM model never fails mid-chat because of an uninstalled engine.
 *What this does:*
 - Downloads the Liquid AI LFM 2.6B post-trained agentic model to your local HuggingFace cache (`~/.cache/huggingface/hub/...`).
 - Validates model integrity and confirms readiness.

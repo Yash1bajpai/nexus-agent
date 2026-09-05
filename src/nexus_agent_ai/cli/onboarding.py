@@ -1,7 +1,8 @@
 """
 Nexus-Agent Onboarding Wizard — runs once on first launch.
 Detects first run via ~/.nexus_agent_initialized.
-Covers: welcome banner, API key setup, system spec detection, default provider.
+Covers: welcome banner, API key setup, system spec detection, default provider,
+and unconditional llama-server engine pre-install (model download is consent-gated).
 """
 
 import os
@@ -460,12 +461,29 @@ def _step_default_provider() -> str:
 
 
 def _step_local_model_setup():
-    """[4/4] - Download/verify the auto-configured local model weights."""
+    """[4/4] - Pre-install the llama-server engine, then offer the model weights download."""
     _print("\n[bold][[4/4]][/bold] [cyan]Local Model Setup[/cyan]" if console else "\n[4/4] Local Model Setup")
     cfg = recommended_model_config(detect_system_specs())
     _print(f"  Model selected for your hardware: {cfg['filename']} ({cfg['size']})")
+
+    # The inference engine is mandatory for local mode: without llama-server
+    # the LFM model cannot run at all. Install it unconditionally (not
+    # consent-gated) so the very first `-p local` query never fails mid-flight.
+    _print("  Checking local inference engine (llama-server)...")
     try:
-        consent = _input(f"  Download now? Requires ~{cfg['size']} disk space. (y/N): ").strip().lower()
+        from ..providers.local_provider import ensure_llama_server_binary
+        engine_path = ensure_llama_server_binary(verbose=False)
+        if engine_path:
+            _print(f"  [green]✓ Inference engine ready: {engine_path}[/green]" if console else
+                   f"  ✓ Inference engine ready: {engine_path}")
+        else:
+            _print("  [yellow]Engine not installed yet — it will download automatically before your first local query (Ollama works as a fallback).[/yellow]" if console else
+                   "  Engine not installed yet — it will download automatically before your first local query (Ollama works as a fallback).")
+    except Exception:
+        pass
+
+    try:
+        consent = _input(f"  Download model weights now? Requires ~{cfg['size']} disk space. (y/N): ").strip().lower()
         if consent != "y":
             _print("  [dim]Skipped. Run `nexus-agent pull-model` later to download when needed.[/dim]" if console else
                    "  Skipped. Run `nexus-agent pull-model` later to download when needed.")
@@ -480,16 +498,6 @@ def _step_local_model_setup():
         prov.setup_model()
     except Exception as e:
         _print(f"  [yellow]Note: Model can be downloaded later when running offline mode ({e})[/yellow]" if console else f"  Note: Model can be downloaded later when running offline mode ({e})")
-        return
-
-    # Pre-install the llama-server inference engine so the first chat doesn't
-    # have to download ~50 MB mid-query.
-    _print("  Pre-installing llama-server inference engine (~50 MB, first time only)...")
-    try:
-        from ..providers.local_provider import ensure_llama_server_binary
-        ensure_llama_server_binary()
-    except Exception:
-        pass
 
 
 # --- Main Entry ---
