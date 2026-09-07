@@ -93,19 +93,22 @@ def system_machine_is_arm_linux() -> bool:
 
 
 def _find_llama_server_exe() -> Optional[str]:
-    """Find llama-server binary in the extracted directory (handles both flat and nested layouts)."""
+    """Find llama-server binary in the extracted directory.
+
+    Handles both flat layouts (Windows zips) and nested ones — the ubuntu-x64
+    release nests everything under build/bin/, and the binary must stay there:
+    its libggml-cpu-*.so siblings resolve relative to the executable.
+    """
     _, exe_name = _get_llama_server_info()
     # Check flat layout (files directly in _SERVER_DIR)
     flat = _SERVER_DIR / exe_name
     if flat.is_file():
         return str(flat)
-    # Check nested layout (files in a subdirectory)
+    # Recursive search for nested layouts (any depth)
     if _SERVER_DIR.is_dir():
-        for child in _SERVER_DIR.iterdir():
-            if child.is_dir():
-                nested = child / exe_name
-                if nested.is_file():
-                    return str(nested)
+        for candidate in _SERVER_DIR.rglob(exe_name):
+            if candidate.is_file():
+                return str(candidate)
     return None
 
 

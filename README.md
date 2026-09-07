@@ -15,7 +15,7 @@
   ![OpenAI Support](https://img.shields.io/badge/Model-OpenAI%20GPT--4o-green.svg)
   ![Anthropic Support](https://img.shields.io/badge/Model-claude--sonnet--4--6-orange.svg)
   ![Gemini Support](https://img.shields.io/badge/Model-Gemini%202.5%20Flash-blue.svg)
-  ![Tests](https://img.shields.io/badge/tests-57%20passed%20%F0%9F%9A%80-brightgreen.svg)
+  ![Tests](https://img.shields.io/badge/tests-59%20passed%20%F0%9F%9A%80-brightgreen.svg)
   ![PyPI Version](https://img.shields.io/pypi/v/nexus-agent-ai.svg?color=blue)
   [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2.svg?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/yash-bajpai-b5a86332a/)
   ![License](https://img.shields.io/badge/License-MIT-teal.svg)

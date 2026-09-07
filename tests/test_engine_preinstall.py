@@ -98,3 +98,57 @@ def test_onboarding_engine_and_model_both_installed_on_consent(monkeypatch):
     onboarding._step_local_model_setup()
     assert engine_calls == [False]
     assert [inst.setup_calls for inst in _StubLocalProvider.instances] == [1]
+
+
+# ── Ubuntu zip layout regression (found via Kaggle clean-start test) ─────────
+# The b7075 ubuntu-x64 release nests the binary under build/bin/ — two levels
+# deep. The old finder only checked flat and one-level nesting, so the engine
+# "installed" but was then reported missing on every Linux machine.
+
+def test_find_llama_server_exe_recurses_deep_layouts(monkeypatch, tmp_path):
+    """build/bin/llama-server (ubuntu-x64 layout) must be found."""
+    import platform as _plat
+    from nexus_agent_ai.providers import local_provider as lp
+
+    engine_dir = tmp_path / "llama-server"
+    nested = engine_dir / "build" / "bin"
+    nested.mkdir(parents=True)
+    (nested / "llama-server").write_bytes(b"#!/bin/sh\n")
+    (nested / "libggml-base.so").write_bytes(b"lib")
+
+    monkeypatch.setattr(lp, "_SERVER_DIR", engine_dir)
+    monkeypatch.setattr(_plat, "system", lambda: "Linux")
+    monkeypatch.setattr(_plat, "machine", lambda: "x86_64")
+    found = lp._find_llama_server_exe()
+    assert found == str(nested / "llama-server")
+
+
+def test_download_llama_server_extracts_and_finds_nested_binary(monkeypatch, tmp_path):
+    """End-to-end _download_llama_server with a synthetic ubuntu-layout zip:
+    digest check passes, extraction is zip-slip safe, and the deeply nested
+    binary is located (previously raised 'binary not found after extraction')."""
+    import hashlib
+    import zipfile
+    import platform as _plat
+    from nexus_agent_ai.providers import local_provider as lp
+
+    engine_dir = tmp_path / "llama-server"
+    engine_dir.mkdir()
+    zip_path = engine_dir / "llama-server.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("build/bin/llama-server", "#!/bin/sh\necho ok")
+        zf.writestr("build/bin/libggml-base.so", "lib")
+    digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(lp, "_SERVER_DIR", engine_dir)
+    monkeypatch.setattr(_plat, "system", lambda: "Linux")
+    monkeypatch.setattr(_plat, "machine", lambda: "x86_64")
+    # Point the pinned digest table at our synthetic zip's real digest.
+    monkeypatch.setattr(lp, "_LLAMA_SERVER_SHA256",
+                        {"llama-b7075-bin-ubuntu-x64.zip": digest})
+    monkeypatch.setenv("NEXUS_AGENT_LLAMA_SERVER_SHA256", "")
+
+    exe = lp.LocalProvider._download_llama_server(lp.LocalProvider())
+    assert exe.endswith("llama-server")
+    assert "build" in exe and "bin" in exe  # stayed nested, next to its libs
+    assert not zip_path.exists()  # zip cleaned up
