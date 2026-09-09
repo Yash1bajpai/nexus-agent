@@ -167,6 +167,22 @@ _SAFE_CALLS = frozenset({
 })
 
 
+def _attr_name_is_safe(attr: str) -> bool:
+    """Attribute-name gate for sandboxed run_code.
+
+    Pure-data method calls (s.split(), d.get(), items.append()) are safe because
+    imports are blocked, so names can only resolve to literals, user-defined
+    functions, and non-dangerous builtins. The remaining risk is dunder/reflection
+    attributes, which walk object graphs back to dangerous machinery — those stay
+    blocked via the explicit tables.
+    """
+    if attr in _FORBIDDEN_ATTRIBUTES or attr in _BLOCKED_DUNDERS:
+        return False
+    if attr.startswith("__") and attr not in _SAFE_DUNDERS:
+        return False
+    return True
+
+
 def _sandbox_check(code: str) -> str | None:
     """
     AST-based static analysis. Returns an error string if forbidden
@@ -185,21 +201,39 @@ def _sandbox_check(code: str) -> str | None:
         ast.Compare, ast.If, ast.For, ast.While, ast.Break, ast.Continue, ast.Pass,
         ast.Return, ast.FunctionDef, ast.arguments, ast.arg, ast.Call, ast.keyword,
         ast.IfExp, ast.Subscript, ast.Slice, ast.Index, ast.Assert, ast.Lambda,
+        ast.Attribute,
         ast.operator, ast.unaryop, ast.boolop, ast.cmpop,
     )
     blocked_names = {"__import__", "eval", "exec", "compile", "open", "getattr", "setattr",
                      "delattr", "globals", "locals", "vars", "dir", "help", "input",
                      "breakpoint", "exit", "quit", "license", "credits", "copyright"}
+    # Calls to user-defined functions are safe: their bodies are validated by this
+    # same walk. Blocked-name shadowing (e.g. `def open(...)`) is rejected outright
+    # so blocked identifiers are never callable, period.
+    defined_funcs = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name not in blocked_names and not n.name.startswith("__")
+    }
     for node in ast.walk(tree):
         if not isinstance(node, allowed_nodes):
             violations.append(f"{type(node).__name__} is not allowed in sandboxed run_code")
-        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Attribute)):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
             violations.append(f"{type(node).__name__} is not allowed in sandboxed run_code")
         if isinstance(node, ast.Name) and (node.id in blocked_names or (node.id.startswith("__") and node.id not in {"__name__", "__file__"})):
             violations.append(f"{node.id} is not available in sandboxed run_code")
+        if isinstance(node, ast.FunctionDef) and (node.name in blocked_names or node.name.startswith("__")):
+            violations.append(f"function name '{node.name}' may not shadow sandboxed identifiers")
+        if isinstance(node, ast.Attribute) and not _attr_name_is_safe(node.attr):
+            violations.append(f"attribute '{node.attr}' is not allowed in sandboxed run_code")
         if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_CALLS:
-                violations.append("only approved pure functions may be called in sandboxed run_code")
+            if isinstance(node.func, ast.Name):
+                if node.func.id not in _SAFE_CALLS and node.func.id not in defined_funcs:
+                    violations.append(f"function '{node.func.id}' is not an approved pure function for sandboxed run_code")
+            elif isinstance(node.func, ast.Attribute):
+                if not _attr_name_is_safe(node.func.attr):
+                    violations.append(f"method '{node.func.attr}' is not allowed in sandboxed run_code")
+            else:
+                violations.append("only approved pure functions or safe method calls are allowed in sandboxed run_code")
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if ("__" in node.value and node.value not in {"__main__"}) or any(word in node.value.lower() for word in ("import", "subprocess", "system", "password", "token")):
                 violations.append("sensitive reflection or command text is not allowed in sandboxed run_code")
