@@ -69,6 +69,7 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built f
 - 🛠️ **Comprehensive Developer Toolset**:
   - `read_file`: Safely parses local file contents to prevent hallucinations.
   - `write_file`: Actively writes or overwrites code files with automatic directory creation.
+  - `patch_file`: Targeted find-and-replace editing to safely modify existing files without full rewrites or truncation.
   - `list_directory`: Recursively maps workspace architecture.
   - `run_code`: Executes arbitrary Python code inside isolated subprocesses with strict execution timeout enforcement (`CODE_EXECUTION_TIMEOUT = 10s`).
   - `search_web`: Queries live DuckDuckGo indexes for real-time API docs and error debugging.

@@ -45,14 +45,7 @@ def execute_read_file(path: str) -> str:
         p = validated
 
         # Do not let an agent copy common credential/config files into prompts.
-        filename_lower = p.name.lower()
-        sensitive_names = {".git", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc"}
-        sensitive_suffixes = (".pem", ".key", ".pfx", ".p12", ".crt", ".token", ".secret")
-        if (filename_lower.startswith(".env") or filename_lower in sensitive_names
-                or any(part.lower() in sensitive_names for part in p.parts)
-                or any(filename_lower.endswith(ext) for ext in sensitive_suffixes)
-                or any(marker in filename_lower for marker in ("credential", "secret", "token", "password", "passwd"))
-                or "id_rsa" in filename_lower):
+        if _is_sensitive_path(p):
             return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
 
         with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -63,6 +56,22 @@ def execute_read_file(path: str) -> str:
         return f"ERROR: Permission denied: {path}"
     except Exception as e:
         return f"ERROR: Could not read file: {str(e)}"
+
+_SENSITIVE_NAMES = frozenset({".git", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc"})
+_SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".crt", ".token", ".secret")
+_SENSITIVE_MARKERS = ("credential", "secret", "token", "password", "passwd")
+
+def _is_sensitive_path(p: Path) -> bool:
+    """Check if a path points to sensitive credentials or configuration."""
+    filename_lower = p.name.lower()
+    return (
+        filename_lower.startswith(".env")
+        or filename_lower in _SENSITIVE_NAMES
+        or any(part.lower() in _SENSITIVE_NAMES for part in p.parts)
+        or any(filename_lower.endswith(ext) for ext in _SENSITIVE_SUFFIXES)
+        or any(marker in filename_lower for marker in _SENSITIVE_MARKERS)
+        or "id_rsa" in filename_lower
+    )
 
 def execute_write_file(path: str, content: str) -> str:
     """Write string content to a file (creating parent directories if needed)."""
@@ -79,6 +88,49 @@ def execute_write_file(path: str, content: str) -> str:
         return f"ERROR: Permission denied writing to: {path}"
     except Exception as e:
         return f"ERROR: Could not write file: {str(e)}"
+
+def execute_patch_file(path: str, target: str, replacement: str, allow_multiple: bool = False) -> str:
+    """Replace target text with replacement text in an existing file."""
+    try:
+        validated = _validate_workspace_path(path)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            return validated
+        p = validated
+
+        if _is_sensitive_path(p):
+            return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
+
+        if not p.exists():
+            return f"ERROR: File not found: {path}"
+        if p.is_dir():
+            return f"ERROR: Path is a directory, not a file: {path}"
+        if not target:
+            return "ERROR: Target string to replace cannot be empty."
+
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        count = content.count(target)
+        if count == 0:
+            return (
+                f"ERROR: Target content not found in '{path}'. "
+                f"Ensure the target matches existing file content exactly, including whitespace and line breaks."
+            )
+        if count > 1 and not allow_multiple:
+            return (
+                f"ERROR: Target content found {count} times in '{path}'. "
+                f"Provide more surrounding context to make the target unique, or set allow_multiple=True."
+            )
+
+        new_content = content.replace(target, replacement)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        return f"Successfully patched '{path}': replaced {count} occurrence(s)."
+    except PermissionError:
+        return f"ERROR: Permission denied patching: {path}"
+    except Exception as e:
+        return f"ERROR: Could not patch file: {str(e)}"
 
 def execute_list_directory(path: str = ".") -> str:
     """List all files and folders in a directory (up to 2 levels deep)."""
@@ -472,6 +524,34 @@ WRITE_FILE_TOOL = Tool(
     execute=execute_write_file,
 )
 
+PATCH_FILE_TOOL = Tool(
+    name="patch_file",
+    description="Replace target code or text block with new replacement text in an existing file. Prefer this over write_file when editing existing files to avoid losing unchanged code or truncating files.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute file path to patch.",
+            },
+            "target": {
+                "type": "string",
+                "description": "The exact string or block of code to find and replace. Must match the existing file content exactly.",
+            },
+            "replacement": {
+                "type": "string",
+                "description": "The new replacement code or text.",
+            },
+            "allow_multiple": {
+                "type": "boolean",
+                "description": "Whether to allow replacing multiple occurrences if found (default: false).",
+            },
+        },
+        "required": ["path", "target", "replacement"],
+    },
+    execute=execute_patch_file,
+)
+
 LIST_DIRECTORY_TOOL = Tool(
     name="list_directory",
     description="List all files and folders in a directory (2 levels deep). Use at the start of any project-level question to understand structure.",
@@ -588,6 +668,7 @@ def get_all_tools() -> List[Tool]:
     return [
         READ_FILE_TOOL,
         WRITE_FILE_TOOL,
+        PATCH_FILE_TOOL,
         LIST_DIRECTORY_TOOL,
         RUN_CODE_TOOL,
         SEARCH_WEB_TOOL,

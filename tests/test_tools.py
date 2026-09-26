@@ -61,5 +61,77 @@ def test_get_readonly_tools():
     assert "read_file" in names
     assert "list_directory" in names
     assert "write_file" not in names
+    assert "patch_file" not in names
     assert "run_code" not in names
     assert "git_commit" not in names
+
+def test_patch_file_success(tmp_path: Path):
+    target = tmp_path / "mod.py"
+    target.write_text("def hello():\n    print('old')\n", encoding="utf-8")
+    res = execute_tool("patch_file", {
+        "path": str(target),
+        "target": "print('old')",
+        "replacement": "print('new')"
+    })
+    assert "Successfully patched" in res
+    assert "print('new')" in target.read_text(encoding="utf-8")
+    assert "print('old')" not in target.read_text(encoding="utf-8")
+
+def test_patch_file_not_found(tmp_path: Path):
+    res = execute_tool("patch_file", {
+        "path": str(tmp_path / "missing.py"),
+        "target": "foo",
+        "replacement": "bar"
+    })
+    assert res.startswith("ERROR: File not found")
+
+def test_patch_file_target_not_found(tmp_path: Path):
+    target = tmp_path / "sample.py"
+    target.write_text("x = 10\n", encoding="utf-8")
+    res = execute_tool("patch_file", {
+        "path": str(target),
+        "target": "y = 20",
+        "replacement": "y = 30"
+    })
+    assert "ERROR: Target content not found" in res
+
+def test_patch_file_multiple_occurrences(tmp_path: Path):
+    target = tmp_path / "multi.txt"
+    target.write_text("item item item", encoding="utf-8")
+    # Default: multiple blocked
+    res_blocked = execute_tool("patch_file", {
+        "path": str(target),
+        "target": "item",
+        "replacement": "widget"
+    })
+    assert "ERROR: Target content found 3 times" in res_blocked
+
+    # With allow_multiple=True
+    res_allowed = execute_tool("patch_file", {
+        "path": str(target),
+        "target": "item",
+        "replacement": "widget",
+        "allow_multiple": True
+    })
+    assert "Successfully patched" in res_allowed
+    assert target.read_text(encoding="utf-8") == "widget widget widget"
+
+def test_patch_file_empty_target(tmp_path: Path):
+    target = tmp_path / "empty_test.txt"
+    target.write_text("hello", encoding="utf-8")
+    res = execute_tool("patch_file", {
+        "path": str(target),
+        "target": "",
+        "replacement": "new"
+    })
+    assert "ERROR: Target string to replace cannot be empty." in res
+
+def test_patch_file_sensitive_path(tmp_path: Path):
+    secret = tmp_path / ".env"
+    secret.write_text("SECRET=123", encoding="utf-8")
+    res = execute_tool("patch_file", {
+        "path": str(secret),
+        "target": "123",
+        "replacement": "456"
+    })
+    assert "ERROR: Security Blocked" in res

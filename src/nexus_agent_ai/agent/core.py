@@ -12,7 +12,8 @@ from ..utils.config import estimate_cost
 RULES_PROMPT = """RULES:
 1. Always use read_file tool before answering questions about a specific file.
    Never guess or assume file contents.
-2. When creating or modifying code files, always use write_file tool.
+2. When creating new files, use write_file. When modifying existing files, always use patch_file
+   to replace only the specific targeted code blocks and preserve file integrity.
 3. When testing calculations, logic, or verifying scripts, use run_code tool.
 4. Use list_directory to understand project structure before project-level questions.
 5. Use git_status to inspect modified files or repository diffs.
