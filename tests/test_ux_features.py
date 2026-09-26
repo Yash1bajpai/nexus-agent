@@ -113,11 +113,107 @@ def test_repl_slash_commands_loop(monkeypatch):
     monkeypatch.setattr("nexus_agent_ai.cli.app.get_provider_instance", lambda p: (DummyProvider(), "dummy"))
 
     runner = CliRunner()
-    # Send /help, /clear, then /exit
-    inputs = "/help\n/clear\n/exit\n"
+    # Send /help, /sessions, /clear, then /exit
+    inputs = "/help\n/sessions\n/clear\n/exit\n"
     result = runner.invoke(cli_app, ["repl"], input=inputs)
     assert result.exit_code == 0
     assert "Available REPL commands:" in result.output
     assert "Conversation memory cleared." in result.output
     assert "Ending session. Goodbye!" in result.output
+
+def test_chat_command_with_persist(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from nexus_agent_ai.cli.app import app as cli_app
+    from nexus_agent_ai.agent.persistence import SQLiteMemory
+
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr("nexus_agent_ai.cli.app.get_provider_instance", lambda p: (DummyProvider(), "dummy"))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_app, ["chat", "Hello test agent", "--persist", "--session", "chat_test_sess", "--no-stream"])
+    assert result.exit_code == 0
+
+    db_path = tmp_path / ".nexus-agent" / "history.db"
+    assert db_path.exists()
+    sessions = SQLiteMemory.list_sessions(db_path=db_path)
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "chat_test_sess"
+
+def test_workspace_session_id(tmp_path):
+    from nexus_agent_ai.agent.persistence import get_workspace_session_id
+    dir1 = tmp_path / "project_a"
+    dir2 = tmp_path / "project_b"
+    dir1.mkdir()
+    dir2.mkdir()
+
+    sess1 = get_workspace_session_id(dir1)
+    sess2 = get_workspace_session_id(dir2)
+
+    assert sess1 != sess2
+    assert sess1.startswith("project_a_")
+    assert sess2.startswith("project_b_")
+    # Idempotence check
+    assert sess1 == get_workspace_session_id(dir1)
+
+def test_sqlite_sessions_list_and_delete(tmp_path):
+    from nexus_agent_ai.agent.persistence import SQLiteMemory
+    db_file = tmp_path / "sessions_test.db"
+
+    mem_a = SQLiteMemory(db_path=db_file, session_id="session_alpha")
+    mem_a.add("user", "Alpha message 1")
+    mem_a.add("assistant", "Alpha message 2")
+
+    mem_b = SQLiteMemory(db_path=db_file, session_id="session_beta")
+    mem_b.add("user", "Beta message 1")
+
+    sessions = SQLiteMemory.list_sessions(db_path=db_file)
+    assert len(sessions) == 2
+    session_ids = [s["session_id"] for s in sessions]
+    assert "session_alpha" in session_ids
+    assert "session_beta" in session_ids
+
+    alpha_entry = next(s for s in sessions if s["session_id"] == "session_alpha")
+    assert alpha_entry["message_count"] == 2
+
+    # Delete session_alpha
+    SQLiteMemory.delete_session("session_alpha", db_path=db_file)
+    remaining = SQLiteMemory.list_sessions(db_path=db_file)
+    assert len(remaining) == 1
+    assert remaining[0]["session_id"] == "session_beta"
+
+def test_sessions_cli_command(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from nexus_agent_ai.cli.app import app as cli_app
+    from nexus_agent_ai.agent.persistence import SQLiteMemory
+
+    nexus_dir = tmp_path / ".nexus-agent"
+    nexus_dir.mkdir()
+    db_file = nexus_dir / "history.db"
+    # Populate dummy sessions
+    mem1 = SQLiteMemory(db_path=db_file, session_id="my_custom_session")
+    mem1.add("user", "Hello custom")
+    del mem1
+
+    # Point home dir or default db_path to tmp_path
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    runner = CliRunner()
+    # List sessions
+    result = runner.invoke(cli_app, ["sessions"])
+    assert result.exit_code == 0
+    assert "Persistent Sessions" in result.output
+    assert "my_custom_session" in result.output
+
+    # Delete session
+    del_result = runner.invoke(cli_app, ["sessions", "--delete", "my_custom_session"])
+    assert del_result.exit_code == 0
+    assert "Deleted session 'my_custom_session'." in del_result.output
+
+    # Check empty list
+    empty_result = runner.invoke(cli_app, ["sessions"])
+    assert empty_result.exit_code == 0
+    assert "No persistent sessions found" in empty_result.output
+
 

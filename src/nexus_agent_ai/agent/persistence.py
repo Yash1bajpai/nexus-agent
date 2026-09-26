@@ -1,19 +1,29 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from ..utils.config import MAX_CONVERSATION_MESSAGES
+
+def get_workspace_session_id(cwd: Optional[Path] = None) -> str:
+    """Generate a stable, unique session ID based on the workspace directory path."""
+    import hashlib
+    p = (cwd or Path.cwd()).resolve()
+    path_str = str(p).replace("\\", "/").rstrip("/").lower()
+    path_hash = hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:8]
+    folder_name = p.name or "root"
+    clean_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in folder_name)
+    return f"{clean_name}_{path_hash}"
 
 class SQLiteMemory:
     """Persistent SQLite-backed conversation buffer for Nexus-Agent sessions."""
 
-    def __init__(self, db_path: Path = None, session_id: str = "default", max_messages: int = MAX_CONVERSATION_MESSAGES):
+    def __init__(self, db_path: Optional[Path] = None, session_id: Optional[str] = None, max_messages: int = MAX_CONVERSATION_MESSAGES):
         if db_path is None:
             home_dir = Path.home() / ".nexus-agent"
             home_dir.mkdir(parents=True, exist_ok=True)
             db_path = home_dir / "history.db"
         self.db_path = db_path
-        self.session_id = session_id
+        self.session_id = session_id or get_workspace_session_id()
         self.max_messages = max_messages
         self._init_db()
 
@@ -107,3 +117,34 @@ class SQLiteMemory:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (self.session_id,))
             conn.commit()
+
+    @classmethod
+    def list_sessions(cls, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """List all stored sessions with message counts and last activity."""
+        if db_path is None:
+            db_path = Path.home() / ".nexus-agent" / "history.db"
+        if not db_path.exists():
+            return []
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute("""
+                SELECT session_id, COUNT(*) as msg_count, MAX(timestamp) as last_active
+                FROM conversation_history
+                GROUP BY session_id
+                ORDER BY last_active DESC
+            """)
+            return [
+                {"session_id": row[0], "message_count": row[1], "last_active": row[2]}
+                for row in cursor.fetchall()
+            ]
+
+    @classmethod
+    def delete_session(cls, session_id: str, db_path: Optional[Path] = None):
+        """Delete all messages for a specific session."""
+        if db_path is None:
+            db_path = Path.home() / ".nexus-agent" / "history.db"
+        if not db_path.exists():
+            return
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (session_id,))
+            conn.commit()
+

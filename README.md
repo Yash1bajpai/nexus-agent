@@ -122,8 +122,8 @@ graph TD
     
     subgraph Sandbox Tools
         Dispatcher --> RF["read_file / list_directory"]
-        Dispatcher --> WF["write_file"]
-        Dispatcher --> RC["run_code"]
+        Dispatcher --> WF["write_file / patch_file"]
+        Dispatcher --> RC["run_code / run_tests"]
         Dispatcher --> WEB["search_web (DuckDuckGo / Offline Cache)"]
         Dispatcher --> GIT["git_status / git_diff / git_commit"]
     end
@@ -416,6 +416,26 @@ nexus-agent commit
 # Skip confirmation and commit immediately:
 nexus-agent commit --yes
 ```
+
+#### 🗃️ 7. Persistent Workspace Sessions & Session Management (`sessions`)
+Resume multi-turn conversations across restarts with SQLite-backed memory automatically scoped to each workspace folder:
+```bash
+# Start REPL with persistent session (defaults to current workspace session ID)
+nexus-agent repl --persist
+
+# Or specify a custom named session
+nexus-agent repl --persist --session feature-login
+
+# Run a persistent one-shot chat command
+nexus-agent chat "Remember our API conventions" --persist
+
+# List all stored sessions across projects
+nexus-agent sessions
+
+# Delete a specific session
+nexus-agent sessions --delete project_a_9c41bc1a
+```
+Inside the interactive REPL, type `/sessions` to view sessions or `/clear` to reset active memory.
 
 ---
 

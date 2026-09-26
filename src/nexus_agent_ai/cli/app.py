@@ -123,8 +123,14 @@ def chat(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
+    persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
+    session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
 ):
     """Execute a single-turn chat instruction with autonomous tool calling."""
+    if hasattr(persist, "default"):
+        persist = bool(persist.default)
+    if hasattr(session, "default"):
+        session = session.default
     if not query or not query.strip():
         display.print_error("Query cannot be empty.")
         raise typer.Exit(code=1)
@@ -133,7 +139,15 @@ def chat(
         raise typer.Exit(code=1)
     try:
         prov, resolved_name = get_provider_instance(provider)
-        memory = ConversationMemory()
+        if persist:
+            try:
+                from ..agent.persistence import SQLiteMemory
+                memory = SQLiteMemory(session_id=session)
+            except Exception as e:
+                display.print_warn(f"SQLite persistence unavailable ({e}), falling back to in-memory.")
+                memory = ConversationMemory()
+        else:
+            memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
 
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
@@ -173,6 +187,7 @@ def _build_repl_completer():
                 ("/review", "Review code file: /review <file>"),
                 ("/debug", "Debug error in file: /debug <file> -e <err>"),
                 ("/history", "View session message history"),
+                ("/sessions", "List stored persistent sessions"),
                 ("/pull-model", "Pre-download local model"),
                 ("/exit", "Exit session"),
             ]
@@ -206,6 +221,7 @@ def repl(
     no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (by default OFF in REPL mode for clean multi-turn prompts)."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
     persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
+    session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
 ):
     """Start an interactive multi-turn REPL chat session."""
     if hasattr(provider, "default"):
@@ -218,6 +234,8 @@ def repl(
         max_iterations = int(max_iterations.default)
     if hasattr(persist, "default"):
         persist = bool(persist.default)
+    if hasattr(session, "default"):
+        session = session.default
     if max_iterations <= 0:
         display.print_error("max-iterations must be a positive integer > 0.")
         raise typer.Exit(code=1)
@@ -226,8 +244,8 @@ def repl(
         if persist:
             try:
                 from ..agent.persistence import SQLiteMemory
-                memory = SQLiteMemory()
-                typer.echo("  [i]Persistent mode: history saved to ~/.nexus-agent/history.db[/i]\n")
+                memory = SQLiteMemory(session_id=session)
+                typer.echo(f"  [i]Persistent mode: session '{memory.session_id}' saved to ~/.nexus-agent/history.db[/i]\n")
             except Exception as e:
                 display.print_warn(f"SQLite persistence unavailable ({e}), falling back to in-memory.")
                 memory = ConversationMemory()
@@ -286,6 +304,7 @@ def repl(
                         "  /review <file>  - Review a source file\n"
                         "  /debug <file>   - Debug an error in a file\n"
                         "  /history        - Show conversation history\n"
+                        "  /sessions       - List stored persistent sessions\n"
                         "  /pull-model     - Download local model weights\n"
                         "  /exit, /quit    - Exit the session\n"
                         "  @filename       - Reference file context directly"
@@ -298,6 +317,24 @@ def repl(
                         role = m.get("role", "unknown")
                         content = str(m.get("content", ""))[:120]
                         typer.echo(f"  [{role.upper()}]: {content}...")
+                    continue
+                elif lower_input in ("/sessions", "sessions"):
+                    try:
+                        from ..agent.persistence import SQLiteMemory, get_workspace_session_id
+                        sess_list = SQLiteMemory.list_sessions()
+                        if not sess_list:
+                            display.print_info("No persistent sessions found.")
+                        else:
+                            curr_sid = getattr(agent.memory, "session_id", get_workspace_session_id())
+                            display.print_info(f"Stored persistent sessions ({len(sess_list)}):")
+                            for s in sess_list:
+                                sid = s["session_id"]
+                                count = s["message_count"]
+                                active = s["last_active"] or "N/A"
+                                current = " (active)" if sid == curr_sid else ""
+                                typer.echo(f"  - {sid}{current}: {count} messages (last active: {active})")
+                    except Exception as e:
+                        display.print_error(f"Failed to list sessions: {e}")
                     continue
 
                 if user_input.startswith("/"):
@@ -642,6 +679,41 @@ def pull_model_cmd(
         ensure_llama_server_binary()
     except Exception:
         pass
+
+
+@app.command("sessions")
+def sessions_cmd(
+    delete: Optional[str] = typer.Option(None, "--delete", "-d", help="Delete a specific session by ID, or 'all' to delete all sessions."),
+):
+    """List or delete stored persistent chat sessions."""
+    from ..agent.persistence import SQLiteMemory, get_workspace_session_id
+    if delete:
+        if delete.lower() == "all":
+            all_s = SQLiteMemory.list_sessions()
+            for s in all_s:
+                SQLiteMemory.delete_session(s["session_id"])
+            display.print_info(f"Cleared all {len(all_s)} persistent session(s).")
+        else:
+            SQLiteMemory.delete_session(delete)
+            display.print_info(f"Deleted session '{delete}'.")
+        return
+
+    sessions_list = SQLiteMemory.list_sessions()
+    if not sessions_list:
+        typer.echo("\nNo persistent sessions found.")
+        typer.echo("Run 'nexus repl --persist' or 'nexus chat --persist \"...\"' to record sessions.\n")
+        return
+
+    curr_ws = get_workspace_session_id()
+    typer.echo(f"\nPersistent Sessions ({len(sessions_list)} total):")
+    typer.echo(f"Current workspace session: {curr_ws}\n")
+    for s in sessions_list:
+        sid = s["session_id"]
+        count = s["message_count"]
+        active = s["last_active"] or "N/A"
+        marker = " [CURRENT WORKSPACE]" if sid == curr_ws else ""
+        typer.echo(f"  • {sid}{marker}: {count} messages (last active: {active})")
+    typer.echo("")
 
 
 @app.callback(invoke_without_command=True)
