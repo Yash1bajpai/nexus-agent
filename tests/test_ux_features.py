@@ -78,3 +78,46 @@ def test_sqlite_memory(tmp_path):
     conn = sqlite3.connect(db_file)
     conn.close()
     del mem  # drop reference so SQLite releases any internal handles
+
+def test_repl_completer_slash_and_at_mentions(tmp_path, monkeypatch):
+    from nexus_agent_ai.cli.app import _build_repl_completer
+    from prompt_toolkit.document import Document
+
+    completer = _build_repl_completer()
+    assert completer is not None
+
+    # Test slash command completion
+    doc_slash = Document("/cl", cursor_position=3)
+    completions = list(completer.get_completions(doc_slash, None))
+    text_matches = [c.text for c in completions]
+    assert "/clear" in text_matches
+
+    # Test @ mention completion
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "hello_script.py").write_text("print(1)")
+    doc_at = Document("check @hel", cursor_position=10)
+    at_completions = list(completer.get_completions(doc_at, None))
+    at_texts = [c.text for c in at_completions]
+    assert "@hello_script.py" in at_texts
+
+def test_display_print_info():
+    from nexus_agent_ai.cli.display import print_info
+    # Should execute without error
+    print_info("Testing info output")
+
+def test_repl_slash_commands_loop(monkeypatch):
+    from typer.testing import CliRunner
+    from nexus_agent_ai.cli.app import app as cli_app
+
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr("nexus_agent_ai.cli.app.get_provider_instance", lambda p: (DummyProvider(), "dummy"))
+
+    runner = CliRunner()
+    # Send /help, /clear, then /exit
+    inputs = "/help\n/clear\n/exit\n"
+    result = runner.invoke(cli_app, ["repl"], input=inputs)
+    assert result.exit_code == 0
+    assert "Available REPL commands:" in result.output
+    assert "Conversation memory cleared." in result.output
+    assert "Ending session. Goodbye!" in result.output
+

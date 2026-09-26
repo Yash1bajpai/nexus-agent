@@ -123,6 +123,10 @@ def print_warn(message: str):
     """Print a warning message (e.g. rate limit fallback)."""
     console.print(f"[bold yellow][WARN][/bold yellow] {message}")
 
+def print_info(message: str):
+    """Print an informational message."""
+    console.print(f"[bold cyan][INFO][/bold cyan] {message}")
+
 def print_fallback_switch(from_provider: str, to_provider: str, reason: str = ""):
     """Print a clean provider-switch warning on rate limit or API/auth error."""
     msg = f"{from_provider.capitalize()} failed or rate-limited. Switching to {to_provider.capitalize()}..."

@@ -156,6 +156,49 @@ def chat(
         display.print_error(f"Fatal execution error: {str(e)}")
         raise typer.Exit(code=1)
 
+def _build_repl_completer():
+    """Build prompt_toolkit completer for slash commands and workspace file @mentions."""
+    try:
+        from prompt_toolkit.completion import Completer, Completion
+    except ImportError:
+        return None
+
+    class NexusReplCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            slash_cmds = [
+                ("/help", "Show available REPL commands"),
+                ("/clear", "Clear conversation memory"),
+                ("/commit", "Review staged changes & commit"),
+                ("/review", "Review code file: /review <file>"),
+                ("/debug", "Debug error in file: /debug <file> -e <err>"),
+                ("/history", "View session message history"),
+                ("/pull-model", "Pre-download local model"),
+                ("/exit", "Exit session"),
+            ]
+            if text.startswith("/"):
+                for cmd, desc in slash_cmds:
+                    if cmd.startswith(text):
+                        yield Completion(cmd, start_position=-len(text), display_meta=desc)
+                return
+
+            last_word = text.split()[-1] if text.split() else ""
+            if last_word.startswith("@"):
+                prefix = last_word[1:]
+                cwd = Path.cwd()
+                try:
+                    for p in cwd.glob("**/*"):
+                        if any(part.startswith(".") or part in {"__pycache__", "venv", "node_modules", "build", "dist"} for part in p.parts):
+                            continue
+                        if p.is_file():
+                            rel = p.relative_to(cwd).as_posix()
+                            if rel.lower().startswith(prefix.lower()):
+                                yield Completion(f"@{rel}", start_position=-len(last_word), display=rel)
+                except Exception:
+                    pass
+
+    return NexusReplCompleter()
+
 @app.command()
 def repl(
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (gemini/anthropic/openai/auto)."),
@@ -194,18 +237,72 @@ def repl(
 
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
-        typer.echo("Type 'exit' or 'quit' to end the session.\n")
+        typer.echo("Type /help for available commands, or /exit to quit.\n")
+
+        session = None
+        if sys.stdin.isatty():
+            try:
+                from prompt_toolkit import PromptSession
+                from prompt_toolkit.history import FileHistory
+                history_dir = Path.home() / ".nexus-agent"
+                history_dir.mkdir(parents=True, exist_ok=True)
+                history_file = str(history_dir / "repl_history")
+                completer = _build_repl_completer()
+                session = PromptSession(
+                    history=FileHistory(history_file),
+                    completer=completer,
+                )
+            except Exception:
+                session = None
 
         while True:
             try:
-                user_input = typer.prompt(">> You").strip()
+                if session is not None and sys.stdin.isatty():
+                    try:
+                        user_input = session.prompt(">> You: ").strip()
+                    except KeyboardInterrupt:
+                        typer.echo("^C")
+                        continue
+                else:
+                    user_input = typer.prompt(">> You").strip()
+
                 if not user_input:
                     continue
-                if user_input.lower() in ["exit", "quit", "q"]:
+                if user_input.lower() in ["exit", "quit", "q", "/exit", "/quit", "/q"]:
                     typer.echo("Ending session. Goodbye!")
                     break
 
                 lower_input = user_input.lower()
+
+                if lower_input in ("/clear", "clear"):
+                    agent.memory.clear()
+                    display.print_info("Conversation memory cleared.")
+                    continue
+                elif lower_input in ("/help", "help"):
+                    display.print_info(
+                        "Available REPL commands:\n"
+                        "  /clear          - Clear conversation context\n"
+                        "  /commit         - Review diff & commit changes\n"
+                        "  /review <file>  - Review a source file\n"
+                        "  /debug <file>   - Debug an error in a file\n"
+                        "  /history        - Show conversation history\n"
+                        "  /pull-model     - Download local model weights\n"
+                        "  /exit, /quit    - Exit the session\n"
+                        "  @filename       - Reference file context directly"
+                    )
+                    continue
+                elif lower_input in ("/history", "history"):
+                    msgs = agent.memory.get()
+                    display.print_info(f"Session history ({len(msgs)} messages):")
+                    for m in msgs:
+                        role = m.get("role", "unknown")
+                        content = str(m.get("content", ""))[:120]
+                        typer.echo(f"  [{role.upper()}]: {content}...")
+                    continue
+
+                if user_input.startswith("/"):
+                    user_input = user_input[1:].strip()
+                    lower_input = user_input.lower()
 
                 if lower_input == "commit" or lower_input.startswith("commit "):
                     try:
