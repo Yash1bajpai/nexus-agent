@@ -1,3 +1,4 @@
+import time
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
 from ..utils.config import ConfigError
@@ -29,11 +30,16 @@ def _make_openai():
     from .openai_provider import OpenAIProvider
     return OpenAIProvider()
 
+def _make_local():
+    from .local_provider import LocalProvider
+    return LocalProvider()
+
 FALLBACK_CHAIN = [
     ("gemini",      _make_gemini),
     ("openrouter",  _make_openrouter),   # ← free fallback, no per-minute limit
     ("anthropic",   _make_anthropic),
     ("openai",      _make_openai),
+    ("local",       _make_local),        # ← offline local fallback
 ]
 
 class FallbackProvider(BaseProvider):
@@ -48,6 +54,8 @@ class FallbackProvider(BaseProvider):
         self._current_name: Optional[str] = None
         self._current_provider: Optional[BaseProvider] = None
         self._warn_fn = None  # injected by app.py for rich output
+        self._fallback_time: Optional[float] = None
+        self._recovery_cooldown: float = 60.0
 
         # Re-order chain so the preferred provider is first
         names = [n for n, _ in FALLBACK_CHAIN]
@@ -76,8 +84,32 @@ class FallbackProvider(BaseProvider):
             + "; ".join(failures)
         )
 
+    def _maybe_recover_primary(self):
+        """Attempt to restore the primary preferred provider once cooldown has elapsed."""
+        if self._current_name == self._start or self._fallback_time is None:
+            return
+        if time.time() - self._fallback_time >= self._recovery_cooldown:
+            for name, factory in self._chain:
+                if name == self._start:
+                    try:
+                        primary_prov = factory()
+                        old_name = self._current_name
+                        self._current_name = name
+                        self._current_provider = primary_prov
+                        self._fallback_time = None
+                        if self._warn_fn:
+                            try:
+                                self._warn_fn(old_name, name, "Rate-limit window elapsed. Recovering to primary provider.")
+                            except TypeError:
+                                self._warn_fn(old_name, name)
+                        return
+                    except Exception:
+                        self._fallback_time = time.time()
+                    break
+
     def _switch_next(self, failed_name: str, reason: str = ""):
         """Switch to the next available provider after a failure."""
+        self._fallback_time = time.time()
         names = [n for n, _ in self._chain]
         try:
             current_idx = names.index(failed_name)
@@ -108,6 +140,7 @@ class FallbackProvider(BaseProvider):
         return getattr(self._current_provider, "model", "unknown")
 
     def complete(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
+        self._maybe_recover_primary()
         while True:
             try:
                 return self._current_provider.complete(messages, tools, system)  # type: ignore
@@ -122,6 +155,7 @@ class FallbackProvider(BaseProvider):
         On failure, switch to next provider and retry from scratch (partial output
         from the failed provider will already be on screen — acceptable tradeoff
         for live streaming UX)."""
+        self._maybe_recover_primary()
         while True:
             try:
                 if hasattr(self._current_provider, "stream") and self._current_provider is not None:

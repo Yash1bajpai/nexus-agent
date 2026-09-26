@@ -1,3 +1,4 @@
+import time
 import pytest
 
 anthropic = pytest.importorskip("anthropic", reason="anthropic SDK optional")
@@ -162,3 +163,32 @@ def test_gemini_complete_and_stream():
     assert res.tool_calls[0].name == "test_tool"
     assert res.input_tokens == 12
     assert res.output_tokens == 18
+
+def test_fallback_chain_includes_local():
+    from nexus_agent_ai.providers.fallback_provider import FALLBACK_CHAIN
+    names = [name for name, _ in FALLBACK_CHAIN]
+    assert "local" in names
+
+def test_fallback_provider_rate_limit_recovery():
+    from nexus_agent_ai.providers.fallback_provider import FallbackProvider
+    from nexus_agent_ai.providers.base import ProviderResponse
+    fb = FallbackProvider(start_provider="gemini")
+
+    mock_primary = MagicMock()
+    mock_primary.complete.return_value = ProviderResponse(text="Primary restored")
+    mock_fallback = MagicMock()
+    mock_fallback.complete.return_value = ProviderResponse(text="Fallback response")
+
+    fb._chain = [("gemini", lambda: mock_primary), ("openrouter", lambda: mock_fallback)]
+    fb._start = "gemini"
+    fb._current_name = "openrouter"
+    fb._current_provider = mock_fallback
+    # Simulate a failure happened 70s ago (exceeding 60s cooldown)
+    fb._fallback_time = time.time() - 70
+    fb._recovery_cooldown = 60.0
+
+    res = fb.complete([], [], "test")
+    assert res.text == "Primary restored"
+    assert fb._current_name == "gemini"
+    assert fb._fallback_time is None
+
