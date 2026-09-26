@@ -751,10 +751,21 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
                     return f"ERROR: Invalid or unsafe -k filter expression: '{token}'"
                 i += 1
             elif token.startswith("--maxfail="):
-                cmd.append(token)
+                val = token.split("=", 1)[1]
+                if val.isdigit() and int(val) > 0:
+                    cmd.append(token)
+                else:
+                    return f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer."
                 i += 1
+            elif token == "--maxfail" and i + 1 < len(tokens):
+                val = tokens[i + 1]
+                if val.isdigit() and int(val) > 0:
+                    cmd.extend(["--maxfail", val])
+                else:
+                    return f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer."
+                i += 2
             else:
-                return f"ERROR: Unsupported or unsafe pytest argument: '{token}'. Allowed flags: -v, -q, -x, -s, -k <expr>, --disable-warnings, --tb=short."
+                return f"ERROR: Unsupported or unsafe pytest argument: '{token}'. Allowed flags: -v, -q, -x, -s, -k <expr>, --disable-warnings, --tb=short, --maxfail=N."
 
     try:
         proc = subprocess.run(

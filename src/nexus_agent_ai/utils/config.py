@@ -56,9 +56,20 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
 def get_package_version() -> str:
     """Get nexus-agent-ai package version dynamically."""
     try:
+        from pathlib import Path
+        import re
+        pyproject = Path(__file__).resolve().parent.parent.parent.parent / "pyproject.toml"
+        if pyproject.is_file():
+            match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', pyproject.read_text(encoding="utf-8"))
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+
+    try:
         from importlib.metadata import version
         return version("nexus-agent-ai")
     except Exception:
         pass
-    return "2.7.3"
+    return "2.8.0"
 

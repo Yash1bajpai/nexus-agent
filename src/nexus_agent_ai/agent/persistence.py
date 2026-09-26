@@ -7,8 +7,11 @@ from ..utils.config import MAX_CONVERSATION_MESSAGES
 def get_workspace_session_id(cwd: Optional[Path] = None) -> str:
     """Generate a stable, unique session ID based on the workspace directory path."""
     import hashlib
+    import os
     p = (cwd or Path.cwd()).resolve()
-    path_str = str(p).replace("\\", "/").rstrip("/").lower()
+    path_str = str(p).replace("\\", "/").rstrip("/")
+    if os.name == "nt":
+        path_str = path_str.lower()
     path_hash = hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:8]
     folder_name = p.name or "root"
     clean_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in folder_name)

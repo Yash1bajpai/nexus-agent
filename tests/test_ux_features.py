@@ -216,4 +216,30 @@ def test_sessions_cli_command(tmp_path, monkeypatch):
     assert empty_result.exit_code == 0
     assert "No persistent sessions found" in empty_result.output
 
+def test_package_version():
+    from nexus_agent_ai.utils.config import get_package_version
+    # When installed/not-installed fallback returns 2.8.0
+    ver = get_package_version()
+    assert ver == "2.8.0"
+
+def test_workspace_session_id_posix_case_sensitivity(monkeypatch, tmp_path):
+    from nexus_agent_ai.agent.persistence import get_workspace_session_id
+    import os
+    # Simulate POSIX environment
+    monkeypatch.setattr(os, "name", "posix")
+    path_lower = tmp_path / "my_project"
+    path_upper = tmp_path / "My_Project"
+    
+    sess_lower = get_workspace_session_id(path_lower)
+    sess_upper = get_workspace_session_id(path_upper)
+    assert sess_lower != sess_upper
+
+    # Simulate Windows environment
+    monkeypatch.setattr(os, "name", "nt")
+    sess_nt_lower = get_workspace_session_id(path_lower)
+    sess_nt_upper = get_workspace_session_id(path_upper)
+    # On Windows, both resolve to the same normalized hash
+    assert sess_nt_lower.split("_")[-1] == sess_nt_upper.split("_")[-1]
+
+
 

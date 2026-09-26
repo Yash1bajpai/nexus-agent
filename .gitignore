@@ -33,6 +33,7 @@ __test_scan.py
 *.sqlite
 *.sqlite3
 *.log
+*.bak
 CHANGELOG.md
 
 # Local graph memory (personal use only)

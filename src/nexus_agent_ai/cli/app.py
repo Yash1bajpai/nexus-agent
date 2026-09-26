@@ -199,16 +199,31 @@ def _build_repl_completer():
 
             last_word = text.split()[-1] if text.split() else ""
             if last_word.startswith("@"):
-                prefix = last_word[1:]
+                prefix = last_word[1:].lower()
                 cwd = Path.cwd()
+                ignored_dirs = {
+                    ".git", ".venv", "venv", "__pycache__", "node_modules",
+                    "build", "dist", ".idea", ".vscode", ".pytest_cache", ".nexus-agent"
+                }
+                matches = 0
+                max_matches = 50
                 try:
-                    for p in cwd.glob("**/*"):
-                        if any(part.startswith(".") or part in {"__pycache__", "venv", "node_modules", "build", "dist"} for part in p.parts):
+                    import os
+                    for root, dirs, files in os.walk(cwd):
+                        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ignored_dirs]
+                        rel_root = Path(root).relative_to(cwd)
+                        if len(rel_root.parts) > 4:
+                            dirs.clear()
                             continue
-                        if p.is_file():
-                            rel = p.relative_to(cwd).as_posix()
-                            if rel.lower().startswith(prefix.lower()):
-                                yield Completion(f"@{rel}", start_position=-len(last_word), display=rel)
+                        for f in sorted(files):
+                            if f.startswith(".") or f.endswith((".pyc", ".bak", ".pyd", ".pyo")):
+                                continue
+                            rel_posix = (rel_root / f).as_posix() if str(rel_root) != "." else f
+                            if rel_posix.lower().startswith(prefix) or f.lower().startswith(prefix):
+                                yield Completion(f"@{rel_posix}", start_position=-len(last_word), display=rel_posix)
+                                matches += 1
+                                if matches >= max_matches:
+                                    return
                 except Exception:
                     pass
 

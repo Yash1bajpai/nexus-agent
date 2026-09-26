@@ -152,3 +152,17 @@ def test_run_tests_nonexistent_path(tmp_path: Path):
     res = execute_tool("run_tests", {"path": str(tmp_path / "nonexistent_test.py")})
     assert "ERROR: Target test path does not exist" in res
 
+def test_run_tests_maxfail_validation(tmp_path: Path):
+    # Invalid maxfail
+    res_bad = execute_tool("run_tests", {"args": "--maxfail=abc"})
+    assert "ERROR: Invalid --maxfail value" in res_bad
+
+    res_zero = execute_tool("run_tests", {"args": "--maxfail 0"})
+    assert "ERROR: Invalid --maxfail value" in res_zero
+
+    # Valid maxfail
+    test_file = tmp_path / "test_maxfail.py"
+    test_file.write_text("def test_one(): assert 1 == 1\n", encoding="utf-8")
+    res_good = execute_tool("run_tests", {"path": str(test_file), "args": "-q --maxfail=1"})
+    assert "PASSED" in res_good
+
