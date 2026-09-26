@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import platform
@@ -7,7 +8,7 @@ import sys
 import uuid
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall
 
 # llama-server binary URLs per platform (llama.cpp b7075 release)
@@ -48,6 +49,43 @@ _SERVER_DIR = _NEXUS_HOME / "llama-server"
 _DEFAULT_PORT = 8099  # avoid collision with 8080
 _DEFAULT_REPO = "LiquidAI/LFM2.5-2.6B-GGUF"
 _DEFAULT_FILENAME = "LFM2.5-2.6B-Q6_K.gguf"
+
+_ACTIVE_SERVER_PROCS: Set[subprocess.Popen] = set()
+
+def _terminate_proc(proc: Optional[subprocess.Popen]):
+    """Terminate and forcefully kill a subprocess if it does not exit promptly."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except (subprocess.TimeoutExpired, Exception):
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+def _cleanup_all_servers():
+    """Ensure all spawned llama-server processes are terminated on interpreter exit."""
+    for proc in list(_ACTIVE_SERVER_PROCS):
+        _terminate_proc(proc)
+    _ACTIVE_SERVER_PROCS.clear()
+    pid_file = _SERVER_DIR / "llama_server.pid"
+    if pid_file.exists():
+        try:
+            pid_file.unlink()
+        except Exception:
+            pass
+
+atexit.register(_cleanup_all_servers)
 
 
 def ensure_llama_server_binary(verbose: bool = True) -> Optional[str]:
@@ -350,6 +388,11 @@ class LocalProvider(BaseProvider):
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
         self._server_log = log_file
+        _ACTIVE_SERVER_PROCS.add(self._server_proc)
+        try:
+            (_SERVER_DIR / "llama_server.pid").write_text(str(self._server_proc.pid), encoding="utf-8")
+        except Exception:
+            pass
 
         # Wait for server to be ready. Model loading is CPU/IO bound and can
         # take well over a minute for ~2 GB quant files on slow laptop CPUs,
@@ -377,11 +420,14 @@ class LocalProvider(BaseProvider):
                         log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-800:]
                 except Exception:
                     pass
+                exit_code = self._server_proc.returncode
+                self.stop()
                 raise RuntimeError(
-                    f"llama-server exited immediately (exit code {self._server_proc.returncode}).\n"
+                    f"llama-server exited immediately (exit code {exit_code}).\n"
                     f"Server log:\n{log_tail.strip()}"
                 )
 
+        self.stop()
         raise RuntimeError(
             f"llama-server did not become ready within {timeout_s} seconds.\n"
             f"Check the log at: {_SERVER_DIR / 'server.log'}\n"
@@ -670,20 +716,33 @@ class LocalProvider(BaseProvider):
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
         return {"role": "tool", "tool_call_id": tool_call_id, "content": str(result)}
 
-    def __del__(self):
-        """Clean up llama-server subprocess on garbage collection."""
-        # getattr: providers built via __new__ (or mid-init) have no attrs —
-        # raising here would surface as an unraisable exception during GC.
+    def stop(self):
+        """Explicitly shut down the llama-server subprocess and release resources."""
         server_proc = getattr(self, "_server_proc", None)
         if server_proc is not None:
-            try:
-                server_proc.terminate()
-                server_proc.wait(timeout=5)
-            except Exception:
-                pass
+            _terminate_proc(server_proc)
+            self._server_proc = None
+            if server_proc in _ACTIVE_SERVER_PROCS:
+                _ACTIVE_SERVER_PROCS.discard(server_proc)
+
         log_file = getattr(self, "_server_log", None)
         if log_file:
             try:
                 log_file.close()
             except Exception:
                 pass
+            self._server_log = None
+
+        pid_file = _SERVER_DIR / "llama_server.pid"
+        if pid_file.exists():
+            try:
+                pid_file.unlink()
+            except Exception:
+                pass
+
+    def __del__(self):
+        """Clean up llama-server subprocess on garbage collection."""
+        try:
+            self.stop()
+        except Exception:
+            pass

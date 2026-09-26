@@ -157,3 +157,40 @@ def test_pull_model_env_fallback(monkeypatch):
     assert result.exit_code == 0, result.output
     assert built[0]["repo"] == "env/repo"
     assert built[0]["file"] == "env-file.gguf"
+
+
+def test_local_provider_stop_and_cleanup(tmp_path, monkeypatch):
+    from nexus_agent_ai.providers.local_provider import (
+        LocalProvider, _ACTIVE_SERVER_PROCS, _terminate_proc, _cleanup_all_servers
+    )
+    prov = LocalProvider()
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None
+
+    pid_file = tmp_path / "llama_server.pid"
+    pid_file.write_text("12345", encoding="utf-8")
+    monkeypatch.setattr("nexus_agent_ai.providers.local_provider._SERVER_DIR", tmp_path)
+
+    prov._server_proc = mock_proc
+    _ACTIVE_SERVER_PROCS.add(mock_proc)
+
+    prov.stop()
+
+    assert mock_proc.terminate.called
+    assert prov._server_proc is None
+    assert mock_proc not in _ACTIVE_SERVER_PROCS
+    assert not pid_file.exists()
+
+
+def test_terminate_proc_force_kills_on_timeout():
+    import subprocess
+    from nexus_agent_ai.providers.local_provider import _terminate_proc
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None
+    mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="llama-server", timeout=3)
+
+    _terminate_proc(mock_proc)
+
+    assert mock_proc.terminate.called
+    assert mock_proc.kill.called
+
