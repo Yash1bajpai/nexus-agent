@@ -63,6 +63,7 @@ def test_get_readonly_tools():
     assert "write_file" not in names
     assert "patch_file" not in names
     assert "run_code" not in names
+    assert "run_tests" not in names
     assert "git_commit" not in names
 
 def test_patch_file_success(tmp_path: Path):
@@ -135,3 +136,19 @@ def test_patch_file_sensitive_path(tmp_path: Path):
         "replacement": "456"
     })
     assert "ERROR: Security Blocked" in res
+
+def test_run_tests_success(tmp_path: Path):
+    test_file = tmp_path / "test_mini.py"
+    test_file.write_text("def test_ok(): assert 1 + 1 == 2\n", encoding="utf-8")
+    res = execute_tool("run_tests", {"path": str(test_file), "args": "-q"})
+    assert "PASSED" in res
+    assert "1 passed" in res
+
+def test_run_tests_rejected_unsafe_args():
+    res = execute_tool("run_tests", {"args": "--override-ini=bad"})
+    assert "ERROR: Unsupported or unsafe pytest argument" in res
+
+def test_run_tests_nonexistent_path(tmp_path: Path):
+    res = execute_tool("run_tests", {"path": str(tmp_path / "nonexistent_test.py")})
+    assert "ERROR: Target test path does not exist" in res
+

@@ -706,6 +706,106 @@ RUN_FILE_TOOL = Tool(
     execute=execute_run_file,
 )
 
+def execute_run_tests(path: str = "", args: str = "") -> str:
+    """Execute pytest in the workspace with safety controls, timeout, and output formatting."""
+    cmd = [sys.executable, "-m", "pytest"]
+
+    # Target path validation
+    if path and path.strip():
+        clean_path = path.strip()
+        validated = _validate_workspace_path(clean_path)
+        if isinstance(validated, str) and validated.startswith("ERROR:"):
+            return validated
+        p = validated
+        if not p.exists():
+            return f"ERROR: Target test path does not exist: {clean_path}"
+        cmd.append(str(p))
+
+    # Safe args whitelist
+    if args and args.strip():
+        safe_flags = {"-v", "-q", "-x", "-s", "--disable-warnings", "--tb=short", "--tb=line", "--tb=no"}
+        import shlex
+        import re
+        try:
+            tokens = shlex.split(args)
+        except Exception:
+            tokens = args.split()
+
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token in safe_flags:
+                cmd.append(token)
+                i += 1
+            elif token == "-k" and i + 1 < len(tokens):
+                k_val = tokens[i + 1]
+                if re.match(r'^[a-zA-Z0-9_\s\(\)]+$', k_val):
+                    cmd.extend(["-k", k_val])
+                else:
+                    return f"ERROR: Invalid or unsafe -k filter expression: '{k_val}'"
+                i += 2
+            elif token.startswith("-k="):
+                if re.match(r'^-k=[a-zA-Z0-9_\s\(\)]+$', token):
+                    cmd.append(token)
+                else:
+                    return f"ERROR: Invalid or unsafe -k filter expression: '{token}'"
+                i += 1
+            elif token.startswith("--maxfail="):
+                cmd.append(token)
+                i += 1
+            else:
+                return f"ERROR: Unsupported or unsafe pytest argument: '{token}'. Allowed flags: -v, -q, -x, -s, -k <expr>, --disable-warnings, --tb=short."
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=45.0,
+            cwd=str(Path.cwd()),
+        )
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        exit_code = proc.returncode
+
+        combined = []
+        if stdout:
+            combined.append(stdout)
+        if stderr:
+            combined.append(stderr)
+        full_output = "\n".join(combined)
+
+        if len(full_output) > 3000:
+            full_output = full_output[:1500] + "\n\n... [truncated] ...\n\n" + full_output[-1500:]
+
+        status_str = "PASSED" if exit_code == 0 else f"FAILED (exit code {exit_code})"
+        return f"=== Pytest Results: {status_str} ===\n{full_output}"
+    except subprocess.TimeoutExpired:
+        return "ERROR: Pytest execution timed out after 45 seconds."
+    except Exception as e:
+        return f"ERROR: Failed to run pytest: {str(e)}"
+
+RUN_TESTS_TOOL = Tool(
+    name="run_tests",
+    description="Run the pytest test suite in the workspace to verify fixes, test passes, or regressions. Optionally specify a test file/path or filter flags like -k.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Optional test file or directory path (e.g. 'tests/' or 'tests/test_tools.py'). Defaults to running the project test suite.",
+            },
+            "args": {
+                "type": "string",
+                "description": "Optional safe pytest flags (e.g. '-v', '-k test_name', '-x', '--tb=short').",
+            },
+        },
+    },
+    execute=execute_run_tests,
+)
+
 def get_all_tools() -> List[Tool]:
     """Return all available tools."""
     return [
@@ -714,6 +814,7 @@ def get_all_tools() -> List[Tool]:
         PATCH_FILE_TOOL,
         LIST_DIRECTORY_TOOL,
         RUN_CODE_TOOL,
+        RUN_TESTS_TOOL,
         SEARCH_WEB_TOOL,
         GIT_STATUS_TOOL,
         GIT_DIFF_TOOL,

@@ -72,6 +72,7 @@ Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built f
   - `patch_file`: Targeted find-and-replace editing to safely modify existing files without full rewrites or truncation.
   - `list_directory`: Recursively maps workspace architecture.
   - `run_code`: Executes arbitrary Python code inside isolated subprocesses with strict execution timeout enforcement (`CODE_EXECUTION_TIMEOUT = 10s`).
+  - `run_tests`: Executes pytest test suites inside the workspace to autonomously verify code fixes and prevent regressions.
   - `search_web`: Queries live DuckDuckGo indexes for real-time API docs and error debugging.
   - `git_status`: Monitors uncommitted workspace changes and diff statistics.
   - `git_diff` + `git_commit`: Reads full staged diff and commits — powering `nexus-agent commit`.

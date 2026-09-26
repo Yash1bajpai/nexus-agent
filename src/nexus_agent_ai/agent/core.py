@@ -14,7 +14,8 @@ RULES_PROMPT = """RULES:
    Never guess or assume file contents.
 2. When creating new files, use write_file. When modifying existing files, always use patch_file
    to replace only the specific targeted code blocks and preserve file integrity.
-3. When testing calculations, logic, or verifying scripts, use run_code tool.
+3. When testing calculations or standalone algorithms, use run_code tool.
+   When verifying bug fixes, test passes, or regressions, use run_tests tool to execute pytest.
 4. Use list_directory to understand project structure before project-level questions.
 5. Use git_status to inspect modified files or repository diffs.
 6. Use search_web to look up live documentation, library APIs, or real-time information.
@@ -49,7 +50,7 @@ _TOOL_PATTERNS = [
     r'\b(delete|remove)\b.*\b(file|line|function)',
     r'@\S+',  # @mention file references
     # Code execution
-    r'\b(run|execute|test|evaluate)\b.*\b(code|script|function|program)',
+    r'\b(run|execute|test|evaluate)\b.*\b(code|script|function|program|test|tests|pytest|suite)',
     # Git operations
     r'\b(git|commit|diff|branch|merge|stash|rebase|cherry)',
     # Web search
