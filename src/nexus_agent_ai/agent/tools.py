@@ -13,6 +13,19 @@ def _validate_workspace_path(path: str | Path) -> Path | str:
     p = Path(path).resolve()
     cwd = Path.cwd().resolve()
     try:
+        home = Path.home().resolve()
+    except Exception:
+        home = None
+
+    # Boundary safeguard: When running in home directory (Global Mode), prevent direct operations
+    # on the home root itself or root dotfiles/configuration (e.g. ~/.bashrc, ~/.gitconfig).
+    if home and cwd == home:
+        if p == home:
+            return f"ERROR: Security Sandbox Access Denied: Direct targeting of the root home directory is forbidden."
+        if p.parent == home and p.name.startswith("."):
+            return f"ERROR: Security Sandbox Access Denied: Root configuration file '{p.name}' in home directory is protected."
+
+    try:
         if p.is_relative_to(cwd):
             return p
     except AttributeError:
@@ -57,7 +70,11 @@ def execute_read_file(path: str) -> str:
     except Exception as e:
         return f"ERROR: Could not read file: {str(e)}"
 
-_SENSITIVE_NAMES = frozenset({".git", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc"})
+_SENSITIVE_NAMES = frozenset({
+    ".git", ".env", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc",
+    ".ssh", ".aws", ".azure", ".kube", ".gnupg", ".bashrc", ".zshrc", ".profile",
+    ".bash_profile", "authorized_keys", "known_hosts", "id_rsa", "id_ed25519",
+})
 _SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".crt", ".token", ".secret")
 _SENSITIVE_MARKERS = ("credential", "secret", "token", "password", "passwd")
 
@@ -71,6 +88,7 @@ def _is_sensitive_path(p: Path) -> bool:
         or any(filename_lower.endswith(ext) for ext in _SENSITIVE_SUFFIXES)
         or any(marker in filename_lower for marker in _SENSITIVE_MARKERS)
         or "id_rsa" in filename_lower
+        or "id_ed25519" in filename_lower
     )
 
 def execute_write_file(path: str, content: str) -> str:
@@ -80,10 +98,25 @@ def execute_write_file(path: str, content: str) -> str:
         if isinstance(validated, str) and validated.startswith("ERROR:"):
             return validated
         p = validated
+
+        if _is_sensitive_path(p):
+            return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
+
+        backup_created = False
+        if p.exists() and p.is_file():
+            backup_path = p.with_name(f"{p.name}.bak")
+            try:
+                with open(p, "rb") as src_f, open(backup_path, "wb") as dst_f:
+                    dst_f.write(src_f.read())
+                backup_created = True
+            except Exception:
+                pass
+
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"Successfully wrote {len(content)} characters to {path}"
+        backup_msg = f" (backup saved to {p.name}.bak)" if backup_created else ""
+        return f"Successfully wrote {len(content)} characters to {path}{backup_msg}"
     except PermissionError:
         return f"ERROR: Permission denied writing to: {path}"
     except Exception as e:
@@ -122,11 +155,21 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
                 f"Provide more surrounding context to make the target unique, or set allow_multiple=True."
             )
 
+        backup_created = False
+        backup_path = p.with_name(f"{p.name}.bak")
+        try:
+            with open(p, "rb") as src_f, open(backup_path, "wb") as dst_f:
+                dst_f.write(src_f.read())
+            backup_created = True
+        except Exception:
+            pass
+
         new_content = content.replace(target, replacement)
         with open(p, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        return f"Successfully patched '{path}': replaced {count} occurrence(s)."
+        backup_msg = f" (backup saved to {p.name}.bak)" if backup_created else ""
+        return f"Successfully patched '{path}': replaced {count} occurrence(s){backup_msg}."
     except PermissionError:
         return f"ERROR: Permission denied patching: {path}"
     except Exception as e:
@@ -167,7 +210,7 @@ def execute_list_directory(path: str = ".") -> str:
                 file_indent = ""
 
             for file in sorted(files):
-                if file not in ignore_dirs:
+                if file not in ignore_dirs and not file.endswith(".bak"):
                     output_lines.append(f"{file_indent}[FILE] {file}")
 
         return "\n".join(output_lines)

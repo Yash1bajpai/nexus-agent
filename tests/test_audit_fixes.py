@@ -190,3 +190,44 @@ def test_onboarding_env_file_path():
     """Verify ENV_FILE is safely contained within the user configuration directory."""
     from nexus_agent_ai.cli.onboarding import ENV_FILE
     assert ENV_FILE.name == ".env"
+
+def test_write_file_creates_backup_on_overwrite(tmp_path: Path):
+    """Verify write_file creates a .bak backup when overwriting existing files."""
+    from nexus_agent_ai.agent.tools import execute_write_file
+    target = tmp_path / "code.py"
+    target.write_text("v1 code", encoding="utf-8")
+    res = execute_write_file(str(target), "v2 code")
+    assert "backup saved" in res
+    bak_file = tmp_path / "code.py.bak"
+    assert bak_file.exists()
+    assert bak_file.read_text(encoding="utf-8") == "v1 code"
+    assert target.read_text(encoding="utf-8") == "v2 code"
+
+def test_write_file_blocks_sensitive_files(tmp_path: Path):
+    """Verify write_file rejects tampering with sensitive files or keys."""
+    from nexus_agent_ai.agent.tools import execute_write_file
+    ssh_key = tmp_path / "id_rsa"
+    res = execute_write_file(str(ssh_key), "fake key")
+    assert "Security Blocked" in res
+    assert not ssh_key.exists()
+
+def test_home_boundary_safeguards(tmp_path: Path, monkeypatch):
+    """Verify that when cwd is home (Global Mode), home root and root dotfiles are blocked."""
+    home_dir = tmp_path / "fake_home"
+    home_dir.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home_dir)
+    monkeypatch.setattr(Path, "cwd", lambda: home_dir)
+
+    # Direct target of home dir
+    res_home = _validate_workspace_path(home_dir)
+    assert isinstance(res_home, str) and "Direct targeting of the root home directory is forbidden" in res_home
+
+    # Root dotfile in home dir
+    dotfile = home_dir / ".bashrc"
+    res_dotfile = _validate_workspace_path(dotfile)
+    assert isinstance(res_dotfile, str) and "Root configuration file '.bashrc' in home directory is protected" in res_dotfile
+
+    # Subdirectory project inside home dir is allowed
+    sub_project = home_dir / "my_project" / "main.py"
+    res_sub = _validate_workspace_path(sub_project)
+    assert isinstance(res_sub, Path)
