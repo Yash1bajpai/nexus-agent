@@ -15,7 +15,7 @@
   ![OpenAI Support](https://img.shields.io/badge/Model-OpenAI%20GPT--4o-green.svg)
   ![Anthropic Support](https://img.shields.io/badge/Model-claude--sonnet--4--6-orange.svg)
   ![Gemini Support](https://img.shields.io/badge/Model-Gemini%202.5%20Flash-blue.svg)
-  ![Tests](https://img.shields.io/badge/tests-85%20passed%20%F0%9F%9A%80-brightgreen.svg)
+  ![Tests](https://img.shields.io/badge/tests-111%20passed%20%F0%9F%9A%80-brightgreen.svg)
   ![PyPI Version](https://img.shields.io/pypi/v/nexus-agent-ai.svg?color=blue)
   [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2.svg?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/yash-bajpai-b5a86332a/)
   ![License](https://img.shields.io/badge/License-MIT-teal.svg)
@@ -470,46 +470,23 @@ pytest tests/ -v --tb=short
 
 ```text
 ============================= test session starts =============================
-collecting ... collected 36 items
+collecting ... collected 111 items
 
-tests/test_audit_fixes.py::test_sandbox_check_blocks_bypass PASSED       [  2%]
-tests/test_audit_fixes.py::test_sandbox_check_blocks_introspection_and_gc PASSED [  5%]
-tests/test_audit_fixes.py::test_sandbox_check_allows_safe_dunders PASSED   [  8%]
-tests/test_audit_fixes.py::test_validate_workspace_path_prefix_containment PASSED [ 11%]
-tests/test_audit_fixes.py::test_execute_run_file_is_disabled PASSED
-tests/test_audit_fixes.py::test_memory_pruning_user_boundaries PASSED    [ 16%]
-tests/test_audit_fixes.py::test_search_web_offline_labeling PASSED       [ 19%]
-tests/test_audit_fixes.py::test_local_provider_setup_model_verify PASSED [ 22%]
-tests/test_audit_fixes.py::test_agent_run_stream_true PASSED             [ 25%]
-tests/test_audit_fixes.py::test_onboarding_env_file_path PASSED          [ 27%]
+tests/test_audit_fixes.py::test_sandbox_check_blocks_bypass PASSED       [  0%]
+tests/test_audit_fixes.py::test_sandbox_check_blocks_introspection_and_gc PASSED [  1%]
+tests/test_audit_fixes.py::test_sandbox_check_allows_safe_dunders PASSED [  2%]
+tests/test_audit_fixes.py::test_validate_workspace_path_prefix_containment PASSED [  3%]
+tests/test_audit_fixes.py::test_execute_run_file_is_disabled PASSED      [  4%]
 tests/test_local_provider.py::test_local_provider_init PASSED            [ 30%]
-tests/test_local_provider.py::test_local_provider_convert_tools PASSED     [ 33%]
-tests/test_local_provider.py::test_local_provider_setup_model PASSED       [ 36%]
-tests/test_local_provider.py::test_local_provider_format_tool_result_message PASSED [ 38%]
 tests/test_providers.py::test_anthropic_provider_schema PASSED           [ 41%]
-tests/test_providers.py::test_openai_provider_schema PASSED              [ 44%]
-tests/test_providers.py::test_gemini_provider_schema PASSED              [ 47%]
-tests/test_providers.py::test_provider_tool_result_format PASSED         [ 50%]
 tests/test_providers.py::test_fallback_provider_general_exception PASSED [ 52%]
-tests/test_providers.py::test_anthropic_complete_and_stream PASSED       [ 55%]
-tests/test_providers.py::test_openai_complete_and_stream PASSED          [ 58%]
-tests/test_providers.py::test_gemini_complete_and_stream PASSED          [ 61%]
-tests/test_tools.py::test_read_file_success PASSED                       [ 63%]
-tests/test_tools.py::test_read_file_not_found PASSED                     [ 66%]
-tests/test_tools.py::test_list_directory_success PASSED                  [ 69%]
-tests/test_tools.py::test_list_directory_not_found PASSED                [ 72%]
-tests/test_tools.py::test_search_web PASSED                              [ 75%]
-tests/test_tools.py::test_write_file_success PASSED                      [ 77%]
-tests/test_tools.py::test_run_code_success PASSED                        [ 80%]
-tests/test_tools.py::test_git_status_tool PASSED                         [ 82%]
 tests/test_tools.py::test_execute_tool_dispatcher PASSED                 [ 85%]
-tests/test_tools.py::test_get_readonly_tools PASSED                      [ 88%]
-tests/test_ux_features.py::test_parse_at_mentions PASSED                 [ 91%]
-tests/test_ux_features.py::test_smart_startup_project_mode PASSED        [ 94%]
-tests/test_ux_features.py::test_status_spinner_helpers PASSED            [ 97%]
-tests/test_ux_features.py::test_sqlite_memory PASSED                     [100%]
+tests/test_ux_features.py::test_sessions_cli_command PASSED              [ 98%]
+tests/test_ux_features.py::test_package_version PASSED                   [ 99%]
+tests/test_ux_features.py::test_workspace_session_id_posix_case_sensitivity PASSED [100%]
+... (98 more)
 
-============================= 41 passed ==============================
+============================ 111 passed in 15.71s =============================
 ```
 
 ---
