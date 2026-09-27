@@ -40,7 +40,7 @@ Built with a clean **ReAct (Reasoning + Acting)** cognitive architecture, Nexus-
 
 ## ❓ Why Nexus-Agent?
 
-Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built for offline-capable, cost-zero local execution. V2 will integrate a custom-trained 124M parameter LLM as the local backend — enabling completely private, zero-latency execution with no external API key required.
+Unlike cloud-dependent tools like GitHub Copilot CLI, **Nexus-Agent** is built for offline-capable, cost-zero local execution. V2 will integrate the custom-trained **CodeForge-250M** (246M parameter) model as the local backend — enabling completely private, zero-latency execution with no external API key required.
 
 ### 📊 How Nexus-Agent Compares
 
