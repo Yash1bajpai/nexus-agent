@@ -195,13 +195,13 @@ def test_write_file_creates_backup_on_overwrite(tmp_path: Path):
     """Verify write_file creates a .bak backup when overwriting existing files."""
     from nexus_agent_ai.agent.tools import execute_write_file
     target = tmp_path / "code.py"
-    target.write_text("v1 code", encoding="utf-8")
-    res = execute_write_file(str(target), "v2 code")
+    target.write_text("value = 1", encoding="utf-8")
+    res = execute_write_file(str(target), "value = 2")
     assert "backup saved" in res
     bak_file = tmp_path / "code.py.bak"
     assert bak_file.exists()
-    assert bak_file.read_text(encoding="utf-8") == "v1 code"
-    assert target.read_text(encoding="utf-8") == "v2 code"
+    assert bak_file.read_text(encoding="utf-8") == "value = 1"
+    assert target.read_text(encoding="utf-8") == "value = 2"
 
 def test_write_file_blocks_sensitive_files(tmp_path: Path):
     """Verify write_file rejects tampering with sensitive files or keys."""

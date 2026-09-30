@@ -12,3 +12,9 @@ def mock_workspace_path_validator(monkeypatch):
         return Path(path).resolve()
         
     monkeypatch.setattr(tools_module, "_validate_workspace_path", mock_validate)
+
+@pytest.fixture(autouse=True)
+def isolate_local_model_configuration(monkeypatch):
+    """Do not let a developer's onboarding configuration change model defaults in tests."""
+    monkeypatch.delenv("NEXUS_AGENT_MODEL_REPO", raising=False)
+    monkeypatch.delenv("NEXUS_AGENT_MODEL_FILENAME", raising=False)

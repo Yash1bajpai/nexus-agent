@@ -169,6 +169,10 @@ class LocalProvider(BaseProvider):
         env vars > built-in LiquidAI LFM2.5-2.6B defaults.
         """
         self.model_id = model_id or os.getenv("NEXUS_AGENT_MODEL_REPO", _DEFAULT_REPO)
+        self.context_size = int(os.getenv("NEXUS_CONTEXT_SIZE", "4096"))
+        if self.context_size < 512:
+            raise ValueError("NEXUS_CONTEXT_SIZE must be at least 512")
+        self.model = self.model_id
         self.filename = filename or os.getenv("NEXUS_AGENT_MODEL_FILENAME", _DEFAULT_FILENAME)
         self._tokenizer = None
         self._model_instance = None
@@ -244,7 +248,7 @@ class LocalProvider(BaseProvider):
                 print(f"💻 CPU Mode: Loading Liquid LFM 2.6B via llama-cpp-python...")
                 self._llama = Llama(
                     model_path=model_path,
-                    n_ctx=4096,
+                    n_ctx=self.context_size,
                     n_threads=4,
                     verbose=False,
                 )
@@ -371,7 +375,8 @@ class LocalProvider(BaseProvider):
         cmd = [
             exe_path,
             "-m", model_path,
-            "-c", "4096",
+            "-c", str(self.context_size),
+            "--parallel", "1",
             "--port", str(port),
             "--host", "127.0.0.1",
             "-t", "4",  # threads
@@ -462,7 +467,7 @@ class LocalProvider(BaseProvider):
         formatted_messages.extend(messages)
 
         payload = {
-            "model": "lfm2.5-2.6b",
+            "model": getattr(self, "model_id", _DEFAULT_REPO),
             "messages": formatted_messages,
             "temperature": 0.2,
             "top_p": 0.95,
@@ -489,7 +494,14 @@ class LocalProvider(BaseProvider):
         raw_tool_call_order: List[str] = []
         usage: Dict[str, Any] = {}
 
-        with urllib.request.urlopen(req, timeout=600) as resp:
+        import urllib.error
+        try:
+            response = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(4096).decode("utf-8", errors="replace")
+            raise RuntimeError(f"Local model request failed (HTTP {exc.code}): {detail}. "
+                               "If context is exceeded, shorten the input/history or increase NEXUS_CONTEXT_SIZE within your RAM budget.") from exc
+        with response as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):

@@ -71,38 +71,14 @@ class SQLiteMemory:
         if len(rows) <= self.max_messages:
             return
 
-        def _is_genuine_user_msg(role: str, msg_json: str) -> bool:
-            if role != "user":
-                return False
-            try:
-                msg = json.loads(msg_json)
-            except Exception:
-                return True
-            if "tool_call_id" in msg or "tool_use_id" in msg or "name" in msg:
-                return False
-            parts = msg.get("parts")
-            if isinstance(parts, list):
-                for p in parts:
-                    if isinstance(p, dict) and "function_response" in p:
-                        return False
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        return False
-            return True
-
-        target_idx = len(rows) - self.max_messages
-        while target_idx < len(rows):
-            if _is_genuine_user_msg(rows[target_idx][1], rows[target_idx][2]):
-                break
-            target_idx += 1
-
-        if target_idx >= len(rows):
-            target_idx = len(rows) - self.max_messages
-
-        if target_idx > 0 and target_idx < len(rows):
-            cutoff_id = rows[target_idx][0]
+        # Use exactly the in-memory policy so active turns and tool pairs stay together.
+        from .memory import ConversationMemory
+        memory = ConversationMemory(max_messages=self.max_messages)
+        memory.messages = [json.loads(row[2]) for row in rows]
+        memory._prune()
+        removed = len(rows) - len(memory.messages)
+        if removed:
+            cutoff_id = rows[removed][0]
             conn.execute("DELETE FROM conversation_history WHERE session_id = ? AND id < ?", (self.session_id, cutoff_id))
 
     def get(self) -> List[Dict[str, Any]]:

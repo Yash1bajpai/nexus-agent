@@ -147,6 +147,7 @@ class OpenAIProvider(BaseProvider):
             "model": self.model,
             "messages": formatted_msgs,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if converted_tools:
             kwargs["tools"] = converted_tools

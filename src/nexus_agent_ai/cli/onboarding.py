@@ -420,6 +420,10 @@ def _step_system_specs():
 
     # Auto-configure the model choice based on detected hardware
     cfg = recommended_model_config(specs)
+    # Explicit environment/user configuration wins over hardware recommendations.
+    if os.getenv("NEXUS_AGENT_MODEL_REPO") or os.getenv("NEXUS_AGENT_MODEL_FILENAME"):
+        _print("  Keeping your configured local model; hardware recommendation was not applied.")
+        return
     _write_env_key("NEXUS_AGENT_MODEL_REPO", cfg["repo"])
     _write_env_key("NEXUS_AGENT_MODEL_FILENAME", cfg["filename"])
     os.environ["NEXUS_AGENT_MODEL_REPO"] = cfg["repo"]

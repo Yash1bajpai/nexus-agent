@@ -71,5 +71,5 @@ def get_package_version() -> str:
         return version("nexus-agent-ai")
     except Exception:
         pass
-    return "2.8.0"
+    return "2.8.1"
 

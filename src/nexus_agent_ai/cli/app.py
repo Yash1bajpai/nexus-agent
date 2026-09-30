@@ -119,7 +119,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
 @app.command()
 def chat(
     query: str = typer.Argument(..., help="The coding question or instruction for the agent."),
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (gemini/anthropic/openai/auto)."),
+    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (local/gemini/anthropic/openai/auto)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
@@ -231,7 +231,7 @@ def _build_repl_completer():
 
 @app.command()
 def repl(
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (gemini/anthropic/openai/auto)."),
+    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (local/gemini/anthropic/openai/auto)."),
     verbose: bool = typer.Option(True, "--verbose/--no-verbose", "-v", help="Show verbose ReAct tool trace (default: ON)."),
     no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (by default OFF in REPL mode for clean multi-turn prompts)."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
@@ -384,13 +384,11 @@ def repl(
                 elif lower_input.startswith("review "):
                     file_to_rev = user_input[7:].strip().strip('"').strip("'")
                     try:
-                        from ..agent.tools import _validate_workspace_path
-                        validated = _validate_workspace_path(file_to_rev)
-                        if isinstance(validated, str) and validated.startswith("ERROR:"):
-                            display.print_error(validated)
+                        from ..agent.tools import execute_read_file
+                        file_contents = execute_read_file(file_to_rev)
+                        if file_contents.startswith("ERROR:"):
+                            display.print_error(file_contents)
                             continue
-                        with open(validated, "r", encoding="utf-8", errors="replace") as _f:
-                            file_contents = _f.read()
                         user_input = (
                             f"Here is the content of '{file_to_rev}':\n\n```\n{file_contents}\n```\n\n"
                             f"Please review this code. Identify bugs, bad practices, missing type hints, "
@@ -404,13 +402,11 @@ def repl(
                     file_to_dbg = parts[0].strip().strip('"').strip("'")
                     err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
                     try:
-                        from ..agent.tools import _validate_workspace_path
-                        validated = _validate_workspace_path(file_to_dbg)
-                        if isinstance(validated, str) and validated.startswith("ERROR:"):
-                            display.print_error(validated)
+                        from ..agent.tools import execute_read_file
+                        file_contents = execute_read_file(file_to_dbg)
+                        if file_contents.startswith("ERROR:"):
+                            display.print_error(file_contents)
                             continue
-                        with open(validated, "r", encoding="utf-8", errors="replace") as _f:
-                            file_contents = _f.read()
                         user_input = (
                             f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
                             f"The user reports this error:\n{err_msg}\n\n"
@@ -603,7 +599,8 @@ def commit(
 
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
-        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
+        from ..agent.tools import get_readonly_tools
+        agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations, tools=get_readonly_tools())
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode="Commit Mode")
 
@@ -647,7 +644,7 @@ def commit(
                 raise typer.Exit(code=0)
 
         from ..agent.tools import execute_git_commit
-        result = execute_git_commit(commit_message)
+        result = execute_git_commit(commit_message, approved=True)
 
         if result.startswith("ERROR"):
             display.print_error(result)

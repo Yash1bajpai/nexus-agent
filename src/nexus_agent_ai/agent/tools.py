@@ -91,6 +91,15 @@ def _is_sensitive_path(p: Path) -> bool:
         or "id_ed25519" in filename_lower
     )
 
+def _validate_python_content(path: Path, content: str) -> str | None:
+    """Reject malformed Python before changing a file; never execute it."""
+    if path.suffix.lower() == ".py":
+        try:
+            ast.parse(content, filename=str(path))
+        except SyntaxError as exc:
+            return f"ERROR: Python syntax validation failed at line {exc.lineno}: {exc.msg}. File unchanged."
+    return None
+
 def execute_write_file(path: str, content: str) -> str:
     """Write string content to a file (creating parent directories if needed)."""
     try:
@@ -101,6 +110,10 @@ def execute_write_file(path: str, content: str) -> str:
 
         if _is_sensitive_path(p):
             return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
+
+        syntax_error = _validate_python_content(p, content)
+        if syntax_error:
+            return syntax_error
 
         backup_created = False
         if p.exists() and p.is_file():
@@ -155,6 +168,11 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
                 f"Provide more surrounding context to make the target unique, or set allow_multiple=True."
             )
 
+        new_content = content.replace(target, replacement)
+        syntax_error = _validate_python_content(p, new_content)
+        if syntax_error:
+            return syntax_error
+
         backup_created = False
         backup_path = p.with_name(f"{p.name}.bak")
         try:
@@ -164,7 +182,6 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         except Exception:
             pass
 
-        new_content = content.replace(target, replacement)
         with open(p, "w", encoding="utf-8") as f:
             f.write(new_content)
 
@@ -508,8 +525,10 @@ def execute_git_diff() -> str:
     except Exception as e:
         return f"ERROR: Could not read git diff: {str(e)}"
 
-def execute_git_commit(message: str) -> str:
-    """Run git commit with the given message. Auto-stages tracked modified files if nothing is staged."""
+def execute_git_commit(message: str, approved: bool = False) -> str:
+    """Run git commit after explicit command confirmation or opt-in."""
+    if not approved and os.environ.get("NEXUS_ALLOW_GIT_COMMIT") != "1":
+        return "ERROR: Git commit is disabled for autonomous tools. Use nexus-agent commit for explicit review."
     try:
         if not message or not message.strip():
             return "ERROR: Commit message cannot be empty."
@@ -708,7 +727,11 @@ RUN_FILE_TOOL = Tool(
 
 def execute_run_tests(path: str = "", args: str = "") -> str:
     """Execute pytest in the workspace with safety controls, timeout, and output formatting."""
-    cmd = [sys.executable, "-m", "pytest"]
+    if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") != "1":
+        return ("ERROR: Project test execution is disabled. Pytest imports arbitrary project code "
+                "with your user permissions; it is NOT sandboxed. For trusted code only, "
+                "set NEXUS_ALLOW_PROJECT_EXECUTION=1 before launching Nexus.")
+    cmd = [sys.executable, "-m", "pytest", "-o", "addopts="]
 
     # Target path validation
     if path and path.strip():
@@ -776,6 +799,9 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
             errors="replace",
             timeout=45.0,
             cwd=str(Path.cwd()),
+            stdin=subprocess.DEVNULL,
+            env={**{key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "TMPDIR") if key in os.environ},
+                 "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
         )
         stdout = proc.stdout.strip()
         stderr = proc.stderr.strip()
@@ -818,19 +844,22 @@ RUN_TESTS_TOOL = Tool(
 )
 
 def get_all_tools() -> List[Tool]:
-    """Return all available tools."""
-    return [
+    """Return inspection/editing tools; project execution is opt-in."""
+    tools = [
         READ_FILE_TOOL,
         WRITE_FILE_TOOL,
         PATCH_FILE_TOOL,
         LIST_DIRECTORY_TOOL,
         RUN_CODE_TOOL,
-        RUN_TESTS_TOOL,
         SEARCH_WEB_TOOL,
         GIT_STATUS_TOOL,
         GIT_DIFF_TOOL,
-        GIT_COMMIT_TOOL,
     ]
+    if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") == "1":
+        tools.append(RUN_TESTS_TOOL)
+    if os.environ.get("NEXUS_ALLOW_GIT_COMMIT") == "1":
+        tools.append(GIT_COMMIT_TOOL)
+    return tools
 
 def get_readonly_tools() -> List[Tool]:
     """Return read-only inspection tools (safe for code review without modifying disk)."""

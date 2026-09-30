@@ -94,32 +94,21 @@ def parse_at_mentions(user_input: str) -> str:
     extracted = [m[0] or m[1] or m[2] for m in matches if (m[0] or m[1] or m[2])]
     for raw_fpath in sorted(set(extracted), key=len, reverse=True):
         fpath = raw_fpath.rstrip('.!,?;:')
-        # Block credential files from being attached via @mention
-        filename_lower = Path(fpath).name.lower()
-        if filename_lower.startswith(".env") or any(filename_lower.endswith(ext) for ext in [".pem", ".key", ".pfx", ".p12"]) or "id_rsa" in filename_lower:
-            attachments.append(f"[Warning: Security blocked attaching secret file @{fpath}]")
-            continue
-
         try:
             resolved_path = Path(fpath).resolve()
         except Exception:
             resolved_path = Path(fpath)
 
         if resolved_path.exists() and resolved_path.is_file():
-            from .tools import _validate_workspace_path
-            validated = _validate_workspace_path(resolved_path)
-            if isinstance(validated, str) and validated.startswith("ERROR:"):
-                attachments.append(f"[Warning: Security blocked reading @{fpath}: {validated}]")
+            from .tools import execute_read_file
+            content = execute_read_file(str(resolved_path))
+            if content.startswith("ERROR:"):
+                attachments.append(f"[Warning: Could not attach @{fpath}: {content}]")
                 continue
-
             pattern = r'(?:^|\s)@\s*(?:"' + re.escape(raw_fpath) + r'"|\'' + re.escape(raw_fpath) + r'\'|' + re.escape(raw_fpath) + r')(?=\s|$|[.!,?;:])'
             clean_input = re.sub(pattern, ' ', clean_input).strip()
-            try:
-                with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                attachments.append(f"[Context attached from @{fpath}: \n{content}\n]")
-            except Exception as e:
-                attachments.append(f"[Warning: Could not read @{fpath}: {str(e)}]")
+            attachments.append(f"[Context attached from @{fpath}: \n{content}\n]")
+
         else:
             attachments.append(f"[Warning: Mentioned file @{fpath} does not exist]")
 
@@ -166,7 +155,9 @@ class Agent:
 
     @property
     def estimated_cost(self) -> float:
-        model_name = getattr(self.provider, "model", "claude-3-5-sonnet-20241022")
+        if _is_local_provider(self.provider):
+            return 0.0
+        model_name = getattr(self.provider, "model", "")
         return estimate_cost(model_name, self.total_input_tokens, self.total_output_tokens)
 
     def run(self, user_input: str, stream: bool = False) -> str:
@@ -270,7 +261,10 @@ class Agent:
                         tool_sig = f"{tool_call.name}:{json.dumps(tool_call.args, sort_keys=True)}"
                         start = time.time()
                         
-                        if tool_sig in executed_tools:
+                        allowed_names = {tool.name for tool in use_tools}
+                        if tool_call.name not in allowed_names:
+                            result = f"ERROR: Tool '{tool_call.name}' is not allowed in this session."
+                        elif tool_sig in executed_tools:
                             duplicate_counts[tool_sig] = duplicate_counts.get(tool_sig, 0) + 1
                             if duplicate_counts[tool_sig] >= 2:
                                 # Hard stop: the model is stuck in a loop.
