@@ -183,6 +183,7 @@ class Agent:
         executed_tools = set()
         duplicate_counts = {}
         force_final = False
+        tool_errors = []
         try:
             while iteration < effective_max_iter:
                 iteration += 1
@@ -279,6 +280,8 @@ class Agent:
                             executed_tools.add(tool_sig)
                             result = execute_tool(tool_call.name, tool_call.args)
 
+                        if str(result).startswith("ERROR:"):
+                            tool_errors.append(str(result))
                         duration = time.time() - start
 
                         if self.event_callback:
@@ -306,6 +309,8 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     final_text = response.text
+                    if tool_errors:
+                        final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(tool_errors))
                     if self.event_callback:
                         self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
                     

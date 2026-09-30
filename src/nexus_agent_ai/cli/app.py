@@ -352,6 +352,7 @@ def repl(
                         display.print_error(f"Failed to list sessions: {e}")
                     continue
 
+                request_tools = None
                 if user_input.startswith("/"):
                     user_input = user_input[1:].strip()
                     lower_input = user_input.lower()
@@ -382,6 +383,8 @@ def repl(
                 elif lower_input.startswith("chat "):
                     user_input = user_input[5:].strip().strip('"').strip("'")
                 elif lower_input.startswith("review "):
+                    from ..agent.tools import get_readonly_tools
+                    request_tools = get_readonly_tools()
                     file_to_rev = user_input[7:].strip().strip('"').strip("'")
                     try:
                         from ..agent.tools import execute_read_file
@@ -417,7 +420,13 @@ def repl(
                         continue
 
                 start_time = time.time()
-                response_text = agent.run(user_input, stream=not no_stream)
+                original_tools = agent.tools
+                if request_tools is not None:
+                    agent.tools = request_tools
+                try:
+                    response_text = agent.run(user_input, stream=not no_stream)
+                finally:
+                    agent.tools = original_tools
                 duration = time.time() - start_time
 
                 if no_stream:

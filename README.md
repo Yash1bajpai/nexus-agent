@@ -53,7 +53,7 @@ nexus-agent commit -p local
 nexus-agent chat --help
 ```
 
-Run inside the project you want Nexus to inspect. Regular chat/generate/debug sessions may write files in that workspace. Review sessions advertise only inspection tools, and the dispatcher rejects tools outside the session's allowed list. Commit-message generation is also read-only; the commit command asks for confirmation unless you deliberately pass `--yes`.
+Run inside the project you want Nexus to inspect. Regular chat/generate/debug sessions may write files in that workspace. Review sessions advertise only inspection tools, and the dispatcher rejects tools outside the session's allowed list, including REPL `/review`. Tool failures are appended to the final answer so a model cannot silently claim success after a failed operation. Commit-message generation is also read-only; the commit command asks for confirmation unless you deliberately pass `--yes`.
 
 `@file.py`, REPL review/debug reads and `read_file` share workspace and sensitive-path checks. Credential-like filenames, `.env` files, keys and sensitive configuration directories are blocked, including resolved symlink targets. This is not content-based secret detection: an innocently named source file may still contain a secret. Do not ask Nexus to inspect such files.
 
@@ -134,7 +134,7 @@ python -m pip install build
 python -m build
 ```
 
-CI runs Python 3.11, 3.12 and 3.13. The September 30 branch suite has 133 tests, including regression coverage for read-only capability bypass, credential attachment, pytest opt-in and environment stripping, Git mutation gating, SQLite history, local cost and detailed context errors. Passing tests are not proof of model accuracy or a hostile-code sandbox.
+CI runs Python 3.11, 3.12 and 3.13. The September 30 branch suite has 135 tests, including regression coverage for read-only capability bypass, credential attachment, pytest opt-in and environment stripping, Git mutation gating, SQLite history, local cost and detailed context errors. Passing tests are not proof of model accuracy or a hostile-code sandbox.
 
 Use a clean environment to install the built wheel and test the CLI before publishing. Publication requires a separate maintainer approval and matching version; branch fixes do not update existing PyPI installations.
 

@@ -140,3 +140,18 @@ def test_onboarding_keeps_explicit_model(monkeypatch):
     onboarding._step_system_specs()
     assert not written
     assert LocalProvider().model_id == "LiquidAI/LFM2.5-1.2B-Instruct-GGUF"
+
+def test_model_cannot_hide_failed_tool(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    p = MaliciousProvider("read_file", {"path": "missing.py"})
+    result = Agent(p, verbose=False).run("Read missing.py")
+    assert "Tool errors occurred" in result
+    assert "File not found" in result
+
+def test_repl_review_capabilities_are_restored():
+    # Verify the CLI wraps one review turn, not all subsequent edit turns.
+    import inspect
+    from nexus_agent_ai.cli.app import repl
+    source = inspect.getsource(repl)
+    assert "request_tools = get_readonly_tools()" in source
+    assert "finally:\n                    agent.tools = original_tools" in source
