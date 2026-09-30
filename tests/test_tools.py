@@ -137,22 +137,26 @@ def test_patch_file_sensitive_path(tmp_path: Path):
     })
     assert "ERROR: Security Blocked" in res
 
-def test_run_tests_success(tmp_path: Path):
+def test_run_tests_success(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("NEXUS_ALLOW_PROJECT_EXECUTION", "1")
     test_file = tmp_path / "test_mini.py"
     test_file.write_text("def test_ok(): assert 1 + 1 == 2\n", encoding="utf-8")
     res = execute_tool("run_tests", {"path": str(test_file), "args": "-q"})
     assert "PASSED" in res
     assert "1 passed" in res
 
-def test_run_tests_rejected_unsafe_args():
+def test_run_tests_rejected_unsafe_args(monkeypatch):
+    monkeypatch.setenv("NEXUS_ALLOW_PROJECT_EXECUTION", "1")
     res = execute_tool("run_tests", {"args": "--override-ini=bad"})
     assert "ERROR: Unsupported or unsafe pytest argument" in res
 
-def test_run_tests_nonexistent_path(tmp_path: Path):
+def test_run_tests_nonexistent_path(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("NEXUS_ALLOW_PROJECT_EXECUTION", "1")
     res = execute_tool("run_tests", {"path": str(tmp_path / "nonexistent_test.py")})
     assert "ERROR: Target test path does not exist" in res
 
-def test_run_tests_maxfail_validation(tmp_path: Path):
+def test_run_tests_maxfail_validation(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("NEXUS_ALLOW_PROJECT_EXECUTION", "1")
     # Invalid maxfail
     res_bad = execute_tool("run_tests", {"args": "--maxfail=abc"})
     assert "ERROR: Invalid --maxfail value" in res_bad
