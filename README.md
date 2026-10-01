@@ -6,7 +6,7 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent`, `age
 
 ## Release status
 
-This branch prepares **2.8.1**. It is not a PyPI release until a maintainer publishes it. At the September 30, 2026 review, PyPI served 2.7.2 and main described 2.8.0. PyPI 2.7.2 does not contain the newer `patch_file` and `run_tests` tools or these safety fixes. Do not assume `pip install` retrieves branch code.
+**2.8.1 was released on PyPI on September 30, 2026.** It includes the capability-enforcement, sensitive-file, packaging and local-runtime fixes described below. The older PyPI 2.7.2 release lacks the newer `patch_file` and `run_tests` tools and these safety fixes. Upgrade the correct package with `python -m pip install --upgrade nexus-agent-ai` and check `nexus-agent --version`.
 
 `pip install nexus-agent` is an unrelated package. Use `nexus-agent-ai`.
 
@@ -96,6 +96,12 @@ export NEXUS_AGENT_MODEL_REPO=LiquidAI/LFM2.5-1.2B-Instruct-GGUF
 export NEXUS_AGENT_MODEL_FILENAME=LFM2.5-1.2B-Instruct-Q4_0.gguf
 nexus-agent chat -p local "What is 17 times 23?"
 ```
+
+### September 30 real-user smoke results
+
+On a Linux x86_64 host with 2 CPUs and about 2GB RAM, genuine offline LFM2.5-1.2B-Instruct Q4_0 answered 17x23 correctly (391). One targeted model-directed patch and a read-only review succeeded before publication. After a fresh install from public PyPI, math passed again, but two file-repair attempts did not complete: one used a nonexistent filename, and one read the right file then stopped without editing. The failed tool call was reported and the original file stayed unchanged. Direct `patch_file` checks passed with a backup and independently verified output.
+
+These are smoke tests, not a model benchmark or proof of unattended reliability. Review the actual diff and run your own trusted tests. LFM2.5-2.6B inference did not complete reliably on this low-memory host, so its quality on suitable hardware remains unverified.
 
 Setup and response time depend on download size and hardware. A 2GB CPU test host is not a useful quality benchmark for 2.6B models. Small models can produce wrong answers and tool calls. Native tool support alone does not guarantee successful file repair in every harness.
 
