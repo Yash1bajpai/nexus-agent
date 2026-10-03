@@ -20,6 +20,8 @@ nexus-agent --version
 nexus-agent --help
 ```
 
+**Windows:** if PowerShell says `nexus-agent` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder printed by `nexus-agent doctor` to PATH. Windows support is covered by unit tests that simulate Windows paths, line endings and permissions on Linux; install and startup were seen on one Windows PC, and there is no Windows CI.
+
 For this checkout:
 
 ```bash
@@ -151,7 +153,7 @@ Python writes and patches are syntax-checked before changing the file. This dete
 
 **API keys.** Keys entered during setup are typed hidden (not echoed) and saved to `~/.nexus-agent/.env`, created with mode 0600 inside a 0700 folder on Linux and macOS. On Windows the file sits in your user profile folder; POSIX permission bits do not apply there. `nexus-agent doctor` warns if the key file is readable by other users.
 
-The REPL stores session history under `~/.nexus-agent`. File context may be retained in that history. Both persistent and in-memory history preserve user-turn/tool-result boundaries when pruning; an active long turn can exceed the nominal message limit rather than lose its original request.
+Sessions: the REPL now saves the conversation by default, one session per folder, in `~/.nexus-agent/history.db`. Open the REPL again in the same folder and it resumes. `nexus-agent repl --continue` (or `-c`) resumes the most recently used session from any folder, `--session NAME` picks one, and `--no-persist` gives a throwaway session. One-shot `nexus-agent chat "question"` still does not save unless you pass `--persist` or `--continue`. File contents you read can be kept in the saved history, so use `--no-persist` for sensitive work. File context may be retained in that history. Both persistent and in-memory history preserve user-turn/tool-result boundaries when pruning; an active long turn can exceed the nominal message limit rather than lose its original request.
 
 CodeForge-250M integration is planned, not a shipped inference backend.
 

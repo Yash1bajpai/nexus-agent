@@ -65,6 +65,18 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
         else:
             checks.append(("ok" if speed >= 0.5 else "warn", "Network", model_select.format_eta(choice["size_gb"], speed) + " for the chosen model"))
 
+    import shutil
+    import sysconfig
+    if shutil.which("nexus-agent"):
+        checks.append(("ok", "Command", "nexus-agent is on PATH"))
+    else:
+        scheme = "nt_user" if os.name == "nt" else "posix_user"
+        try:
+            scripts = sysconfig.get_path("scripts", scheme)
+        except Exception:
+            scripts = "your Python Scripts folder"
+        checks.append(("warn", "Command", f"nexus-agent is not on PATH. Run it as: python -m nexus_agent_ai   (or add {scripts} to PATH)"))
+
     keys = [k for k in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY") if os.getenv(k)]
     checks.append(("info", "Cloud keys", ", ".join(keys) if keys else "none set (local mode works without them)"))
 
