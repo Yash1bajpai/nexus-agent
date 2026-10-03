@@ -48,6 +48,31 @@ app = typer.Typer(
 )
 
 
+def _fit_local_model(prov, context_size, kwargs):
+    """Keep an explicit model choice; otherwise pick by free RAM and ask before downloading."""
+    import os
+    from ..utils import model_select
+    from ..providers.local_provider import LocalProvider
+    if os.getenv("NEXUS_AGENT_MODEL_REPO") or os.getenv("NEXUS_AGENT_MODEL_FILENAME"):
+        return prov
+    from .onboarding import _is_android
+    ctx = context_size or getattr(prov, "context_size", 4096)
+    free = model_select.available_ram_gb()
+    choice = model_select.pick_model(free, ctx, android=_is_android())
+    if model_select.is_cached(choice["repo"], choice["filename"]):
+        if (choice["repo"], choice["filename"]) == (prov.model_id, prov.filename):
+            return prov
+        return LocalProvider(model_id=choice["repo"], filename=choice["filename"], **kwargs)
+    if model_select.is_cached(prov.model_id, prov.filename):
+        display.print_warn(f"Using the downloaded model {prov.filename}. {choice['reason']}")
+        return prov
+    chosen = model_select.confirm_download(choice, ctx, out=display.print_info)
+    if chosen is None:
+        display.print_error("Download cancelled. Run again when ready, or set NEXUS_AGENT_MODEL_REPO and NEXUS_AGENT_MODEL_FILENAME to choose a model.")
+        raise typer.Exit(code=1)
+    return LocalProvider(model_id=chosen["repo"], filename=chosen["filename"], **kwargs)
+
+
 def _make_local_provider(context_size: Optional[int] = None) -> Tuple[Any, str]:
     """Build the default local provider and pre-flight the inference engine.
 
@@ -56,7 +81,8 @@ def _make_local_provider(context_size: Optional[int] = None) -> Tuple[Any, str]:
     pre-flight prevents is only discoverable after the agent loop starts.
     """
     from ..providers.local_provider import LocalProvider, ensure_llama_server_binary
-    prov = LocalProvider(context_size=context_size) if context_size is not None else LocalProvider()
+    kwargs = {"context_size": context_size} if context_size is not None else {}
+    prov = _fit_local_model(LocalProvider(**kwargs), context_size, kwargs)
     prov.setup_model()
     try:
         ensure_llama_server_binary(verbose=False)
@@ -125,7 +151,7 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
 
 @app.command()
 def chat(
-    query: str = typer.Argument(..., help="The coding question or instruction for the agent."),
+    query: Optional[str] = typer.Argument(None, help="The coding question or instruction. Leave it out to open the interactive REPL."),
     provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (local/gemini/anthropic/openai/auto)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
@@ -141,7 +167,12 @@ def chat(
         session = session.default
     if hasattr(context_size, "default"):
         context_size = context_size.default
-    if not query or not query.strip():
+    if query is None or (hasattr(query, "default") and query.default is None):
+        # `nexus-agent chat` with no question behaves like `nexus-agent repl`.
+        repl(provider=provider, verbose=True, no_stream=True, max_iterations=max_iterations,
+             persist=persist, session=session, context_size=context_size)
+        return
+    if not query.strip():
         display.print_error("Query cannot be empty.")
         raise typer.Exit(code=1)
     if max_iterations <= 0:
@@ -763,6 +794,22 @@ def sessions_cmd(
     typer.echo("")
 
 
+@app.command()
+def doctor(
+    context_size: int = typer.Option(4096, "--context-size", min=512, help="Context window to size the model fit for."),
+    no_network: bool = typer.Option(False, "--no-network", help="Skip the download speed test."),
+):
+    """Check Python, RAM, disk, network speed and which local model fits."""
+    from ..utils.doctor import run_checks
+    icons = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]", "info": "[INFO]"}
+    failed = False
+    for status, label, detail in run_checks(context_size=context_size, probe_network=not no_network):
+        typer.echo(f"{icons[status]} {label}: {detail}")
+        failed = failed or status == "fail"
+    if failed:
+        raise typer.Exit(code=1)
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -778,6 +825,9 @@ def main(
         if ctx.invoked_subcommand is None:
             ctx.invoke(repl)
         return
+
+    if ctx.invoked_subcommand == "doctor":
+        return  # diagnostics must work before (and without) the setup wizard
 
     try:
         from .onboarding import run_if_first_time

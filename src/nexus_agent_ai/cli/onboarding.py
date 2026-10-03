@@ -80,7 +80,7 @@ def _input(prompt: str) -> str:
 # ─── System Spec Detection ────────────────────────────────────────────────────
 
 def detect_system_specs() -> dict:
-    specs = {"ram_gb": 0, "cpu_cores": 0, "gpu": None, "cpu_name": None, "avx2": False}
+    specs = {"ram_gb": 0, "cpu_cores": 0, "gpu": None, "cpu_name": None, "avx2": False, "available_ram_gb": None}
 
     import os
     specs["cpu_cores"] = os.cpu_count() or 0
@@ -129,6 +129,12 @@ def detect_system_specs() -> dict:
 
         if not ram_found:
             specs["ram_gb"] = -1  # sentinel: unknown
+
+    try:
+        from ..utils.model_select import available_ram_gb
+        specs["available_ram_gb"] = available_ram_gb()
+    except Exception:
+        pass
 
     # Try to detect CPU name + AVX2 support
     try:
@@ -238,6 +244,17 @@ def recommended_model_config(specs: dict) -> dict:
     if android:
         note += ", Android" if ram and ram > 0 else "Android"
 
+    # Free RAM, not total, decides what is safe: keep headroom for the OS and context.
+    avail = specs.get("available_ram_gb")
+    repo_out = "LiquidAI/LFM2.5-2.6B-GGUF"
+    if avail is not None:
+        from ..utils import model_select
+        big = {"size_gb": float(size.replace("~", "").replace(" GB", ""))}
+        if avail < model_select.required_ram_gb(big):
+            small = model_select.SMALL_MODEL
+            repo_out, filename, size = small["repo"], small["filename"], f"~{small['size_gb']} GB"
+            note += f"; only {avail:.1f} GB free, so the small model was chosen"
+
     alt_cmd = ""
     if gpu or (ram > 16):
         repo, fn = _ALTERNATIVE_MODELS["gpu_or_16gb"]
@@ -247,7 +264,7 @@ def recommended_model_config(specs: dict) -> dict:
         alt_cmd = f"nexus-agent pull-model --repo {repo} --file {fn}"
 
     return {
-        "repo": "LiquidAI/LFM2.5-2.6B-GGUF",
+        "repo": repo_out,
         "filename": filename,
         "size": size,
         "note": note,
