@@ -578,6 +578,15 @@ def run_if_first_time():
     """Run the onboarding wizard if this is the first launch. No-op on subsequent runs."""
     if INIT_FILE.exists():
         return
+    # Piped / CI / scripted runs have nobody to answer the prompts: skip the wizard (without marking it
+    # done, so the next interactive launch still shows it) instead of blocking forever on input().
+    try:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        _print("  Non-interactive run: skipping first-time setup. Run `nexus-agent` in a terminal to set up keys.")
+        return
 
     _show_welcome()
     _step_api_keys()
