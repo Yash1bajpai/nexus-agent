@@ -101,6 +101,14 @@ This option currently applies to local llama-server and llama-cpp-python, not cl
 **Long-session caveat:** history is still limited by message count, not token count. A large file or a long session can overflow even a bigger window. Token-aware trimming and automatic compaction are separate follow-up work. `/clear` removes conversation history (including the current persistent session); use it only if you want to discard that context.
 
 
+### First run and model fit
+
+On a first local run Nexus picks a model by **free** RAM (not total), keeping about 1 GB of headroom plus room for the context window. If the big model will not fit, it falls back to the 1.2B model (~0.7 GB) and says why. Before downloading it shows the file size, a measured download speed and an estimate, and asks `[y]es / [s]mall instead / [n]o`. Downloads resume if interrupted. Set `NEXUS_AGENT_ASSUME_YES=1` to skip the question, or `NEXUS_AGENT_MODEL_REPO` and `NEXUS_AGENT_MODEL_FILENAME` to choose a model yourself.
+
+`nexus-agent` and `nexus-agent chat` with no question both open the interactive REPL.
+
+`nexus-agent doctor` checks Python version, free RAM and disk, download speed to Hugging Face, the inference engine, and which model fits. It downloads nothing. Use `--no-network` to skip the speed test.
+
 You can select a smaller model explicitly:
 
 ```bash

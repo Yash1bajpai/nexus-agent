@@ -26,6 +26,7 @@ class _StubLocalProvider:
 def _reset_stubs(monkeypatch, engine_calls):
     _StubLocalProvider.instances = []
     monkeypatch.setattr(lp, "LocalProvider", _StubLocalProvider)
+    monkeypatch.setenv("NEXUS_AGENT_MODEL_FILENAME", "stub.gguf")  # skip RAM-based model pick
     monkeypatch.setattr(lp, "ensure_llama_server_binary",
                         lambda verbose=True: engine_calls.append(verbose) or "/fake/llama-server")
 
