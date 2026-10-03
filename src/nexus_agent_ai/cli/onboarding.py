@@ -48,6 +48,19 @@ USER_CONFIG_DIR = Path.home() / ".nexus-agent"
 USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 ENV_FILE = USER_CONFIG_DIR / ".env"
 
+
+def _restrict_permissions(path: Path, mode: int) -> None:
+    """Best-effort chmod. Windows ignores POSIX bits; its profile folder is already per-user."""
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+_restrict_permissions(USER_CONFIG_DIR, 0o700)
+
 def _ensure_gitignore_protection():
     """Ensure .env is listed in local workspace .gitignore if present."""
     try:
@@ -362,7 +375,7 @@ def _step_api_keys():
                "  You can add missing keys now or skip (press Enter to skip each).")
         for env_key, label in missing:
             try:
-                val = _input(f"  Enter {label} API key (or Enter to skip): ").strip()
+                val = _secret_input(f"  Enter {label} API key (hidden, or Enter to skip): ").strip()
                 if val:
                     err = _validate_api_key_format(val, label)
                     if err:
@@ -377,13 +390,13 @@ def _step_api_keys():
                 break
 
 def _write_env_key(key: str, value: str):
-    """Append or update a key in the .env file."""
+    """Add or update a key in the .env file. The file is created and kept owner-only (0600)."""
     env_path = ENV_FILE
-    if not env_path.exists():
-        env_path.write_text(f"{key}={value}\n", encoding="utf-8")
-        return
-
-    lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
     updated = False
     for i, line in enumerate(lines):
         if line.startswith(f"{key}="):
@@ -392,7 +405,32 @@ def _write_env_key(key: str, value: str):
             break
     if not updated:
         lines.append(f"{key}={value}\n")
-    env_path.write_text("".join(lines), encoding="utf-8")
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = env_path.with_name(env_path.name + ".tmp")
+    # Create with 0600 from the start so the key is never world-readable, even briefly.
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("".join(lines))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, env_path)
+    _restrict_permissions(env_path, 0o600)
+
+def _secret_input(prompt: str) -> str:
+    """Read a secret without echoing it to the terminal."""
+    import getpass
+    if console:
+        console.print(f"[bold cyan]{prompt}[/bold cyan]", end="")
+        prompt = ""
+    sys.stdout.flush()
+    return getpass.getpass(prompt)
+
 
 def _validate_api_key_format(key: str, label: str) -> str | None:
     """Basic format validation for API keys. Returns error string or None."""

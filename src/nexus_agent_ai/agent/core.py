@@ -15,6 +15,9 @@ RULES_PROMPT = """RULES:
    Never guess or assume file contents.
 2. When creating new files, use write_file. When modifying existing files, always use patch_file
    to replace only the specific targeted code blocks and preserve file integrity.
+   Read the file with read_file first; edits to unread or changed files are refused.
+   If patch_file says the target was not found, copy the target exactly from the
+   closest text it shows and retry once.
 3. When testing calculations or standalone algorithms, use run_code tool.
    When verifying bug fixes, test passes, or regressions, use run_tests tool to execute pytest.
 4. Use list_directory to understand project structure before project-level questions.
@@ -137,6 +140,7 @@ class Agent:
         window = getattr(provider, "context_size", None)
         self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
+        self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -216,9 +220,12 @@ class Agent:
         iteration = 0
         executed_tools = set()
         duplicate_counts = {}
+        failed_counts: Dict[str, int] = {}
         force_final = False
         tool_errors = []
+        unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
         window_scale = 1.0
+        self.unresolved_errors = []
         try:
             while iteration < effective_max_iter:
                 iteration += 1
@@ -324,8 +331,17 @@ class Agent:
                             executed_tools.add(tool_sig)
                             result = execute_tool(tool_call.name, tool_call.args)
 
+                        error_key = str(tool_call.args.get("path") or tool_call.name)
                         if str(result).startswith("ERROR:"):
                             tool_errors.append(str(result))
+                            unresolved[error_key] = str(result)
+                            # A failed call may legitimately be retried unchanged (e.g. after
+                            # read_file). Only a repeated failure counts as a loop.
+                            failed_counts[tool_sig] = failed_counts.get(tool_sig, 0) + 1
+                            if failed_counts[tool_sig] < 2:
+                                executed_tools.discard(tool_sig)
+                        elif not str(result).startswith("[SYSTEM"):
+                            unresolved.pop(error_key, None)  # a later success on the same file fixes it
                         duration = time.time() - start
 
                         if self.event_callback:
@@ -353,8 +369,9 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     final_text = response.text
-                    if tool_errors:
-                        final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(tool_errors))
+                    self.unresolved_errors = list(unresolved.values())
+                    if self.unresolved_errors:
+                        final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
                     if self.event_callback:
                         self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
                     
@@ -368,5 +385,6 @@ class Agent:
                     return final_text
         finally:
             display.stop_status(status)
+            self.unresolved_errors = list(unresolved.values())
 
         return "Max tool iterations reached. Please try a more specific question."

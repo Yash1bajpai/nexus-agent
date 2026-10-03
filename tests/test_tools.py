@@ -69,6 +69,7 @@ def test_get_readonly_tools():
 def test_patch_file_success(tmp_path: Path):
     target = tmp_path / "mod.py"
     target.write_text("def hello():\n    print('old')\n", encoding="utf-8")
+    execute_tool("read_file", {"path": str(target)})
     res = execute_tool("patch_file", {
         "path": str(target),
         "target": "print('old')",
@@ -89,6 +90,7 @@ def test_patch_file_not_found(tmp_path: Path):
 def test_patch_file_target_not_found(tmp_path: Path):
     target = tmp_path / "sample.py"
     target.write_text("x = 10\n", encoding="utf-8")
+    execute_tool("read_file", {"path": str(target)})
     res = execute_tool("patch_file", {
         "path": str(target),
         "target": "y = 20",
@@ -99,6 +101,7 @@ def test_patch_file_target_not_found(tmp_path: Path):
 def test_patch_file_multiple_occurrences(tmp_path: Path):
     target = tmp_path / "multi.txt"
     target.write_text("item item item", encoding="utf-8")
+    execute_tool("read_file", {"path": str(target)})
     # Default: multiple blocked
     res_blocked = execute_tool("patch_file", {
         "path": str(target),

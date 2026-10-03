@@ -196,6 +196,8 @@ def test_write_file_creates_backup_on_overwrite(tmp_path: Path):
     from nexus_agent_ai.agent.tools import execute_write_file
     target = tmp_path / "code.py"
     target.write_text("value = 1", encoding="utf-8")
+    from nexus_agent_ai.agent.tools import execute_read_file
+    execute_read_file(str(target))
     res = execute_write_file(str(target), "value = 2")
     assert "backup saved" in res
     bak_file = tmp_path / "code.py.bak"

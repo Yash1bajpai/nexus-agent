@@ -49,6 +49,45 @@ def _safe_git_run(args: List[str]) -> subprocess.CompletedProcess:
         check=False
     )
 
+# Files the model has read (or written) in this process, with their state at that time.
+# Edits are only allowed on files whose current state matches, so a patch is always
+# based on content the model has actually seen.
+_FILE_STATE: Dict[str, tuple] = {}
+
+
+def _file_state(p: Path):
+    try:
+        st = p.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _remember_file(p: Path) -> None:
+    state = _file_state(p)
+    if state is not None:
+        _FILE_STATE[str(p)] = state
+
+
+def reset_file_tracking() -> None:
+    """Forget which files were read (used by tests and /clear)."""
+    _FILE_STATE.clear()
+
+
+def _check_read_before_edit(p: Path, path: str) -> str | None:
+    """Return an error string unless the existing file was read and is unchanged since."""
+    if not p.exists():
+        return None
+    known = _FILE_STATE.get(str(p))
+    if known is None:
+        return (f"ERROR: Read '{path}' with read_file before editing it, "
+                "so the edit is based on its current content.")
+    if known != _file_state(p):
+        return (f"ERROR: '{path}' changed on disk since you last read it. "
+                "Read it again with read_file, then retry the edit.")
+    return None
+
+
 def execute_read_file(path: str) -> str:
     """Read the contents of any file and return it as a string."""
     try:
@@ -62,7 +101,9 @@ def execute_read_file(path: str) -> str:
             return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
 
         with open(p, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+            text = f.read()
+        _remember_file(p)
+        return text
     except FileNotFoundError:
         return f"ERROR: File not found: {path}"
     except PermissionError:
@@ -111,6 +152,10 @@ def execute_write_file(path: str, content: str) -> str:
         if _is_sensitive_path(p):
             return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
 
+        unread = _check_read_before_edit(p, path)
+        if unread:
+            return unread
+
         syntax_error = _validate_python_content(p, content)
         if syntax_error:
             return syntax_error
@@ -128,12 +173,57 @@ def execute_write_file(path: str, content: str) -> str:
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
+        _remember_file(p)
         backup_msg = f" (backup saved to {p.name}.bak)" if backup_created else ""
         return f"Successfully wrote {len(content)} characters to {path}{backup_msg}"
     except PermissionError:
         return f"ERROR: Permission denied writing to: {path}"
     except Exception as e:
         return f"ERROR: Could not write file: {str(e)}"
+
+def _find_loose_match(content: str, target: str):
+    """Find a unique span equal to target when trailing whitespace is ignored. Returns (start, end) or None."""
+    target_lines = [ln.rstrip() for ln in target.replace("\r\n", "\n").split("\n")]
+    while target_lines and target_lines[-1] == "":
+        target_lines.pop()
+    if not target_lines or not any(target_lines):
+        return None
+    content_lines = content.splitlines(keepends=True)
+    stripped = [ln.rstrip("\r\n").rstrip() for ln in content_lines]
+    n = len(target_lines)
+    hits = [i for i in range(len(stripped) - n + 1) if stripped[i:i + n] == target_lines]
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    start = sum(len(ln) for ln in content_lines[:i])
+    end = start + sum(len(ln) for ln in content_lines[i:i + n])
+    last = content_lines[i + n - 1]
+    if not target.endswith(("\n", "\r\n")) and last.endswith(("\r\n", "\n")):
+        end -= len(last) - len(last.rstrip("\r\n"))
+    return start, end
+
+
+def _target_not_found_message(path: str, content: str, target: str) -> str:
+    """Explain the miss and show the closest real lines so the model can retry accurately."""
+    import difflib
+    msg = (f"ERROR: Target content not found in '{path}'. "
+           "Ensure the target matches existing file content exactly, including whitespace and line breaks.")
+    lines = content.splitlines()
+    t_lines = target.splitlines() or [target]
+    n = max(1, len(t_lines))
+    best_ratio, best_i = 0.0, -1
+    for i in range(0, max(1, len(lines) - n + 1)):
+        window = "\n".join(lines[i:i + n])
+        ratio = difflib.SequenceMatcher(None, window, "\n".join(t_lines)).quick_ratio()
+        if ratio > best_ratio:
+            best_ratio, best_i = ratio, i
+    if best_i >= 0 and best_ratio >= 0.6:
+        real = difflib.SequenceMatcher(None, "\n".join(lines[best_i:best_i + n]), "\n".join(t_lines)).ratio()
+        if real >= 0.5:
+            snippet = "\n".join(f"{best_i + k + 1}: {ln}" for k, ln in enumerate(lines[best_i:best_i + min(n, 12)]))
+            msg += f"\nClosest text in the file (lines {best_i + 1}-{best_i + min(n, 12)}):\n{snippet}\nCopy the target from these lines exactly and retry."
+    return msg
+
 
 def execute_patch_file(path: str, target: str, replacement: str, allow_multiple: bool = False) -> str:
     """Replace target text with replacement text in an existing file."""
@@ -153,22 +243,36 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         if not target:
             return "ERROR: Target string to replace cannot be empty."
 
-        with open(p, "r", encoding="utf-8", errors="replace") as f:
+        unread = _check_read_before_edit(p, path)
+        if unread:
+            return unread
+
+        with open(p, "r", encoding="utf-8", errors="replace", newline="") as f:
             content = f.read()
+
+        note = ""
+        # Line-ending mismatch (CRLF file, LF target) is the most common harmless miss.
+        if "\r\n" in content and "\r\n" not in target and "\n" in target:
+            target = target.replace("\n", "\r\n")
+            replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
 
         count = content.count(target)
         if count == 0:
-            return (
-                f"ERROR: Target content not found in '{path}'. "
-                f"Ensure the target matches existing file content exactly, including whitespace and line breaks."
-            )
-        if count > 1 and not allow_multiple:
+            loose = _find_loose_match(content, target)
+            if loose is not None:
+                start, end = loose
+                new_content = content[:start] + replacement + content[end:]
+                note = " Target matched after ignoring trailing whitespace."
+                count = 1
+            else:
+                return _target_not_found_message(path, content, target)
+        elif count > 1 and not allow_multiple:
             return (
                 f"ERROR: Target content found {count} times in '{path}'. "
                 f"Provide more surrounding context to make the target unique, or set allow_multiple=True."
             )
-
-        new_content = content.replace(target, replacement)
+        else:
+            new_content = content.replace(target, replacement)
         syntax_error = _validate_python_content(p, new_content)
         if syntax_error:
             return syntax_error
@@ -182,11 +286,12 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         except Exception:
             pass
 
-        with open(p, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8", newline="") as f:
             f.write(new_content)
+        _remember_file(p)
 
         backup_msg = f" (backup saved to {p.name}.bak)" if backup_created else ""
-        return f"Successfully patched '{path}': replaced {count} occurrence(s){backup_msg}."
+        return f"Successfully patched '{path}': replaced {count} occurrence(s){backup_msg}.{note}"
     except PermissionError:
         return f"ERROR: Permission denied patching: {path}"
     except Exception as e:
