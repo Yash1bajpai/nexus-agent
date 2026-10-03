@@ -211,17 +211,18 @@ def _target_not_found_message(path: str, content: str, target: str) -> str:
     lines = content.splitlines()
     t_lines = target.splitlines() or [target]
     n = max(1, len(t_lines))
+    flat_target = "\n".join(t_lines)
     best_ratio, best_i = 0.0, -1
     for i in range(0, max(1, len(lines) - n + 1)):
-        window = "\n".join(lines[i:i + n])
-        ratio = difflib.SequenceMatcher(None, window, "\n".join(t_lines)).quick_ratio()
+        sm = difflib.SequenceMatcher(None, "\n".join(lines[i:i + n]), flat_target)
+        if sm.real_quick_ratio() < 0.4 or sm.quick_ratio() < 0.4:
+            continue
+        ratio = sm.ratio()
         if ratio > best_ratio:
             best_ratio, best_i = ratio, i
-    if best_i >= 0 and best_ratio >= 0.6:
-        real = difflib.SequenceMatcher(None, "\n".join(lines[best_i:best_i + n]), "\n".join(t_lines)).ratio()
-        if real >= 0.5:
-            snippet = "\n".join(f"{best_i + k + 1}: {ln}" for k, ln in enumerate(lines[best_i:best_i + min(n, 12)]))
-            msg += f"\nClosest text in the file (lines {best_i + 1}-{best_i + min(n, 12)}):\n{snippet}\nCopy the target from these lines exactly and retry."
+    if best_i >= 0 and best_ratio >= 0.4:
+        snippet = "\n".join(f"{best_i + k + 1}: {ln}" for k, ln in enumerate(lines[best_i:best_i + min(n, 12)]))
+        msg += f"\nClosest text in the file (lines {best_i + 1}-{best_i + min(n, 12)}):\n{snippet}\nCopy the target from these lines exactly and retry."
     return msg
 
 

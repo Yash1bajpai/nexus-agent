@@ -1,0 +1,61 @@
+name: Windows
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,all,web]"
+      - name: Tests
+        shell: pwsh
+        run: python -m pytest tests/ -v --tb=short
+      - name: Entry points and doctor
+        shell: pwsh
+        run: |
+          nexus-agent --version
+          python -m nexus_agent_ai --version
+          nexus-agent doctor
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+      - name: Windows smoke checks (ACL, session ids, CRLF patching, spaces/unicode paths)
+        shell: pwsh
+        run: python scripts/windows_smoke.py
+
+  first-run:
+    # Real model download + chat. Slow (the runner measured ~1 MB/s from Hugging Face), so manual only.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        shell: pwsh
+        run: python -m pip install -e ".[dev,all,web]"
+      - name: First run with small model and one chat
+        shell: pwsh
+        env:
+          NEXUS_AGENT_MODEL_REPO: LiquidAI/LFM2.5-1.2B-Instruct-GGUF
+          NEXUS_AGENT_MODEL_FILENAME: LFM2.5-1.2B-Instruct-Q4_0.gguf
+          NEXUS_AGENT_ASSUME_YES: "1"
+        run: |
+          nexus-agent chat -p local "say hi in five words" 2>&1 | Tee-Object -FilePath chat.log
+          if ($LASTEXITCODE -ne 0) { throw "chat failed with exit code $LASTEXITCODE" }
+          if ((Get-Content chat.log -Raw).Trim().Length -lt 3) { throw "empty chat output" }
