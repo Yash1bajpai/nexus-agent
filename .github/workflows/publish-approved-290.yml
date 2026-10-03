@@ -1,0 +1,36 @@
+name: Publish approved Nexus 2.9.0
+on:
+  push:
+    branches: [release/pypi-2.9.0]
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: >-
+      github.event.head_commit.message == 'release: publish approved nexus-agent-ai 2.9.0'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 98550183cd9f0658e7a8652d6018fc42bc256673
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify approved source and build
+        run: |
+          test "$(git rev-parse HEAD)" = 98550183cd9f0658e7a8652d6018fc42bc256673
+          python -m pip install -e '.[dev,cloud]' build twine
+          python -m pytest -q
+          python -m build
+          python -m twine check dist/*
+          python - <<'PYCODE'
+          import tomllib
+          from pathlib import Path
+          assert tomllib.loads(Path('pyproject.toml').read_text())['project']['version'] == '2.9.0'
+          PYCODE
+      - name: Publish approved artifacts
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.NEXUS_PYPI_290 }}
+          TWINE_NON_INTERACTIVE: '1'
+        run: python -m twine upload --repository-url https://upload.pypi.org/legacy/ dist/*
