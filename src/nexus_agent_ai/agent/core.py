@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 from ..providers.base import BaseProvider, RateLimitError, ProviderResponse
+from . import context
 from .memory import ConversationMemory
 from .tools import get_all_tools, execute_tool
 from ..cli import display
@@ -132,6 +133,10 @@ class Agent:
         self.event_callback = event_callback
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        # Only local llama providers expose a fixed window we can budget against.
+        window = getattr(provider, "context_size", None)
+        self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+        self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -160,6 +165,35 @@ class Agent:
         model_name = getattr(self.provider, "model", "")
         return estimate_cost(model_name, self.total_input_tokens, self.total_output_tokens)
 
+    def _fit(self, messages, tools, scale: float = 1.0):
+        """Trim what is sent to the model so it fits the window. Stored history is untouched."""
+        if not self.context_window:
+            return messages
+        window = int(self.context_window * scale)
+        reserve = min(1024, max(256, window // 4))  # room for the answer
+        overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
+        budget = max(256, window - reserve - overhead)
+        fitted, stats = context.fit_messages(messages, budget)
+        self.last_trim = stats
+        if stats["dropped_messages"] or stats["truncated_messages"]:
+            display.print_warn(
+                f"Context is full: left out {stats['dropped_messages']} older message(s) and cut "
+                f"{stats['truncated_messages']} large item(s) for this request. Use /compact to shrink history."
+            )
+        return fitted
+
+    def context_used(self) -> int:
+        """Estimated tokens the next request would use (history + instructions)."""
+        return context.history_tokens(self.memory.get()) + context.estimate_tokens(self.system) + context.tools_tokens(self.tools)
+
+    def compact(self, keep_turns: int = 2):
+        """Shrink stored history; returns (before_tokens, after_tokens, info)."""
+        before = context.history_tokens(self.memory.get())
+        new, info = context.compact_messages(self.memory.get(), keep_turns=keep_turns)
+        if info["removed_messages"]:
+            self.memory.replace(new)
+        return before, context.history_tokens(self.memory.get()), info
+
     def run(self, user_input: str, stream: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
         processed_input = parse_at_mentions(user_input)
@@ -184,10 +218,12 @@ class Agent:
         duplicate_counts = {}
         force_final = False
         tool_errors = []
+        window_scale = 1.0
         try:
             while iteration < effective_max_iter:
                 iteration += 1
                 display.update_status(status, "Thinking...")
+                send_messages = self._fit(messages, use_tools, window_scale)
 
                 try:
                     if stream and hasattr(self.provider, "stream"):
@@ -196,7 +232,7 @@ class Agent:
                             status = None
                         response = None
                         streamed_text = ""
-                        for item in self.provider.stream(messages=messages, tools=use_tools, system=self.system):
+                        for item in self.provider.stream(messages=send_messages, tools=use_tools, system=self.system):
                             if isinstance(item, ProviderResponse):
                                 response = item
                             elif isinstance(item, str):
@@ -212,7 +248,7 @@ class Agent:
                             response.text = streamed_text
                     else:
                         response = self.provider.complete(
-                            messages=messages,
+                            messages=send_messages,
                             tools=use_tools,
                             system=self.system
                         )
@@ -220,6 +256,14 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     display.print_warn(f"{e.provider} rate limit hit. Switching to next provider...")
+                    raise
+                except Exception as e:
+                    # One retry with a tighter budget when the server says the prompt did not fit.
+                    if self.context_window and window_scale == 1.0 and context.is_context_overflow(e):
+                        window_scale = 0.6
+                        iteration -= 1
+                        display.print_warn("The model rejected the request as too large. Retrying once with a smaller history.")
+                        continue
                     raise
 
                 self.total_input_tokens += response.input_tokens

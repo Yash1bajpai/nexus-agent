@@ -1,6 +1,28 @@
 from typing import Any, Dict, List
 from ..utils.config import MAX_CONVERSATION_MESSAGES
 
+def is_genuine_user_message(msg: Dict[str, Any]) -> bool:
+    if msg.get("role") != "user":
+        return False
+    # OpenAI tool results use role='tool', not 'user' — already excluded above.
+    # Check for tool_call_id / tool_use_id / name at top level (OpenAI-style)
+    if "tool_call_id" in msg or "tool_use_id" in msg or "name" in msg:
+        return False
+    # Gemini: parts containing function_response
+    parts = msg.get("parts")
+    if isinstance(parts, list):
+        for p in parts:
+            if isinstance(p, dict) and "function_response" in p:
+                return False
+    # Anthropic: content is a list of blocks with type='tool_result'
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                return False
+    return True
+
+
 class ConversationMemory:
     """Manages in-memory conversation history with a sliding window limit."""
 
@@ -25,26 +47,7 @@ class ConversationMemory:
         if len(self.messages) <= self.max_messages:
             return
 
-        def _is_genuine_user_msg(msg: Dict[str, Any]) -> bool:
-            if msg.get("role") != "user":
-                return False
-            # OpenAI tool results use role='tool', not 'user' — already excluded above.
-            # Check for tool_call_id / tool_use_id / name at top level (OpenAI-style)
-            if "tool_call_id" in msg or "tool_use_id" in msg or "name" in msg:
-                return False
-            # Gemini: parts containing function_response
-            parts = msg.get("parts")
-            if isinstance(parts, list):
-                for p in parts:
-                    if isinstance(p, dict) and "function_response" in p:
-                        return False
-            # Anthropic: content is a list of blocks with type='tool_result'
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        return False
-            return True
+        _is_genuine_user_msg = is_genuine_user_message
 
         target_idx = len(self.messages) - self.max_messages
 
@@ -78,6 +81,10 @@ class ConversationMemory:
     def get(self) -> List[Dict[str, Any]]:
         """Retrieve a copy of the current message history."""
         return self.messages.copy()
+
+    def replace(self, messages: List[Dict[str, Any]]):
+        """Replace the whole history (used by /compact)."""
+        self.messages = list(messages)
 
     def clear(self):
         """Clear all messages from memory."""

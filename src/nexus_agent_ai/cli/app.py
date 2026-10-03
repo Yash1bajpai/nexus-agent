@@ -224,7 +224,8 @@ def _build_repl_completer():
             slash_cmds = [
                 ("/help", "Show available REPL commands"),
                 ("/clear", "Clear conversation memory"),
-                ("/context", "Show local context window and recovery guidance"),
+                ("/context", "Show context window, usage and recovery guidance"),
+                ("/compact", "Shrink older history to free context"),
                 ("/commit", "Review staged changes & commit"),
                 ("/review", "Review code file: /review <file>"),
                 ("/debug", "Debug error in file: /debug <file> -e <err>"),
@@ -364,14 +365,25 @@ def repl(
                         display.print_info(
                             f"Local context window: {window} tokens (includes instructions, tools, history and output). "
                             "Restart with --context-size <tokens> to change it. Larger windows use more RAM. "
-                            "History is not auto-compacted; /clear clears it, including a persistent session."
+                            "Old turns are dropped and big items cut automatically when a request would not fit; "
+                            "/compact shrinks stored history, /clear clears it (including a persistent session)."
                         )
+                        from ..agent import context as _ctx
+                        display.print_info(_ctx.meter(agent.context_used(), window))
+                    continue
+                elif lower_input == "/compact":
+                    before, after, info = agent.compact()
+                    if not info["removed_messages"]:
+                        display.print_info("Nothing to compact yet (only the last 2 turns are kept as they are).")
+                    else:
+                        display.print_info(f"Compacted {info['turns_summarized']} earlier turn(s): history ~{before} -> ~{after} tokens.")
                     continue
                 elif lower_input in ("/help", "help"):
                     display.print_info(
                         "Available REPL commands:\n"
                         "  /clear          - Clear conversation context\n"
-                        "  /context        - Show context window and recovery guidance\n"
+                        "  /context        - Show context window, usage and recovery guidance\n"
+                        "  /compact        - Shrink older history to free context\n"
                         "  /commit         - Review diff & commit changes\n"
                         "  /review <file>  - Review a source file\n"
                         "  /debug <file>   - Debug an error in a file\n"
@@ -489,6 +501,9 @@ def repl(
                 if no_stream:
                     display.print_response(response_text)
                 display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+                if getattr(agent, "context_window", None):
+                    from ..agent import context as _ctx
+                    typer.echo(_ctx.meter(agent.context_used(), agent.context_window))
             except (KeyboardInterrupt, EOFError):
                 typer.echo("\nSession ended. Goodbye!")
                 break

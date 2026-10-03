@@ -91,6 +91,17 @@ class SQLiteMemory:
             rows = cursor.fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def replace(self, messages: List[Dict[str, Any]]):
+        """Replace the stored history for this session (used by /compact)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (self.session_id,))
+            for message in messages:
+                conn.execute(
+                    "INSERT INTO conversation_history (session_id, role, message_json) VALUES (?, ?, ?)",
+                    (self.session_id, message.get("role", "unknown"), json.dumps(message)),
+                )
+            conn.commit()
+
     def clear(self):
         """Clear session history from database."""
         with sqlite3.connect(self.db_path) as conn:
