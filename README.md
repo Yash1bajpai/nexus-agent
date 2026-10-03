@@ -20,7 +20,7 @@ nexus-agent --version
 nexus-agent --help
 ```
 
-**Windows:** if PowerShell says `nexus-agent` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder printed by `nexus-agent doctor` to PATH. Windows support is covered by unit tests that simulate Windows paths, line endings and permissions on Linux; it has been exercised by hand on one Windows 11 PC, not by Windows CI.
+**Windows:** if PowerShell says `nexus-agent` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder printed by `nexus-agent doctor` to PATH. Windows support is covered by unit tests that simulate Windows paths, line endings and permissions on Linux; install and startup were seen on one Windows PC, and there is no Windows CI.
 
 For this checkout:
 
