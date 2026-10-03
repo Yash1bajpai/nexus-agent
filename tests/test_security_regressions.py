@@ -122,6 +122,8 @@ def test_python_syntax_rejected_without_mutation(tmp_path, operation):
     p = tmp_path / "calculator.py"
     original = "def multiply(a, b):\n    return a + b\n"
     p.write_text(original)
+    from nexus_agent_ai.agent.tools import execute_read_file
+    execute_read_file(str(p))
     if operation == "write":
         result = execute_write_file(str(p), "def broken(:")
     else:

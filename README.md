@@ -147,6 +147,10 @@ Python writes and patches are syntax-checked before changing the file. This dete
 
 `patch_file` creates a backup and requires a unique target unless multiple replacements are explicitly requested. Inspect the backup and diff. Workspace path checks resolve symlinks; they are not OS-level isolation or protection against concurrent filesystem changes.
 
+**Edit safety.** `write_file` (over an existing file) and `patch_file` are refused unless the file was read with `read_file` (or an `@file` mention) in this run and has not changed on disk since. If a patch target is not found, Nexus tolerates CRLF line endings and trailing-whitespace differences, otherwise it returns the closest real text so the model can retry. `nexus-agent chat` exits with code 1 if a tool error was never fixed by the end of the run, or the iteration limit was hit; errors the model recovered from do not count.
+
+**API keys.** Keys entered during setup are typed hidden (not echoed) and saved to `~/.nexus-agent/.env`, created with mode 0600 inside a 0700 folder on Linux and macOS. On Windows the file sits in your user profile folder; POSIX permission bits do not apply there. `nexus-agent doctor` warns if the key file is readable by other users.
+
 The REPL stores session history under `~/.nexus-agent`. File context may be retained in that history. Both persistent and in-memory history preserve user-turn/tool-result boundaries when pruning; an active long turn can exceed the nominal message limit rather than lose its original request.
 
 CodeForge-250M integration is planned, not a shipped inference backend.

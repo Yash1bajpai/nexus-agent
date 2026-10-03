@@ -68,6 +68,14 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
     keys = [k for k in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY") if os.getenv(k)]
     checks.append(("info", "Cloud keys", ", ".join(keys) if keys else "none set (local mode works without them)"))
 
+    env_file = Path.home() / ".nexus-agent" / ".env"
+    if env_file.exists() and os.name != "nt":
+        mode = env_file.stat().st_mode & 0o777
+        if mode & 0o077:
+            checks.append(("warn", "Key file", f"{env_file} is readable by other users (mode {oct(mode)}). Fix: chmod 600 {env_file}"))
+        else:
+            checks.append(("ok", "Key file", f"{env_file} is private (mode {oct(mode)})"))
+
     home = Path.home() / ".nexus-agent"
     try:
         home.mkdir(parents=True, exist_ok=True)
