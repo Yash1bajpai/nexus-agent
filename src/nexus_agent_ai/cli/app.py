@@ -16,6 +16,12 @@ for stream in (sys.stdout, sys.stderr):
             except Exception:
                 pass
 
+import os
+if sys.platform == "win32":
+    # Without Windows Developer Mode, huggingface_hub cannot use symlinks and warns on every
+    # download. The cache then keeps full copies (more disk use) but works the same.
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 from ..utils.config import DEFAULT_PROVIDER, ConfigError
 from ..agent.memory import ConversationMemory
 from ..agent.core import Agent
