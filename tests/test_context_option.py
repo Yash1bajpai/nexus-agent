@@ -114,7 +114,9 @@ def test_help_documents_option():
     for cmd in ["chat", "repl"]:
         result = CliRunner().invoke(cli.app, [cmd, "--help"])
         assert result.exit_code == 0
-        assert "--context-size" in result.output
+        import re
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)  # CI renders Rich help with ANSI codes
+        assert "--context-size" in plain
 
 def test_server_launch_receives_window(tmp_path, monkeypatch):
     mod = importlib.import_module("nexus_agent_ai.providers.local_provider")
