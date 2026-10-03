@@ -98,7 +98,7 @@ Priority: `--context-size` > `NEXUS_CONTEXT_SIZE` > 4096. Values must be integer
 
 This option currently applies to local llama-server and llama-cpp-python, not cloud providers, `auto`, Ollama, or Transformers. Unsupported routes fail clearly instead of silently ignoring the option. An already-running server must be stopped before using an explicit override because its window is not verified. In REPL, `/context` shows the configured window and restart guidance. Changing the window requires a restart; the history can be resumed using the same `--persist --session` ID.
 
-**Long-session caveat:** history is still limited by message count, not token count. A large file or a long session can overflow even a bigger window. Token-aware trimming and automatic compaction are separate follow-up work. `/clear` removes conversation history (including the current persistent session); use it only if you want to discard that context.
+**Long sessions:** history is trimmed by estimated tokens, not message count. Before each request Nexus drops the oldest whole turns, and cuts the largest file or tool outputs (keeping their start and end), so the request fits the window. If the server still rejects it as too large, Nexus retries once with a tighter budget. After each REPL turn a meter shows how full the window is. `/compact` replaces older turns with a short note (earlier requests, files and tools touched, built without calling the model) and keeps the last 2 turns. `/clear` removes all history, including the current persistent session. Token counts are estimates (about 3.5 characters per token), and the meter only applies to local models with a known window.
 
 
 ### First run and model fit

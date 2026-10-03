@@ -39,7 +39,7 @@ def test_option_reaches_factory(command, monkeypatch):
     assert calls == [("local", 8192)]
     if command == "repl":
         assert "8192 tokens" in result.output
-        assert "not auto-compacted" in result.output
+        assert "/compact" in result.output and "context:" in result.output
 
 @pytest.mark.parametrize("command", ["chat", "repl"])
 @pytest.mark.parametrize("value", ["511", "0", "-1", "abc", "8192.5"])
