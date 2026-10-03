@@ -162,16 +162,21 @@ class LocalProvider(BaseProvider):
       4. Ollama (external HTTP API, must be pre-installed)
     """
 
-    def __init__(self, model_id: str = None, filename: str = None):
+    def __init__(self, model_id: str = None, filename: str = None, context_size: Optional[int] = None):
         """Create a local provider for any HuggingFace GGUF repo.
 
         Priority: explicit args > NEXUS_AGENT_MODEL_REPO / NEXUS_AGENT_MODEL_FILENAME
         env vars > built-in LiquidAI LFM2.5-2.6B defaults.
         """
         self.model_id = model_id or os.getenv("NEXUS_AGENT_MODEL_REPO", _DEFAULT_REPO)
-        self.context_size = int(os.getenv("NEXUS_CONTEXT_SIZE", "4096"))
-        if self.context_size < 512:
-            raise ValueError("NEXUS_CONTEXT_SIZE must be at least 512")
+        self._explicit_context_size = context_size is not None
+        raw_context = context_size if context_size is not None else os.getenv("NEXUS_CONTEXT_SIZE", "4096")
+        try:
+            self.context_size = int(raw_context)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Context size must be an integer of at least 512 tokens") from exc
+        if isinstance(raw_context, bool) or (isinstance(raw_context, float) and raw_context != self.context_size) or self.context_size < 512:
+            raise ValueError("Context size must be an integer of at least 512 tokens")
         self.model = self.model_id
         self.filename = filename or os.getenv("NEXUS_AGENT_MODEL_FILENAME", _DEFAULT_FILENAME)
         self._tokenizer = None
@@ -230,6 +235,8 @@ class LocalProvider(BaseProvider):
         try:
             import torch
             if torch.cuda.is_available():
+                if self._explicit_context_size:
+                    raise RuntimeError("--context-size currently supports llama-server and llama-cpp-python, not the Transformers engine.")
                 gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "CUDA GPU"
                 print(f"🟢 Dedicated GPU Detected ({gpu_name}). Using Transformers GGUF Engine...")
                 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -262,6 +269,8 @@ class LocalProvider(BaseProvider):
             # A server may already be running (e.g. started manually) — use it
             # before attempting any binary download.
             if self._is_server_alive():
+                if self._explicit_context_size:
+                    raise RuntimeError("A llama-server is already running; its context size is unverified. Stop it before using --context-size.")
                 print(f"✅ llama-server already running on port {self._server_port}")
                 self._model_instance = "llama_server"
                 return
@@ -283,6 +292,8 @@ class LocalProvider(BaseProvider):
                 print(f"   Log: {_SERVER_DIR / 'server.log'}")
 
         # Path 4: Ollama (external HTTP API)
+        if self._explicit_context_size:
+            raise RuntimeError("--context-size requires llama-server or llama-cpp-python; it cannot be applied to the Ollama fallback.")
         print("💻 CPU Mode: llama-server unavailable. Checking Ollama...")
         print("   If you don't have Ollama, install it from: https://ollama.com")
         self._model_instance = "cpu_ollama_or_fallback"
@@ -363,6 +374,8 @@ class LocalProvider(BaseProvider):
         """Download llama-server if needed and start it with the GGUF model."""
         # Check if already running on our port (avoids a needless binary download)
         if self._is_server_alive():
+            if self._explicit_context_size:
+                raise RuntimeError("A llama-server is already running; its context size is unverified. Stop it before using --context-size.")
             print(f"✅ llama-server already running on port {self._server_port}")
             self._model_instance = "llama_server"
             return
@@ -500,7 +513,7 @@ class LocalProvider(BaseProvider):
         except urllib.error.HTTPError as exc:
             detail = exc.read(4096).decode("utf-8", errors="replace")
             raise RuntimeError(f"Local model request failed (HTTP {exc.code}): {detail}. "
-                               "If context is exceeded, shorten the input/history or increase NEXUS_CONTEXT_SIZE within your RAM budget.") from exc
+                               "If context is exceeded, shorten the input/history or restart with --context-size <tokens> or increase NEXUS_CONTEXT_SIZE within your model/RAM limits. In REPL, /clear clears history.") from exc
         with response as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()

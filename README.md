@@ -87,7 +87,19 @@ Official model information:
 - [LFM2.5-2.6B](https://docs.liquid.ai/lfm/models/lfm25-2.6b): 128K model context and training for agent workloads.
 - [Tool-use format](https://docs.liquid.ai/lfm/key-concepts/tool-use): Pythonic calls by default; JSON calls can be requested.
 
-A model's advertised maximum context is not Nexus's configured context. Nexus defaults to **4096**, with one llama-server slot. Set `NEXUS_CONTEXT_SIZE` to change it; a larger context consumes more RAM. Local HTTP errors now retain the server detail, including context overflow. Shorten input/history or choose a suitable context/model if a request will not fit.
+A model's advertised maximum context is not Nexus's configured context. Nexus defaults to **4096**, with one llama-server slot. Use `--context-size` on `chat` or `repl` to change it for that run, or set `NEXUS_CONTEXT_SIZE` as a default; a larger context consumes more RAM. Local HTTP errors now retain the server detail, including context overflow. Shorten input/history or choose a suitable context/model if a request will not fit.
+
+```bash
+nexus-agent chat "Explain this project" -p local --context-size 8192
+nexus-agent repl -p local --context-size 8192 --persist --session my-project
+```
+
+Priority: `--context-size` > `NEXUS_CONTEXT_SIZE` > 4096. Values must be integer token counts of at least 512. The setting covers the whole window, including instructions, tool schemas, conversation, and generated output. It does not enlarge a model's trained limit, compact history, or guarantee that your RAM can hold the requested window. Start with 4096 on low-memory machines and raise it only within your model and hardware limits.
+
+This option currently applies to local llama-server and llama-cpp-python, not cloud providers, `auto`, Ollama, or Transformers. Unsupported routes fail clearly instead of silently ignoring the option. An already-running server must be stopped before using an explicit override because its window is not verified. In REPL, `/context` shows the configured window and restart guidance. Changing the window requires a restart; the history can be resumed using the same `--persist --session` ID.
+
+**Long-session caveat:** history is still limited by message count, not token count. A large file or a long session can overflow even a bigger window. Token-aware trimming and automatic compaction are separate follow-up work. `/clear` removes conversation history (including the current persistent session); use it only if you want to discard that context.
+
 
 You can select a smaller model explicitly:
 

@@ -48,7 +48,7 @@ app = typer.Typer(
 )
 
 
-def _make_local_provider() -> Tuple[Any, str]:
+def _make_local_provider(context_size: Optional[int] = None) -> Tuple[Any, str]:
     """Build the default local provider and pre-flight the inference engine.
 
     Downloads/verifies llama-server up front (idempotent, ~50 MB once) so a
@@ -56,7 +56,7 @@ def _make_local_provider() -> Tuple[Any, str]:
     pre-flight prevents is only discoverable after the agent loop starts.
     """
     from ..providers.local_provider import LocalProvider, ensure_llama_server_binary
-    prov = LocalProvider()
+    prov = LocalProvider(context_size=context_size) if context_size is not None else LocalProvider()
     prov.setup_model()
     try:
         ensure_llama_server_binary(verbose=False)
@@ -65,7 +65,7 @@ def _make_local_provider() -> Tuple[Any, str]:
     return prov, f"Local ({prov.filename})"
 
 
-def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
+def get_provider_instance(provider_name: Any, context_size: Optional[int] = None) -> Tuple[Any, str]:
     """
     Factory to return (provider_instance, resolved_name).
     Returns a resolved name so print_header() always shows the actual provider,
@@ -76,6 +76,13 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
     if not isinstance(provider_name, str):
         provider_name = str(provider_name or DEFAULT_PROVIDER)
     name_clean = provider_name.lower().strip()
+    if context_size is not None:
+        if name_clean not in {"local", "liquid", "lfm", "default", "demo"}:
+            raise ConfigError("--context-size requires --provider local (not cloud, ollama, or auto).")
+        display.print_warn(
+            f"Local context: {context_size} tokens. Larger windows use more RAM; "
+            "stay within your model's supported context. This does not compact history."
+        )
 
     if name_clean == "anthropic":
         from ..providers.anthropic_provider import AnthropicProvider
@@ -87,7 +94,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         from ..providers.openai_provider import OpenAIProvider
         return OpenAIProvider(), "openai"
     elif name_clean in ["local", "liquid", "lfm", "default", "demo"]:
-        return _make_local_provider()
+        return _make_local_provider(context_size=context_size)
     elif name_clean in ["ollama"]:
         import os
         from ..providers.openai_provider import OpenAIProvider
@@ -113,7 +120,7 @@ def get_provider_instance(provider_name: Any) -> Tuple[Any, str]:
         return fb, f"auto ({fb._current_name})"
     else:
         display.print_warn(f"Unknown provider '{provider_name}'. Using local fallback.")
-        return _make_local_provider()
+        return _make_local_provider(context_size=context_size)
 
 
 @app.command()
@@ -125,12 +132,15 @@ def chat(
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
     persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Local llama context window in tokens (default: NEXUS_CONTEXT_SIZE or 4096). Larger windows use more RAM."),
 ):
     """Execute a single-turn chat instruction with autonomous tool calling."""
     if hasattr(persist, "default"):
         persist = bool(persist.default)
     if hasattr(session, "default"):
         session = session.default
+    if hasattr(context_size, "default"):
+        context_size = context_size.default
     if not query or not query.strip():
         display.print_error("Query cannot be empty.")
         raise typer.Exit(code=1)
@@ -138,7 +148,7 @@ def chat(
         display.print_error("max-iterations must be a positive integer > 0.")
         raise typer.Exit(code=1)
     try:
-        prov, resolved_name = get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, context_size=context_size) if context_size is not None else get_provider_instance(provider)
         if persist:
             try:
                 from ..agent.persistence import SQLiteMemory
@@ -183,6 +193,7 @@ def _build_repl_completer():
             slash_cmds = [
                 ("/help", "Show available REPL commands"),
                 ("/clear", "Clear conversation memory"),
+                ("/context", "Show local context window and recovery guidance"),
                 ("/commit", "Review staged changes & commit"),
                 ("/review", "Review code file: /review <file>"),
                 ("/debug", "Debug error in file: /debug <file> -e <err>"),
@@ -237,6 +248,7 @@ def repl(
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
     persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Local llama context window in tokens (default: NEXUS_CONTEXT_SIZE or 4096). Larger windows use more RAM."),
 ):
     """Start an interactive multi-turn REPL chat session."""
     if hasattr(provider, "default"):
@@ -251,11 +263,13 @@ def repl(
         persist = bool(persist.default)
     if hasattr(session, "default"):
         session = session.default
+    if hasattr(context_size, "default"):
+        context_size = context_size.default
     if max_iterations <= 0:
         display.print_error("max-iterations must be a positive integer > 0.")
         raise typer.Exit(code=1)
     try:
-        prov, resolved_name = get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, context_size=context_size) if context_size is not None else get_provider_instance(provider)
         if persist:
             try:
                 from ..agent.persistence import SQLiteMemory
@@ -311,10 +325,22 @@ def repl(
                     agent.memory.clear()
                     display.print_info("Conversation memory cleared.")
                     continue
+                elif lower_input == "/context":
+                    window = getattr(prov, "context_size", None)
+                    if window is None:
+                        display.print_info("Context window is managed by this provider; --context-size applies only to local llama engines.")
+                    else:
+                        display.print_info(
+                            f"Local context window: {window} tokens (includes instructions, tools, history and output). "
+                            "Restart with --context-size <tokens> to change it. Larger windows use more RAM. "
+                            "History is not auto-compacted; /clear clears it, including a persistent session."
+                        )
+                    continue
                 elif lower_input in ("/help", "help"):
                     display.print_info(
                         "Available REPL commands:\n"
                         "  /clear          - Clear conversation context\n"
+                        "  /context        - Show context window and recovery guidance\n"
                         "  /commit         - Review diff & commit changes\n"
                         "  /review <file>  - Review a source file\n"
                         "  /debug <file>   - Debug an error in a file\n"
