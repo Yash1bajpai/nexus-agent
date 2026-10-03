@@ -48,6 +48,23 @@ app = typer.Typer(
 )
 
 
+def _resolve_session(persist: bool, session: Optional[str], continue_last: bool):
+    """Apply --continue: resume the most recently used session (any folder)."""
+    if not continue_last:
+        return persist, session
+    from ..agent.persistence import SQLiteMemory
+    if session is None:
+        try:
+            sessions = SQLiteMemory.list_sessions()
+        except Exception:
+            sessions = []
+        if sessions:
+            session = sessions[0]["session_id"]
+        else:
+            display.print_info("No earlier session found, starting a new one.")
+    return True, session
+
+
 def _fit_local_model(prov, context_size, kwargs):
     """Keep an explicit model choice; otherwise pick by free RAM and ask before downloading."""
     import os
@@ -158,6 +175,7 @@ def chat(
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
     persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
+    continue_last: bool = typer.Option(False, "--continue", "-c", help="Resume the most recent saved session."),
     context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Local llama context window in tokens (default: NEXUS_CONTEXT_SIZE or 4096). Larger windows use more RAM."),
 ):
     """Execute a single-turn chat instruction with autonomous tool calling."""
@@ -167,10 +185,12 @@ def chat(
         session = session.default
     if hasattr(context_size, "default"):
         context_size = context_size.default
+    if hasattr(continue_last, "default"):
+        continue_last = bool(continue_last.default)
     if query is None or (hasattr(query, "default") and query.default is None):
         # `nexus-agent chat` with no question behaves like `nexus-agent repl`.
         repl(provider=provider, verbose=True, no_stream=True, max_iterations=max_iterations,
-             persist=persist, session=session, context_size=context_size)
+             persist=True, session=session, context_size=context_size, continue_last=continue_last)
         return
     if not query.strip():
         display.print_error("Query cannot be empty.")
@@ -179,6 +199,7 @@ def chat(
         display.print_error("max-iterations must be a positive integer > 0.")
         raise typer.Exit(code=1)
     try:
+        persist, session = _resolve_session(persist, session, continue_last)
         prov, resolved_name = get_provider_instance(provider, context_size=context_size) if context_size is not None else get_provider_instance(provider)
         if persist:
             try:
@@ -281,8 +302,9 @@ def repl(
     verbose: bool = typer.Option(True, "--verbose/--no-verbose", "-v", help="Show verbose ReAct tool trace (default: ON)."),
     no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (by default OFF in REPL mode for clean multi-turn prompts)."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
-    persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
+    persist: bool = typer.Option(True, "--persist/--no-persist", help="Save the conversation so it resumes next time in this folder (default: on). Use --no-persist for a throwaway session."),
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
+    continue_last: bool = typer.Option(False, "--continue", "-c", help="Resume the most recent saved session."),
     context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Local llama context window in tokens (default: NEXUS_CONTEXT_SIZE or 4096). Larger windows use more RAM."),
 ):
     """Start an interactive multi-turn REPL chat session."""
@@ -300,16 +322,23 @@ def repl(
         session = session.default
     if hasattr(context_size, "default"):
         context_size = context_size.default
+    if hasattr(continue_last, "default"):
+        continue_last = bool(continue_last.default)
     if max_iterations <= 0:
         display.print_error("max-iterations must be a positive integer > 0.")
         raise typer.Exit(code=1)
     try:
+        persist, session = _resolve_session(persist, session, continue_last)
         prov, resolved_name = get_provider_instance(provider, context_size=context_size) if context_size is not None else get_provider_instance(provider)
         if persist:
             try:
                 from ..agent.persistence import SQLiteMemory
                 memory = SQLiteMemory(session_id=session)
-                typer.echo(f"  [i]Persistent mode: session '{memory.session_id}' saved to ~/.nexus-agent/history.db[/i]\n")
+                earlier = len(memory.get())
+                if earlier:
+                    display.print_info(f"Resumed session '{memory.session_id}' ({earlier} messages). /clear starts fresh; --no-persist skips saving.")
+                else:
+                    display.print_info(f"New session '{memory.session_id}', saved to ~/.nexus-agent/history.db. Resume later with --continue.")
             except Exception as e:
                 display.print_warn(f"SQLite persistence unavailable ({e}), falling back to in-memory.")
                 memory = ConversationMemory()
