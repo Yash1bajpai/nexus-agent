@@ -30,25 +30,19 @@ jobs:
           nexus-agent --version
           python -m nexus_agent_ai --version
           nexus-agent doctor
-      - name: Paths with spaces and unicode, CRLF patching
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+      - name: Windows smoke checks (ACL, session ids, CRLF patching, spaces/unicode paths)
         shell: pwsh
-        run: |
-          $d = Join-Path $env:RUNNER_TEMP 'my proj é'
-          New-Item -ItemType Directory -Force $d | Out-Null
-          [IO.File]::WriteAllText("$d\calc.py", "def add(a,b):`r`n    return a - b`r`n")
-          Set-Location $d
-          python -c "from nexus_agent_ai.agent.tools import execute_tool as x; print(x('read_file',{'path':'calc.py'})); print(x('patch_file',{'path':'calc.py','target':'return a - b','replacement':'return a + b'}))"
-          Get-Content calc.py
-      - name: Key file and session id on Windows
-        shell: pwsh
-        run: |
-          python -c "import os,tempfile; from pathlib import Path; from nexus_agent_ai.cli import onboarding as o; print([n for n in dir(o) if 'env' in n.lower() or 'perm' in n.lower()])"
-          python -c "from nexus_agent_ai.agent.persistence import SQLiteMemory as S; print(S.__name__)"
+        run: python scripts/windows_smoke.py
       - name: First run with small model and one chat
         shell: pwsh
         env:
           NEXUS_AGENT_MODEL_REPO: LiquidAI/LFM2.5-1.2B-Instruct-GGUF
           NEXUS_AGENT_MODEL_FILENAME: LFM2.5-1.2B-Instruct-Q4_0.gguf
           NEXUS_AGENT_ASSUME_YES: "1"
-        run: nexus-agent chat -p local "say hi in five words"
+        run: |
+          $out = nexus-agent chat -p local "say hi in five words" | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or $out.Trim().Length -lt 3) { throw "chat failed" }
+          python -c "import os; from pathlib import Path; print(sorted(p.name for p in (Path.home()/'.cache'/'huggingface'/'hub').glob('models--*')))"
         timeout-minutes: 20

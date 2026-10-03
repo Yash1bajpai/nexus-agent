@@ -50,8 +50,18 @@ ENV_FILE = USER_CONFIG_DIR / ".env"
 
 
 def _restrict_permissions(path: Path, mode: int) -> None:
-    """Best-effort chmod. Windows ignores POSIX bits; its profile folder is already per-user."""
+    """Best-effort owner-only access. POSIX: chmod. Windows: icacls, drop inherited ACEs
+    and grant only the current user (chmod bits do nothing there)."""
     if os.name == "nt":
+        try:
+            import getpass
+            import subprocess
+            user = os.environ.get("USERNAME") or getpass.getuser()
+            perm = "(OI)(CI)F" if Path(path).is_dir() else "F"
+            subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:{perm}"],
+                           capture_output=True, check=False, timeout=20)
+        except Exception:
+            pass
         return
     try:
         os.chmod(path, mode)
@@ -479,12 +489,10 @@ def _step_system_specs():
     if os.getenv("NEXUS_AGENT_MODEL_REPO") or os.getenv("NEXUS_AGENT_MODEL_FILENAME"):
         _print("  Keeping your configured local model; hardware recommendation was not applied.")
         return
-    _write_env_key("NEXUS_AGENT_MODEL_REPO", cfg["repo"])
-    _write_env_key("NEXUS_AGENT_MODEL_FILENAME", cfg["filename"])
-    os.environ["NEXUS_AGENT_MODEL_REPO"] = cfg["repo"]
-    os.environ["NEXUS_AGENT_MODEL_FILENAME"] = cfg["filename"]
-    _print(f"  [green]✓ Auto-configured model: {cfg['filename']} ({cfg['size']}) — {cfg['note']}[/green]" if console else
-           f"  ✓ Auto-configured model: {cfg['filename']} ({cfg['size']}) — {cfg['note']}")
+    # Do not persist the recommendation: an explicit env/.env model would skip the
+    # free-RAM check and the size/speed confirmation at first launch.
+    _print(f"  [green]✓ Suggested model: {cfg['filename']} ({cfg['size']}) — {cfg['note']}. Final choice uses free RAM when you first run it.[/green]" if console else
+           f"  ✓ Suggested model: {cfg['filename']} ({cfg['size']}) — {cfg['note']}. Final choice uses free RAM when you first run it.")
     if cfg["alt_cmd"]:
         _print(f"  [dim]Want a bigger model? Run:[/dim] {cfg['alt_cmd']}" if console else
                f"  Want a bigger model? Run: {cfg['alt_cmd']}")
@@ -519,11 +527,16 @@ def _step_default_provider() -> str:
     return current
 
 
+def _size_txt(size) -> str:
+    """Size label with exactly one leading ~ (recommended sizes already carry one)."""
+    return "~" + str(size).lstrip("~").strip()
+
+
 def _step_local_model_setup():
     """[4/4] - Pre-install the llama-server engine, then offer the model weights download."""
     _print("\n[bold][[4/4]][/bold] [cyan]Local Model Setup[/cyan]" if console else "\n[4/4] Local Model Setup")
     cfg = recommended_model_config(detect_system_specs())
-    _print(f"  Model selected for your hardware: {cfg['filename']} ({cfg['size']})")
+    _print(f"  Suggested model: {cfg['filename']} ({_size_txt(cfg['size'])})")
 
     # The inference engine is mandatory for local mode: without llama-server
     # the LFM model cannot run at all. Install it unconditionally (not
@@ -542,10 +555,10 @@ def _step_local_model_setup():
         pass
 
     try:
-        consent = _input(f"  Download model weights now? Requires ~{cfg['size']} disk space. (y/N): ").strip().lower()
+        consent = _input(f"  Download model weights now? Requires {_size_txt(cfg['size'])} disk space. (y/N): ").strip().lower()
         if consent != "y":
-            _print("  [dim]Skipped. Run `nexus-agent pull-model` later to download when needed.[/dim]" if console else
-                   "  Skipped. Run `nexus-agent pull-model` later to download when needed.")
+            _print("  [dim]Skipped. You will be asked again, with size and speed, before anything downloads.[/dim]" if console else
+                   "  Skipped. You will be asked again, with size and speed, before anything downloads.")
             return
     except (EOFError, KeyboardInterrupt):
         return

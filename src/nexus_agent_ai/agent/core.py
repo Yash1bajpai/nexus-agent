@@ -78,6 +78,14 @@ def _is_local_provider(provider: BaseProvider) -> bool:
             'lfm' in model.lower() or
             hasattr(provider, '_server_proc'))
 
+_EDIT_INTENT = re.compile(r"\b(fix|change|edit|modify|update|replace|rewrite|refactor|patch|rename|implement|add|remove|delete)\b", re.IGNORECASE)
+_WRITE_TOOLS = ("patch_file", "write_file")
+
+
+def _wants_edit(user_input: str) -> bool:
+    return bool(_EDIT_INTENT.search(user_input or ""))
+
+
 def _query_needs_tools(user_input: str) -> bool:
     """Determine if a query likely needs tool access (file ops, code, git, etc.)."""
     q = user_input.lower().strip()
@@ -225,6 +233,7 @@ class Agent:
         tool_errors = []
         unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
         window_scale = 1.0
+        wrote_ok = False
         self.unresolved_errors = []
         try:
             while iteration < effective_max_iter:
@@ -342,6 +351,8 @@ class Agent:
                                 executed_tools.discard(tool_sig)
                         elif not str(result).startswith("[SYSTEM"):
                             unresolved.pop(error_key, None)  # a later success on the same file fixes it
+                            if tool_call.name in _WRITE_TOOLS:
+                                wrote_ok = True
                         duration = time.time() - start
 
                         if self.event_callback:
@@ -370,6 +381,10 @@ class Agent:
                     status = None
                     final_text = response.text
                     self.unresolved_errors = list(unresolved.values())
+                    if (not wrote_ok and not self.unresolved_errors and _wants_edit(user_input)
+                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in (use_tools or []))):
+                        final_text += ("\n\nWarning: no file was changed. No successful patch_file or write_file call "
+                                       "happened in this run, so do not assume the edit was applied.")
                     if self.unresolved_errors:
                         final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
                     if self.event_callback:
