@@ -6,7 +6,17 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent`, `age
 
 ## Release status
 
-**2.8.1 was released on PyPI on September 30, 2026.** It includes the capability-enforcement, sensitive-file, packaging and local-runtime fixes described below. The older PyPI 2.7.2 release lacks the newer `patch_file` and `run_tests` tools and these safety fixes. Upgrade the correct package with `python -m pip install --upgrade nexus-agent-ai` and check `nexus-agent --version`.
+**Current release: 2.9.1** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+
+What changed since 2.8.1:
+
+- First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes).
+- `nexus-agent doctor` checks Python, RAM, disk, download speed, engine, model fit and PATH. `nexus-agent` and `nexus-agent chat` with no question open the REPL.
+- `--context-size` and `/context`, token-based history trimming, `/compact`, a context meter, and one retry on context overflow.
+- Reliable edits: read before patch, CRLF tolerant matching, closest-text hint on a miss, a warning when an edit request ends without a successful write, and a nonzero exit code on unresolved tool errors.
+- API keys are typed hidden and stored owner-only (0600 on Linux/macOS, an owner-only ACL on Windows).
+- Sessions are saved by default; `--continue` resumes the last one.
+- Windows is covered by CI on a real Windows runner (tests, `doctor`, key-file ACL, session IDs from paths with spaces and unicode, CRLF patching). A full local-model download and chat on Windows has not been run in CI because the runner downloads slowly.
 
 `pip install nexus-agent` is an unrelated package. Use `nexus-agent-ai`.
 
@@ -127,7 +137,7 @@ These are smoke tests, not a model benchmark or proof of unattended reliability.
 
 Setup and response time depend on download size and hardware. A 2GB CPU test host is not a useful quality benchmark for 2.6B models. Small models can produce wrong answers and tool calls. Native tool support alone does not guarantee successful file repair in every harness.
 
-The downloaded desktop binary supports Windows, macOS and Linux x86_64. ARM Linux/Android require a compatible external engine/build; Termux installation is not a promise of tested on-device inference. Windows and Android execution were not verified in this review.
+The downloaded desktop binary supports Windows, macOS and Linux x86_64. ARM Linux/Android require a compatible external engine/build; Termux installation is not a promise of tested on-device inference. Windows is exercised in CI (see Release status) and was booted by the author on Windows 11; Android execution was not verified.
 
 ## Cloud providers
 
@@ -151,7 +161,7 @@ Python writes and patches are syntax-checked before changing the file. This dete
 
 **Edit safety.** `write_file` (over an existing file) and `patch_file` are refused unless the file was read with `read_file` (or an `@file` mention) in this run and has not changed on disk since. If a patch target is not found, Nexus tolerates CRLF line endings and trailing-whitespace differences, otherwise it returns the closest real text so the model can retry. `nexus-agent chat` exits with code 1 if a tool error was never fixed by the end of the run, or the iteration limit was hit; errors the model recovered from do not count.
 
-**API keys.** Keys entered during setup are typed hidden (not echoed) and saved to `~/.nexus-agent/.env`, created with mode 0600 inside a 0700 folder on Linux and macOS. On Windows the file sits in your user profile folder; POSIX permission bits do not apply there. `nexus-agent doctor` warns if the key file is readable by other users.
+**API keys.** Keys entered during setup are typed hidden (not echoed) and saved to `~/.nexus-agent/.env`, created with mode 0600 inside a 0700 folder on Linux and macOS. On Windows the file sits in your user profile folder and is restricted to your user with `icacls` (CI-verified). `nexus-agent doctor` warns if the key file is readable by other users.
 
 Sessions: the REPL now saves the conversation by default, one session per folder, in `~/.nexus-agent/history.db`. Open the REPL again in the same folder and it resumes. `nexus-agent repl --continue` (or `-c`) resumes the most recently used session from any folder, `--session NAME` picks one, and `--no-persist` gives a throwaway session. One-shot `nexus-agent chat "question"` still does not save unless you pass `--persist` or `--continue`. File contents you read can be kept in the saved history, so use `--no-persist` for sensitive work. File context may be retained in that history. Both persistent and in-memory history preserve user-turn/tool-result boundaries when pruning; an active long turn can exceed the nominal message limit rather than lose its original request.
 

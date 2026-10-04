@@ -220,7 +220,7 @@ def test_package_version():
     from nexus_agent_ai.utils.config import get_package_version
     # Source metadata and installed distribution must agree with the release.
     ver = get_package_version()
-    assert ver == "2.9.0"
+    assert ver == "2.9.1"
 
 def test_workspace_session_id_posix_case_sensitivity(monkeypatch, tmp_path):
     from nexus_agent_ai.agent.persistence import get_workspace_session_id
