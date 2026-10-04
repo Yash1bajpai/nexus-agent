@@ -137,7 +137,7 @@ These are smoke tests, not a model benchmark or proof of unattended reliability.
 
 Setup and response time depend on download size and hardware. A 2GB CPU test host is not a useful quality benchmark for 2.6B models. Small models can produce wrong answers and tool calls. Native tool support alone does not guarantee successful file repair in every harness.
 
-The downloaded desktop binary supports Windows, macOS and Linux x86_64. ARM Linux/Android require a compatible external engine/build; Termux installation is not a promise of tested on-device inference. Windows is exercised in CI (see Release status) and was booted by the author on Windows 11; Android execution was not verified.
+The downloaded desktop binary supports Windows, macOS and Linux x86_64. ARM Linux/Android require a compatible external engine/build; Termux installation is not a promise of tested on-device inference. Windows is exercised in CI (see Release status); Android execution was not verified.
 
 ## Cloud providers
 
