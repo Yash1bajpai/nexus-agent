@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional, List
 from ..providers.base import BaseProvider, RateLimitError, ProviderResponse
 from . import context
 from .memory import ConversationMemory
-from .tools import get_all_tools, execute_tool
+from .tools import get_all_tools, execute_tool, execute_list_directory
+from .guardrails import LoopGuard, guardrails_enabled
 from ..cli import display
 from ..utils.config import estimate_cost
 
@@ -135,8 +136,9 @@ def parse_at_mentions(user_input: str) -> str:
 class Agent:
     """Core autonomous coding agent implementing the ReAct tool-use loop."""
 
-    def __init__(self, provider: BaseProvider, memory: Optional[ConversationMemory] = None, max_iterations: int = 10, verbose: bool = True, tools: Optional[list] = None, event_callback: Optional[Any] = None):
+    def __init__(self, provider: BaseProvider, memory: Optional[ConversationMemory] = None, max_iterations: int = 10, verbose: bool = True, tools: Optional[list] = None, event_callback: Optional[Any] = None, guardrails: Optional[bool] = None):
         self.provider = provider
+        self.guardrails = guardrails_enabled(guardrails)
         self.memory = memory if memory is not None else ConversationMemory()
         self.tools = tools if tools is not None else get_all_tools()
         self.max_iterations = max_iterations
@@ -234,6 +236,7 @@ class Agent:
         unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
         window_scale = 1.0
         wrote_ok = False
+        guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
         try:
             while iteration < effective_max_iter:
@@ -339,6 +342,8 @@ class Agent:
                         else:
                             executed_tools.add(tool_sig)
                             result = execute_tool(tool_call.name, tool_call.args)
+                            if guard:
+                                result = guard.after_tool(tool_call.name, tool_call.args, result)
 
                         error_key = str(tool_call.args.get("path") or tool_call.name)
                         if str(result).startswith("ERROR:"):
@@ -353,6 +358,8 @@ class Agent:
                             unresolved.pop(error_key, None)  # a later success on the same file fixes it
                             if tool_call.name in _WRITE_TOOLS:
                                 wrote_ok = True
+                                # State changed: re-running run_tests / read_file / git_* is legitimate now.
+                                executed_tools.clear()
                         duration = time.time() - start
 
                         if self.event_callback:
@@ -380,6 +387,19 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     final_text = response.text
+                    if guard and use_tools:
+                        verdict, reviewed = guard.review_final(final_text)
+                        if verdict == "retry":
+                            self.memory.add("assistant", final_text)
+                            self.memory.add("user", reviewed)
+                            if self.event_callback:
+                                self.event_callback({"type": "guardrail", "content": "blocked unverified success claim"})
+                            effective_max_iter = max(effective_max_iter, iteration + 1)
+                            messages = self.memory.get()
+                            if self.verbose and status is None:
+                                status = display.create_status("Thinking...")
+                            continue
+                        final_text = reviewed
                     self.unresolved_errors = list(unresolved.values())
                     if (not wrote_ok and not self.unresolved_errors and _wants_edit(user_input)
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in (use_tools or []))):
