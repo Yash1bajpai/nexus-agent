@@ -907,7 +907,7 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
             cwd=str(Path.cwd()),
             stdin=subprocess.DEVNULL,
             env={**{key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "TMPDIR") if key in os.environ},
-                 "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+                 "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONDONTWRITEBYTECODE": "1"},
         )
         stdout = proc.stdout.strip()
         stderr = proc.stderr.strip()
