@@ -6,7 +6,7 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent`, `age
 
 ## Release status
 
-**Current release: 2.9.1** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+**Current release: 2.10.0** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
 
 What changed since 2.8.1:
 
