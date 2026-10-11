@@ -470,9 +470,31 @@ def repl(
                     except typer.Exit:
                         pass
                     continue
-                elif lower_input == "pull-model" or lower_input.startswith("pull-model"):
+                elif lower_input == "pull-model" or lower_input.startswith("pull-model "):
+                    import shlex
                     try:
-                        pull_model_cmd()
+                        pm_args = shlex.split(user_input[len("pull-model"):])
+                    except ValueError as e:
+                        display.print_error(f"Could not parse /pull-model arguments: {e}")
+                        continue
+                    pm_repo, pm_file, pm_bad = "", "", False
+                    i = 0
+                    while i < len(pm_args):
+                        flag = pm_args[i]
+                        if flag in ("--repo", "-r", "--file", "-f") and i + 1 < len(pm_args):
+                            if flag in ("--repo", "-r"):
+                                pm_repo = pm_args[i + 1]
+                            else:
+                                pm_file = pm_args[i + 1]
+                            i += 2
+                        else:
+                            display.print_error("Usage: /pull-model [--repo REPO] [--file FILENAME]")
+                            pm_bad = True
+                            break
+                    if pm_bad:
+                        continue
+                    try:
+                        _pull_model(pm_repo, pm_file)
                     except typer.Exit:
                         pass
                     continue
@@ -786,6 +808,15 @@ def pull_model_cmd(
     file: str = typer.Option("", "--file", "-f", help="GGUF filename inside the repo (default: built-in quant or NEXUS_AGENT_MODEL_FILENAME)."),
 ):
     """Download or verify a local GGUF model from any HuggingFace repo."""
+    _pull_model(repo, file)
+
+
+def _pull_model(repo: str = "", file: str = "") -> None:
+    """Plain-Python implementation shared by the CLI command and the /pull-model REPL command.
+
+    The typer command passes OptionInfo defaults when called directly as a
+    function, so callers outside typer must use this helper instead.
+    """
     import os
     from ..providers.local_provider import LocalProvider, _DEFAULT_REPO, _DEFAULT_FILENAME
     repo = repo.strip() or os.getenv("NEXUS_AGENT_MODEL_REPO", _DEFAULT_REPO)
