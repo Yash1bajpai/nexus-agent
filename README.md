@@ -10,6 +10,8 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent`, `age
 
 What changed since 2.8.1:
 
+- 2.10.0: loop guardrails for small local models (see Loop guardrails below).
+- 2.10.1: fixes `/pull-model` crashing inside the interactive REPL.
 - First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes).
 - `nexus-agent doctor` checks Python, RAM, disk, download speed, engine, model fit and PATH. `nexus-agent` and `nexus-agent chat` with no question open the REPL.
 - `--context-size` and `/context`, token-based history trimming, `/compact`, a context meter, and one retry on context overflow.
@@ -30,7 +32,7 @@ nexus-agent --version
 nexus-agent --help
 ```
 
-**Windows:** if PowerShell says `nexus-agent` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder printed by `nexus-agent doctor` to PATH. Windows support is covered by unit tests that simulate Windows paths, line endings and permissions on Linux; install and startup were seen on one Windows PC, and there is no Windows CI.
+**Windows:** if PowerShell says `nexus-agent` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder printed by `nexus-agent doctor` to PATH. Windows support is covered by CI on a real Windows runner (see Release status), and install and startup were also seen on one Windows PC.
 
 For this checkout:
 
@@ -67,7 +69,7 @@ nexus-agent chat --help
 
 Run inside the project you want Nexus to inspect. Regular chat/generate/debug sessions may write files in that workspace. Review sessions advertise only inspection tools, and the dispatcher rejects tools outside the session's allowed list, including REPL `/review`. Tool failures are appended to the final answer so a model cannot silently claim success after a failed operation. Commit-message generation is also read-only; the commit command asks for confirmation unless you deliberately pass `--yes`.
 
-**Loop guardrails (on main, not yet in a PyPI release):** when a model asks for a file that does not exist, the tool result now includes the real directory listing. Before a model may say "tests pass", the loop checks the actual test result and appends an "unverified" note if the run failed. Answers to `git_status` and `git_diff` questions are grounded with the real git output. These checks fix the loop, not the model: on a 12-task local re-score, the guardrails moved CodeForge adapters from 4/12 to 6/12, and both gains came from the git tasks. Wrong code and wrong arithmetic from small models are not fixed.
+**Loop guardrails (since 2.10.0):** when a model asks for a file that does not exist, the tool result now includes the real directory listing. Before a model may say "tests pass", the loop checks the actual test result and appends an "unverified" note if the run failed. Answers to `git_status` and `git_diff` questions are grounded with the real git output. These checks fix the loop, not the model: on a 12-task local re-score, the guardrails moved CodeForge adapters from 4/12 to 6/12, and both gains came from the git tasks. Wrong code and wrong arithmetic from small models are not fixed.
 
 `@file.py`, REPL review/debug reads and `read_file` share workspace and sensitive-path checks. Credential-like filenames, `.env` files, keys and sensitive configuration directories are blocked, including resolved symlink targets. This is not content-based secret detection: an innocently named source file may still contain a secret. Do not ask Nexus to inspect such files.
 
@@ -178,7 +180,7 @@ python -m pip install build
 python -m build
 ```
 
-CI runs Python 3.11, 3.12 and 3.13. The current main suite has 244 tests (1 skipped) on Linux, and CI also runs a Windows job (Python 3.11 and 3.12). The September 30 branch suite had 135 tests, including regression coverage for read-only capability bypass, credential attachment, pytest opt-in and environment stripping, Git mutation gating, SQLite history, local cost and detailed context errors. Passing tests are not proof of model accuracy or a hostile-code sandbox.
+CI runs Python 3.11, 3.12 and 3.13. The current main suite has 246 passing tests (1 skipped) on Linux, and CI also runs a Windows job (Python 3.11 and 3.12). The September 30 branch suite had 135 tests, including regression coverage for read-only capability bypass, credential attachment, pytest opt-in and environment stripping, Git mutation gating, SQLite history, local cost and detailed context errors. Passing tests are not proof of model accuracy or a hostile-code sandbox.
 
 Use a clean environment to install the built wheel and test the CLI before publishing. Publication requires a separate maintainer approval and matching version; branch fixes do not update existing PyPI installations.
 
