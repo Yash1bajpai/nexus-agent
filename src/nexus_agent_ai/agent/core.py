@@ -167,9 +167,11 @@ def _attach_named_files(user_input: str) -> str:
             continue
         if len(seen) >= 4:
             break
-    out = user_input
-    for tok in seen:
-        out = re.sub(r'(?<![\w@/\\.-])' + re.escape(tok) + r'(?![\w/\\-])', '@' + tok, out, count=1)
+    if not seen:
+        return user_input
+    # Append the mentions instead of rewriting the sentence: parse_at_mentions removes "@name" from the
+    # prompt text, and the model must still see which files the user is talking about.
+    out = user_input.rstrip() + " " + " ".join("@" + t for t in seen)
     return out
 
 
