@@ -40,7 +40,7 @@ def folder_missing_from_path(path_value: Optional[str] = None) -> Optional[str]:
 
 
 def _profile_for_shell() -> Path:
-    shell = os.path.basename(os.environ.get("SHELL", ""))
+    shell = os.path.basename(os.environ.get("SHELL", ""))  # fish and others fall back to ~/.profile (read by login shells)
     home = Path.home()
     if shell == "zsh":
         return home / ".zshrc"
@@ -57,7 +57,7 @@ def _add_posix(folder: str) -> str:
         return f"{profile} already mentions {folder}. Open a new terminal."
     with open(profile, "a", encoding="utf-8") as fh:
         fh.write(("\n" if existing and not existing.endswith("\n") else "") + f"{MARK}\n{line}\n")
-    return f"Added to {profile}:\n    {line}\nOpen a new terminal (or run: source {profile}) and nexus-agent-ai will work from any folder."
+    return f"Added to {profile}:\n    {line}\nOpen a new terminal (or run: source {profile}) and nexus-agent-ai will work from any folder.\nTo undo: delete those two lines (the '{MARK}' comment and the export line) from {profile}."
 
 
 def _add_windows(folder: str) -> str:
@@ -76,7 +76,7 @@ def _add_windows(folder: str) -> str:
         ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Environment", 0x0002, 3000, None)
     except Exception:
         pass
-    return f"Added {folder} to your user PATH. Open a NEW terminal window and nexus-agent-ai will work from any folder."
+    return f"Added {folder} to your user PATH. Open a NEW terminal window and nexus-agent-ai will work from any folder.\nTo undo: Settings > System > About > Advanced system settings > Environment Variables > user Path, and delete that entry."
 
 
 def add_to_user_path(folder: str) -> str:
