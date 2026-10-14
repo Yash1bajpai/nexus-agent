@@ -56,6 +56,9 @@ try:
 except OSError:
     pass
 log = strip(out)
+red = log.replace(FAKE, '<FAKE-KEY>')
+open('wizard_e2e.log', 'w').write(red)
+print('--- wizard transcript (last 3500 chars) ---\n' + red[-3500:] + '\n--- sent keys: ' + ','.join(sorted(sent)) + ' ---', flush=True)
 open("wizard_e2e.log", "w").write(log.replace(FAKE, "<FAKE-KEY>"))
 nx = os.path.join(home, ".nexus-agent")
 envf = os.path.join(nx, ".env")
