@@ -1,0 +1,44 @@
+name: Tiny fix benchmark (manual)
+
+# Grounding only: same 5 one-line bug fixes, same prompt, fixed wheel built from this commit, three models
+# the app already ships or recommends. Free CPU runners, no GPU, manual trigger only. Small sample.
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: lfm-1.2b-q4_0, repo: LiquidAI/LFM2.5-1.2B-Instruct-GGUF, file: LFM2.5-1.2B-Instruct-Q4_0.gguf}
+          - {name: lfm-2.6b-q6_k, repo: LiquidAI/LFM2.5-2.6B-GGUF, file: LFM2.5-2.6B-Q6_K.gguf}
+          - {name: qwen2.5-coder-3b-q4_k_m, repo: Qwen/Qwen2.5-Coder-3B-Instruct-GGUF, file: qwen2.5-coder-3b-instruct-q4_k_m.gguf}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build wheel, clean venv
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m venv /tmp/clean
+          /tmp/clean/bin/python -m pip install --only-binary :all: dist/*.whl
+          nproc; free -g | head -2
+      - name: Benchmark (${{ matrix.name }})
+        env:
+          NEXUS_AGENT_MODEL_REPO: ${{ matrix.repo }}
+          NEXUS_AGENT_MODEL_FILENAME: ${{ matrix.file }}
+          NEXUS_AGENT_ASSUME_YES: "1"
+          NEXUS_ALLOW_PROJECT_EXECUTION: "1"
+        run: |
+          cd /tmp && /tmp/clean/bin/python $GITHUB_WORKSPACE/ci/bench_fixes.py /tmp/clean/bin/nexus-agent 3 240 | tee $GITHUB_WORKSPACE/bench.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.name }}
+          path: |
+            bench.log
+            /tmp/bench_result.json
