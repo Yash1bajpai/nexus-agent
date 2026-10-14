@@ -194,6 +194,7 @@ class Agent:
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
         self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
+        self.edit_not_applied = False  # an edit was requested, nothing was written, and the model did not say nothing needs changing
         self.claim_unverified = False  # model said tests pass but they were not run / last run failed
 
         # Smart Startup: Global vs. Project Context check
@@ -286,6 +287,7 @@ class Agent:
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
         self.claimed_unapplied_edit = False
+        self.edit_not_applied = False
         self.claim_unverified = False
         try:
             while iteration < effective_max_iter:
@@ -497,6 +499,8 @@ class Agent:
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in offered_tools)):
                         final_text += ("\n\nWarning: no file was changed. No successful patch_file or write_file call "
                                        "happened in this run, so do not assume the edit was applied.")
+                        if not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
+                            self.edit_not_applied = True
                         if _CHANGE_CLAIM.search(final_text.split("\n\nWarning: no file was changed")[0]) and not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
                             # Not just "nothing to change": the model claimed an edit that never happened.
                             self.claimed_unapplied_edit = True

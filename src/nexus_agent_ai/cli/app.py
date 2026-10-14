@@ -231,6 +231,9 @@ def chat(
         if getattr(agent, "claimed_unapplied_edit", False):
             display.print_error("The model said it changed code but no file was modified. Exiting with code 1.")
             raise typer.Exit(code=1)
+        if getattr(agent, "edit_not_applied", False):
+            display.print_error("An edit was requested but no file was changed. Exiting with code 1.")
+            raise typer.Exit(code=1)
         if getattr(agent, "claim_unverified", False):
             display.print_error("The model claimed the tests pass, but no passing test run backs that up. Exiting with code 1.")
             raise typer.Exit(code=1)

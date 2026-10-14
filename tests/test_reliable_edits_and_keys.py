@@ -377,3 +377,28 @@ def test_forced_loop_stop_still_says_no_file_was_changed(tmp_path, monkeypatch):
     out = Agent(prov, verbose=False).run("fix f.txt")
     assert (tmp_path / "f.txt").read_text() == "alpha"
     assert "no file was changed" in out
+
+
+def test_no_change_after_edit_request_is_incomplete_but_valid_no_change_is_not(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    a = Agent(Scripted([("read_file", {"path": "f.txt"}), None]), verbose=False)
+    a.run("fix f.txt")
+    assert a.edit_not_applied is True
+    b = Agent(_Local(["f.txt is already correct, nothing to change."]), verbose=False)
+    b.run("fix f.txt")
+    assert b.edit_not_applied is False
+    c = Agent(Scripted([None]), verbose=False)
+    c.run("explain what f.txt does")
+    assert c.edit_not_applied is False
+
+
+def test_chat_exits_1_when_edit_requested_and_nothing_changed(tmp_path, monkeypatch):
+    import nexus_agent_ai.cli.app as appmod
+    from typer.testing import CliRunner
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    monkeypatch.setattr(appmod, "get_provider_instance",
+                        lambda *a, **k: (Scripted([("read_file", {"path": "f.txt"}), None]), "stub"))
+    r = CliRunner().invoke(appmod.app, ["chat", "-p", "local", "fix f.txt"])
+    assert r.exit_code == 1
