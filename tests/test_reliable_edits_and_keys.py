@@ -402,3 +402,18 @@ def test_chat_exits_1_when_edit_requested_and_nothing_changed(tmp_path, monkeypa
                         lambda *a, **k: (Scripted([("read_file", {"path": "f.txt"}), None]), "stub"))
     r = CliRunner().invoke(appmod.app, ["chat", "-p", "local", "fix f.txt"])
     assert r.exit_code == 1
+
+
+def test_reread_after_a_successful_edit_and_a_failed_patch_is_not_a_loop(tmp_path, monkeypatch):
+    """Transcript from the 2.6B diagnostic (sub.py): read, read again, patch ok, read, failed patch, read again.
+    The last read is needed to recover and must not be treated as a repeat of the reads made before the edit."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}), ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "gamma"}),
+                     ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}),  # stale target: fails
+                     ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "gamma", "replacement": "beta"}), None])
+    Agent(prov, verbose=False).run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "beta"

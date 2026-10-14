@@ -430,6 +430,7 @@ class Agent:
                                     result = f"{result}\n\n[AUTO CHECK after this edit, run_tests result]\n{check}"
                                 # State changed: re-running run_tests / read_file / git_* is legitimate now.
                                 executed_tools.clear()
+                                duplicate_counts.clear()  # repeats made before the file changed are not repeats now
                         duration = time.time() - start
 
                         if self.event_callback:
