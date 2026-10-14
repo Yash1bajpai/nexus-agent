@@ -5,6 +5,7 @@ That keeps the install pure Python with no compiled dependencies (PyYAML etc.).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import time
@@ -45,6 +46,37 @@ def find_cached(repo: str, filename: str) -> Optional[str]:
     return None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def expected_digest(url: str, timeout: float = 15.0) -> "tuple[Optional[int], Optional[str]]":
+    """Best-effort (size, sha256) of the real file from Hugging Face's X-Linked-* headers on the first
+    response. (None, None) for hosts that do not send them; then only the size check from the download applies."""
+    try:
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "nexus-agent-ai"})
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:  # the 302 carries the headers
+            resp = e
+        size = resp.headers.get("X-Linked-Size")
+        etag = (resp.headers.get("X-Linked-ETag") or "").strip('"').lower()
+        sha = etag if len(etag) == 64 and all(c in "0123456789abcdef" for c in etag) else None
+        return (int(size) if size and size.isdigit() else None), sha
+    except Exception:
+        return None, None
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _total_size(resp, start: int) -> Optional[int]:
     cr = resp.headers.get("Content-Range")  # "bytes 100-999/1000"
     if cr and "/" in cr:
@@ -67,6 +99,7 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
     final.parent.mkdir(parents=True, exist_ok=True)
     part = final.with_name(final.name + ".part")
     url = url or model_url(repo, filename)
+    want_size, want_sha = expected_digest(url)
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         have = part.stat().st_size if part.exists() else 0
@@ -89,6 +122,12 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
                             progress(have, total)
             if total is not None and have != total:
                 raise OSError(f"incomplete download ({have} of {total} bytes)")
+            if want_size is not None and have != want_size:
+                raise OSError(f"size {have} does not match expected {want_size}")
+            if want_sha is not None and _sha256(part) != want_sha:
+                part.unlink(missing_ok=True)  # corrupt: do not resume from bad bytes
+                have = 0
+                raise OSError("SHA-256 mismatch, discarded the partial file")
             os.replace(part, final)
             return str(final)
         except urllib.error.HTTPError as e:

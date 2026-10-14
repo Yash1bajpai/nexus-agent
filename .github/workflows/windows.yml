@@ -36,6 +36,45 @@ jobs:
         shell: pwsh
         run: python scripts/windows_smoke.py
 
+  wheel-install:
+    # What a new user does: only Python present, plain pip install of the built wheel, no extras.
+    # --only-binary :all: proves nothing needs a compiler. Not the same as the editable-install job above.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+      - name: Clean venv install, binary wheels only
+        shell: pwsh
+        run: |
+          python -m venv $env:RUNNER_TEMP\clean
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip install --only-binary :all: $wheel
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip list
+      - name: Command works and no PyYAML pulled in
+        shell: pwsh
+        run: |
+          $env:Path = "$env:RUNNER_TEMP\clean\Scripts;$env:Path"
+          nexus-agent-ai --version
+          if ($LASTEXITCODE -ne 0) { throw "nexus-agent-ai failed" }
+          nexus-agent-ai doctor --no-network
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+          $pl = & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip list
+          if ($pl -match "(?i)pyyaml|huggingface") { throw "unexpected dependency present" }
+
   first-run:
     # Real model download + chat. Slow (the runner measured ~1 MB/s from Hugging Face), so manual only.
     if: github.event_name == 'workflow_dispatch'

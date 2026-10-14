@@ -124,7 +124,8 @@ class Scripted(BaseProvider):
         return {"role": "tool", "tool_call_id": tool_call_id, "content": result}
 
 
-def test_recovered_error_is_not_reported_as_failure(tmp_path):
+def test_recovered_error_is_not_reported_as_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")  # exercise the refused-then-read path itself
     (tmp_path / "f.txt").write_text("alpha")
     prov = Scripted([
         ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}),  # refused: unread
@@ -133,24 +134,25 @@ def test_recovered_error_is_not_reported_as_failure(tmp_path):
         None,
     ])
     agent = Agent(prov, verbose=False)
-    out = agent.run("fix the file")
+    out = agent.run("fix f.txt")
     assert agent.unresolved_errors == []
     assert "Tool errors occurred" not in out
     assert (tmp_path / "f.txt").read_text() == "beta"
 
 
 def test_unfixed_error_stays_and_chat_exits_nonzero(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
     (tmp_path / "f.txt").write_text("alpha")
     prov = Scripted([("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
     agent = Agent(prov, verbose=False)
-    out = agent.run("fix the file")
+    out = agent.run("fix f.txt")
     assert agent.unresolved_errors and "Tool errors occurred" in out
 
     T.reset_file_tracking()
     monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
     monkeypatch.setattr(appmod, "get_provider_instance",
                         lambda *a, **k: (Scripted([("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None]), "stub"))
-    result = CliRunner().invoke(appmod.app, ["chat", "fix the file", "-p", "local", "--no-stream"])
+    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
     assert result.exit_code == 1
 
 
@@ -214,3 +216,19 @@ def test_doctor_warns_on_readable_key_file(tmp_path, monkeypatch):
     monkeypatch.setattr(doctor.Path, "home", classmethod(lambda cls: home))
     checks = doctor.run_checks(probe_network=False)
     assert any(c[1] == "Key file" and c[0] == "warn" for c in checks)
+
+
+def test_reading_a_file_does_not_clear_a_failed_edit(tmp_path, monkeypatch):
+    """Regression: a failed patch followed by a successful read_file of the same file used to count as fixed,
+    so the CLI exited 0 while the file was unchanged."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([
+        ("patch_file", {"path": "f.txt", "target": "nothere", "replacement": "beta"}),
+        ("read_file", {"path": "f.txt"}),
+        None,
+    ])
+    agent = Agent(prov, verbose=False)
+    out = agent.run("fix f.txt")
+    assert agent.unresolved_errors and "Tool errors occurred" in out
+    assert (tmp_path / "f.txt").read_text() == "alpha"

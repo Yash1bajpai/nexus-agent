@@ -137,6 +137,12 @@ _FILE_TOKEN = re.compile(r'(?<![\w@/\\.-])([\w][\w.\-]*(?:[/\\][\w.\-]+)*\.[A-Za
 
 
 def attach_named_files(user_input: str) -> str:
+    if os.environ.get("NEXUS_AGENT_AUTO_ATTACH", "1") == "0":
+        return user_input
+    return _attach_named_files(user_input)
+
+
+def _attach_named_files(user_input: str) -> str:
     """For edit requests, turn bare names of files that exist in the current folder (calc.py) into
     @mentions, so their content is attached up front. Small local models often skip read_file and
     then every edit is refused. Only files inside the working folder are used; a handful at most."""
@@ -264,6 +270,7 @@ class Agent:
         force_final = False
         tool_errors = []
         unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
+        unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
         window_scale = 1.0
         wrote_ok = False
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
@@ -379,13 +386,19 @@ class Agent:
                         if str(result).startswith("ERROR:"):
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
+                            unresolved_tool[error_key] = tool_call.name
                             # A failed call may legitimately be retried unchanged (e.g. after
                             # read_file). Only a repeated failure counts as a loop.
                             failed_counts[tool_sig] = failed_counts.get(tool_sig, 0) + 1
                             if failed_counts[tool_sig] < 2:
                                 executed_tools.discard(tool_sig)
                         elif not str(result).startswith("[SYSTEM"):
-                            unresolved.pop(error_key, None)  # a later success on the same file fixes it
+                            # A later success fixes the error only if it is the same tool succeeding, or a
+                            # write. Reading the file is not a fix for a failed edit.
+                            failed_tool = unresolved_tool.get(error_key)
+                            if failed_tool is None or tool_call.name == failed_tool or tool_call.name in _WRITE_TOOLS:
+                                unresolved.pop(error_key, None)
+                                unresolved_tool.pop(error_key, None)
                             if tool_call.name in _WRITE_TOOLS:
                                 wrote_ok = True
                                 # State changed: re-running run_tests / read_file / git_* is legitimate now.

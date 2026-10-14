@@ -311,10 +311,15 @@ class LocalProvider(BaseProvider):
             print(f"⬇️  Downloading llama-server (~50 MB) for CPU inference...")
             import urllib.request
             try:
-                urllib.request.urlretrieve(bin_url, str(zip_path))
+                # Download to a temp name and rename only when complete, so an interrupted
+                # download can never be mistaken for the finished file on the next run.
+                tmp_zip = zip_path.with_name(zip_path.name + ".part")
+                urllib.request.urlretrieve(bin_url, str(tmp_zip))
+                os.replace(tmp_zip, zip_path)
             except Exception as dl_err:
                 # Clean up partial download
                 zip_path.unlink(missing_ok=True)
+                zip_path.with_name(zip_path.name + ".part").unlink(missing_ok=True)
                 raise RuntimeError(
                     f"Failed to download llama-server from:\n  {bin_url}\n"
                     f"Error: {dl_err}\n\n"
