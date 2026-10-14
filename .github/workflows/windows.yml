@@ -162,3 +162,26 @@ jobs:
           Write-Host $out
           if ($out -notmatch [regex]::Escape($userScripts)) { throw "doctor did not name the Scripts folder" }
           if ($out -notmatch "python -m nexus_agent_ai") { throw "doctor did not give the python -m fallback" }
+      - name: setup-path adds the folder to the USER PATH when asked, and a fresh terminal then finds the bare command
+        shell: pwsh
+        run: |
+          $userScripts = python -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ne $userScripts.TrimEnd('\') }) -join ';'
+          python -m nexus_agent_ai setup-path --yes
+          if ($LASTEXITCODE -ne 0) { throw "setup-path failed" }
+          $user = [Environment]::GetEnvironmentVariable('Path','User')
+          Write-Host "user PATH now contains the folder: $(($user -split ';') -contains $userScripts)"
+          if (-not (($user -split ';') -contains $userScripts)) { throw "user PATH not updated" }
+          # what a NEW terminal would see: machine PATH + user PATH from the registry
+          $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + $user
+          $cmd = Get-Command nexus-agent-ai -ErrorAction SilentlyContinue
+          Write-Host "fresh-terminal Get-Command: $([bool]$cmd)"
+          if (-not $cmd) { throw "bare command still not found after setup-path" }
+          nexus-agent-ai --version
+          if ($LASTEXITCODE -ne 0) { throw "bare nexus-agent-ai failed" }
+          # idempotent: second run adds nothing
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ne $userScripts.TrimEnd('\') }) -join ';'
+          python -m nexus_agent_ai setup-path --yes
+          $count = (([Environment]::GetEnvironmentVariable('Path','User')) -split ';' | Where-Object { $_.TrimEnd('\') -eq $userScripts.TrimEnd('\') }).Count
+          Write-Host "entries for the folder after a second run: $count"
+          if ($count -ne 1) { throw "duplicate PATH entry" }

@@ -120,4 +120,4 @@ def _path_advice() -> str:
         fix = f'add {where} to your user PATH (Settings > System > About > Advanced system settings > Environment Variables), then open a new terminal'
     else:
         fix = f'add this line to your shell profile (~/.profile, ~/.zshrc or ~/.bashrc): export PATH="{where}:$PATH"'
-    return f"installed in {where}, which is not on PATH (pip does not change PATH). Run it as: {run_as}  or {fix}"
+    return f"installed in {where}, which is not on PATH (pip does not change PATH). Run it as: {run_as}  or run: {run_as} setup-path (asks first, then adds the folder to your user PATH)  or {fix}"

@@ -911,6 +911,20 @@ def setup():
     _mark_initialized()
 
 
+@app.command("setup-path")
+def setup_path(yes: bool = typer.Option(False, "--yes", help="Do not ask; add the folder to your user PATH")):
+    """If 'nexus-agent-ai' is not found in a new terminal, add its install folder to your user PATH (asks first)."""
+    from ..utils import pathfix
+    folder = pathfix.folder_missing_from_path()
+    if not folder:
+        typer.echo("The nexus-agent-ai command is already on PATH (or its install folder was not found). Nothing to do.")
+        return
+    if yes:
+        typer.echo(pathfix.add_to_user_path(folder))
+    else:
+        pathfix.offer(ask=input, say=typer.echo)
+
+
 trust_app = typer.Typer(help="Folders where Nexus may run the project's tests (pytest runs the project's code).")
 app.add_typer(trust_app, name="trust")
 
@@ -958,7 +972,7 @@ def main(
             ctx.invoke(repl)
         return
 
-    if ctx.invoked_subcommand in ("doctor", "trust", "setup"):
+    if ctx.invoked_subcommand in ("doctor", "trust", "setup", "setup-path"):
         return  # diagnostics must work before (and without) the setup wizard
 
     try:

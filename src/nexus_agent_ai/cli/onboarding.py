@@ -661,6 +661,15 @@ def _mark_initialized():
         pass
 
 
+def _step_command_path():
+    """Offer (never force) to put the install folder on the user's PATH when the bare command would not work."""
+    try:
+        from ..utils import pathfix
+        pathfix.offer(ask=_input, say=_print)
+    except Exception:
+        pass
+
+
 def _has_cloud_config() -> bool:
     keys = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "DEFAULT_PROVIDER")
     return any(os.getenv(k) for k in keys)
@@ -675,3 +684,4 @@ def run_full_setup(show_welcome: bool = True):
     _step_system_specs()
     _step_default_provider()
     _step_local_model_setup()
+    _step_command_path()

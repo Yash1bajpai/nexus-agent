@@ -46,6 +46,7 @@ while time.time() - t0 < TMO:
         n = [m.group(1) for m in re.finditer(r"^\s*(\d+)\. qwen2\.5-coder", lines, re.M)]
         sent.add("model"); os.write(fd, (n[0] if n else "").encode() + b"\n")
     reply("anyway", "Use it anyway?", "y")
+    reply("pathfix", "Add it now? (y/N)", "y")
     reply("dl", "Download model weights now?", "y")
     if not asked_q and "Type /help" in txt:
         time.sleep(3); os.write(fd, b"say hi in five words\n"); asked_q = True
@@ -71,6 +72,9 @@ chk("wizard reached the REPL and got an answer", "Tokens:" in log)
 chk("model list was shown", "Choose a model" in log)
 chk("chosen model saved globally", "NEXUS_AGENT_MODEL_FILENAME=qwen2.5-coder-3b-instruct-q4_k_m.gguf" in txtenv)
 chk("fake key saved globally", FAKE in txtenv)
+if os.name == "posix":
+    prof = [os.path.join(home, n) for n in (".zshrc", ".bashrc", ".bash_profile", ".profile") if os.path.exists(os.path.join(home, n))]
+    chk("PATH offer: user said y and the install folder was added to ONE shell profile in the throwaway home", any("added by nexus-agent-ai setup-path" in open(x).read() and os.path.dirname(EXE) in open(x).read() for x in prof), str(prof))
 if os.name == "posix":
     chk(".env is owner-only", mode == 0o600, oct(mode) if mode is not None else "missing")
 chk("fake key not printed in the session output", FAKE not in log)
