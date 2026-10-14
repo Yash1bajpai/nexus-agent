@@ -297,3 +297,38 @@ def test_cli_exits_zero_when_nothing_to_change(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "get_provider_instance", lambda *a, **k: (_Say("f.txt is already correct."), "stub"))
     result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
     assert result.exit_code == 0
+
+
+class _Local(Scripted):
+    """Looks like a local model (name contains 'local') and first just talks, then acts when nudged."""
+    def __init__(self, steps):
+        super().__init__(steps)
+        self.model = "lfm-stub"
+
+    def complete(self, messages, tools, system):
+        step = self.steps[min(self.i, len(self.steps) - 1)]
+        self.i += 1
+        if isinstance(step, str):
+            return ProviderResponse(text=step)
+        if step is None:
+            return ProviderResponse(text="Done, patched.")
+        name, args = step
+        return ProviderResponse(tool_calls=[ToolCall(f"c{self.i}", name, args)],
+                                raw_assistant_message={"role": "assistant", "content": "x"})
+
+
+def test_local_model_that_only_talks_gets_nudged_to_edit(tmp_path, monkeypatch):
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = _Local(["The bug is that alpha is wrong; fixing it will help.",
+                   ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    agent = Agent(prov, verbose=False)
+    agent.run("fix f.txt")   # f.txt auto-attached, so patch_file is allowed
+    assert (tmp_path / "f.txt").read_text() == "beta"
+
+
+def test_local_model_saying_nothing_to_change_is_not_nudged(tmp_path):
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = _Local(["f.txt is already correct, nothing to change."])
+    agent = Agent(prov, verbose=False)
+    out = agent.run("fix f.txt")
+    assert prov.i == 1 and (tmp_path / "f.txt").read_text() == "alpha"

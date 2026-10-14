@@ -460,6 +460,19 @@ class Agent:
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
                         continue
+                    if (local_mode and use_tools and not wrote_ok and not unresolved and error_nudges < 2
+                            and iteration < effective_max_iter and _wants_edit(user_input)
+                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in use_tools)
+                            and not _NO_CHANGE_OK.search(final_text or "")):
+                        # An edit was requested, nothing was written, and the model did not say there is nothing to change.
+                        error_nudges += 1
+                        self.memory.add("assistant", final_text or "(no answer)")
+                        self.memory.add("user", "[SYSTEM] No file has been changed yet. Do not explain; act. Call patch_file "
+                                        "(or write_file) now using the exact text from the file, then call run_tests to check.")
+                        messages = self.memory.get()
+                        if self.verbose and status is None:
+                            status = display.create_status("Thinking...")
+                        continue
                     self.unresolved_errors = list(unresolved.values())
                     if (not wrote_ok and not self.unresolved_errors and _wants_edit(user_input)
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in (use_tools or []))):
