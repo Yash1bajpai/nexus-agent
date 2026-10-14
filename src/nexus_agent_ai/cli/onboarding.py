@@ -589,17 +589,44 @@ def run_if_first_time():
         return
 
     _show_welcome()
-    _step_api_keys()
-    _step_system_specs()
-    _step_default_provider()
-    _step_local_model_setup()
+    # Local-first: a brand-new user with no cloud keys and no provider choice goes straight to the local
+    # model; nothing about cloud keys is asked. Anyone who already has keys or a provider set keeps the
+    # full setup. Cloud keys can be added any time with `nexus-agent-ai setup`.
+    if _has_cloud_config():
+        run_full_setup(show_welcome=False)
+    else:
+        _print("  Local mode needs no account or API key. Add cloud keys later with: nexus-agent-ai setup")
+        _step_system_specs()
+        _step_local_model_setup()
+        _mark_initialized()
+        _print()
+        _print("[bold green][OK] Setup complete! Starting Nexus-Agent...[/bold green]\n" if console else
+               "\n[OK] Setup complete! Starting Nexus-Agent...\n")
+        return
+    _mark_initialized()
+    _print()
+    _print("[bold green][OK] Setup complete! Starting Nexus-Agent...[/bold green]\n" if console else
+           "\n[OK] Setup complete! Starting Nexus-Agent...\n")
 
-    # Mark as initialized
+
+def _mark_initialized():
     try:
         INIT_FILE.write_text("Nexus-Agent initialized.\n", encoding="utf-8")
     except Exception:
         pass
 
-    _print()
-    _print("[bold green][OK] Setup complete! Starting Nexus-Agent...[/bold green]\n" if console else
-           "\n[OK] Setup complete! Starting Nexus-Agent...\n")
+
+def _has_cloud_config() -> bool:
+    keys = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "DEFAULT_PROVIDER")
+    return any(os.getenv(k) for k in keys)
+
+
+def run_full_setup(show_welcome: bool = True):
+    """The complete interactive setup (cloud keys, provider, local model). Used by `nexus-agent-ai setup`
+    and by first launches that already have cloud keys or a provider configured."""
+    if show_welcome:
+        _show_welcome()
+    _step_api_keys()
+    _step_system_specs()
+    _step_default_provider()
+    _step_local_model_setup()

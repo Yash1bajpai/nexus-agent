@@ -98,3 +98,53 @@ jobs:
           nexus-agent chat -p local "say hi in five words" 2>&1 | Tee-Object -FilePath chat.log
           if ($LASTEXITCODE -ne 0) { throw "chat failed with exit code $LASTEXITCODE" }
           if ((Get-Content chat.log -Raw).Trim().Length -lt 3) { throw "empty chat output" }
+
+  permission-prompt-conpty:
+    # Real Windows pseudo-console. Scratch folder, throwaway home, answers typed by the script.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheel and install it into a clean venv
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m venv $env:RUNNER_TEMP\clean
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip install --only-binary :all: $wheel pywinpty
+      - name: Permission prompt through ConPTY
+        shell: pwsh
+        run: |
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe ci\pty_consent_windows.py $env:RUNNER_TEMP\clean\Scripts\python.exe
+          if ($LASTEXITCODE -ne 0) { throw "ConPTY permission flow failed" }
+
+  user-install-path:
+    # What a plain `pip install --user` leaves behind: is the bare command found, and does the fallback work?
+    # Reports the real result; PATH is not edited to make it pass.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install with --user and look for the command
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          python -m pip install --user --only-binary :all: $wheel
+          $userScripts = python -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          Write-Host "user Scripts folder: $userScripts"
+          Write-Host ("script exists there: " + (Test-Path "$userScripts\nexus-agent-ai.exe"))
+          $onPath = ($env:PATH -split ';') -contains $userScripts
+          Write-Host "user Scripts folder on PATH: $onPath"
+          Write-Host ("Get-Command nexus-agent-ai: " + [bool](Get-Command nexus-agent-ai -ErrorAction SilentlyContinue))
+          python -m nexus_agent_ai --version
+          if ($LASTEXITCODE -ne 0) { throw "python -m nexus_agent_ai failed" }
+          python -m nexus_agent_ai doctor --no-network | Select-String "Command"

@@ -900,6 +900,14 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+@app.command()
+def setup():
+    """Interactive setup: optional cloud API keys, default provider, local model. Not needed for local use."""
+    from .onboarding import run_full_setup, _mark_initialized
+    run_full_setup()
+    _mark_initialized()
+
+
 trust_app = typer.Typer(help="Folders where Nexus may run the project's tests (pytest runs the project's code).")
 app.add_typer(trust_app, name="trust")
 
@@ -947,7 +955,7 @@ def main(
             ctx.invoke(repl)
         return
 
-    if ctx.invoked_subcommand in ("doctor", "trust"):
+    if ctx.invoked_subcommand in ("doctor", "trust", "setup"):
         return  # diagnostics must work before (and without) the setup wizard
 
     try:
