@@ -12,7 +12,7 @@ What changed since 2.8.1:
 
 - 2.10.0: loop guardrails for small local models (see Loop guardrails below).
 - 2.10.1: fixes `/pull-model` crashing inside the interactive REPL.
-- First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes).
+- First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes). A new user with no cloud keys or provider configured is not asked for any key: first launch goes straight to the local model. Anyone who already has cloud keys or `DEFAULT_PROVIDER` set keeps the full setup, and `nexus-agent-ai setup` runs the full setup (cloud keys, provider) at any time.
 - `nexus-agent doctor` checks Python, RAM, disk, download speed, engine, model fit and PATH. `nexus-agent` and `nexus-agent chat` with no question open the REPL.
 - `--context-size` and `/context`, token-based history trimming, `/compact`, a context meter, and one retry on context overflow.
 - Reliable edits: read before patch, CRLF tolerant matching, closest-text hint on a miss, a warning when an edit request ends without a successful write, and a nonzero exit code on unresolved tool errors.
@@ -52,7 +52,19 @@ Local models come from Hugging Face. The download resumes if interrupted (run th
 
 **Python versions:** tested on 3.11, 3.12 and 3.13 (CI). Newer versions may work but are untested. nexus no longer needs any compiled dependency (the model download is built in, no PyYAML), so install should not need a C++ compiler; this was checked by a wheel-only dependency resolve for Windows, not yet by a real Windows install.
 
-**Windows:** if PowerShell says `nexus-agent-ai` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder pip printed after installing to PATH (`nexus-agent doctor` also prints it). If the model download is interrupted, run the same command again: it resumes from the saved partial file. Windows support is covered by CI on a real Windows runner (see Release status), and install and startup were also seen on one Windows PC.
+**Supported platforms (what has actually been run).** Python 3.11 or newer. An engine download exists for more platforms than have been tested, so the two are listed separately.
+
+| Platform | Engine asset available | Tested in CI |
+|---|---|---|
+| Windows x64 | yes | wheel install on Python 3.11-3.14; full tests on 3.11 and 3.12; real model first run and one chat (3.12); permission prompt through a real Windows pseudo-console (3.12) |
+| macOS arm64 (GitHub runner) | yes | wheel install and tests on Python 3.11-3.13; real model first run and one chat (3.12) |
+| Linux x64 | yes | tests on Python 3.11-3.13; real model chat and permission prompt checked by hand on 3.13 |
+| Windows ARM, macOS Intel | yes | not tested |
+| Linux ARM | no prebuilt engine (build llama.cpp yourself or use Ollama) | not tested |
+
+CI machines have fast datacenter networks and are not a measure of your hardware, RAM or download speed. Python 3.15 and GPUs are untested; the model download and the engine are CPU only.
+
+**Command not found.** `pip` cannot edit your PATH. If `nexus-agent-ai` is not recognized (common after `pip install --user`, or when the Python installer's "Add to PATH" box was not ticked), run `python -m nexus_agent_ai`; `nexus-agent-ai doctor` prints the exact folder to add to PATH. CI checks this on Windows with the user Scripts folder removed from PATH. If the model download is interrupted, run the same command again: it resumes from the saved partial file.
 
 For this checkout:
 
