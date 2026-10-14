@@ -16,6 +16,7 @@ TASKS = {
     "sub": ("def sub(a, b):\n    return b - a\n", "from sub import sub\ndef test_s():\n    assert sub(5, 2) == 3\n"),
 }
 home = tempfile.mkdtemp()
+LOGS = '/tmp/bench_logs'; os.makedirs(LOGS, exist_ok=True)
 env = dict(os.environ, NEXUS_AGENT_HOME=home)
 fixed = total = 0
 rows = []
@@ -32,6 +33,7 @@ for run in range(1, RUNS + 1):
             code, log = "timeout", (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         t = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], cwd=d, capture_output=True, text=True)
         ok = t.returncode == 0
+        open(f'{LOGS}/run{run}_{name}.txt', 'w').write(f'EXIT {code}\n--- agent output ---\n{log}\n--- source after ---\n' + open(f'{d}/{name}.py').read() + '\n--- pytest ---\n' + t.stdout[-1500:])
         fixed += ok; total += 1
         tools = [l.strip()[:90] for l in log.splitlines() if "[ACTION]" in l]
         print(f"run{run} {name}: exit={code} tests_pass={'yes' if ok else 'no'} actions={len(tools)} first={tools[:1]}", flush=True)
