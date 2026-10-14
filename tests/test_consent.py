@@ -95,3 +95,41 @@ def test_env_variable_still_allows(monkeypatch):
 def test_run_tests_offered_when_a_person_is_at_the_terminal(monkeypatch):
     monkeypatch.setattr(consent, "_interactive", lambda: True)
     assert "run_tests" in {t.name for t in T.get_all_tools()}
+
+
+def _edit_agent(monkeypatch, work):
+    from nexus_agent_ai.agent.core import Agent
+    from tests.test_reliable_edits_and_keys import Scripted
+    (work / "f.py").write_text("X = 1\n")
+    (work / "test_f.py").write_text("from f import X\ndef test_x():\n    assert X == 2\n")
+    prov = Scripted([("read_file", {"path": "f.py"}),
+                     ("patch_file", {"path": "f.py", "target": "X = 1", "replacement": "X = 2"}), None])
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    return Agent(prov, verbose=False, tools=T.get_all_tools()), prov
+
+
+def test_auto_check_off_by_default_even_when_permitted(monkeypatch, tmp_path):
+    consent.trust()
+    monkeypatch.setattr(consent, "_interactive", lambda: False)
+    agent, _ = _edit_agent(monkeypatch, tmp_path / "work")
+    agent.run("fix f.py")
+    assert "AUTO CHECK" not in str(agent.memory.get())
+
+
+def test_auto_check_needs_the_grant_too(monkeypatch, tmp_path):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_CHECK", "1")
+    monkeypatch.setattr(consent, "_interactive", lambda: False)   # no grant, no prompt possible
+    (tmp_path / "work" / "canary_test.py").write_text("")
+    agent, _ = _edit_agent(monkeypatch, tmp_path / "work")
+    agent.run("fix f.py")
+    assert "AUTO CHECK" not in str(agent.memory.get())
+
+
+def test_auto_check_runs_after_edit_when_opted_in_and_granted(monkeypatch, tmp_path):
+    consent.trust()
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_CHECK", "1")
+    monkeypatch.setattr(consent, "_interactive", lambda: False)
+    agent, _ = _edit_agent(monkeypatch, tmp_path / "work")
+    agent.run("fix f.py")
+    assert "AUTO CHECK after this edit" in str(agent.memory.get())
+    assert "PASSED" in str(agent.memory.get())

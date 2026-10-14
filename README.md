@@ -32,6 +32,24 @@ nexus-agent-ai --version
 nexus-agent --help
 ```
 
+### Running tests safely (permission)
+
+`run_tests` runs the project's own code (pytest imports it) on your computer, with your permissions, not sandboxed. Nexus never does this without your say-so:
+
+- In a terminal, when the model first wants to run tests in a folder, Nexus asks: `[o]` once (this folder, until Nexus exits, nothing saved), `[a]` always (this exact folder only, saved in `~/.nexus-agent/trusted_folders.json`), or `[N]` no (default).
+- A saved folder covers only that folder, not its subfolders or parent.
+- See and undo your choices: `nexus-agent-ai trust list`, `nexus-agent-ai trust add [folder]`, `nexus-agent-ai trust revoke [folder]` (`--all` removes everything).
+- Non-interactive runs (scripts, CI) never run tests unless `NEXUS_ALLOW_PROJECT_EXECUTION=1` is set, as before. Use that only for code you trust.
+- Optional: set `NEXUS_AGENT_AUTO_CHECK=1` to run the tests automatically after each successful edit. It only works in folders you already allowed, and is off by default.
+
+If the model says "the tests pass" but no passing test run backs it up, `nexus-agent-ai chat "..."` exits with code 1 and says so.
+
+### Model downloads
+
+Local models come from Hugging Face. The download resumes if interrupted (run the same command again), and size and SHA-256 are checked when Hugging Face provides them. Public models need nothing. For a private or gated model, set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`, or log in with the Hugging Face CLI so `~/.cache/huggingface/token` exists). The token is sent only to huggingface.co and is not forwarded to the download servers it redirects to. Private-repo access has been tested against local test servers only, not a real private repo.
+
+**Known limits:** small local models (1.2B) often fail file edits and may not follow multi-step instructions. In our small checks (5 one-line bug fixes, 2 runs each, CPU only) the 1.2B model fixed 0 to 1 out of 10, so check every change it makes. Windows is covered by CI for the editable install; the plain wheel-install check on Windows is new and unproven.
+
 **Python versions:** tested on 3.11, 3.12 and 3.13 (CI). Newer versions may work but are untested. nexus no longer needs any compiled dependency (the model download is built in, no PyYAML), so install should not need a C++ compiler; this was checked by a wheel-only dependency resolve for Windows, not yet by a real Windows install.
 
 **Windows:** if PowerShell says `nexus-agent-ai` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder pip printed after installing to PATH (`nexus-agent doctor` also prints it). If the model download is interrupted, run the same command again: it resumes from the saved partial file. Windows support is covered by CI on a real Windows runner (see Release status), and install and startup were also seen on one Windows PC.

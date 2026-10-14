@@ -69,6 +69,17 @@ def _interactive() -> bool:
         return False
 
 
+def execution_allowed_without_asking() -> bool:
+    """True only if a person already granted it (env variable, 'once' this session, or a saved folder). Never prompts."""
+    return (os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") == "1"
+            or folder_key() in _session_allowed or folder_key() in list_trusted())
+
+
+def auto_check_enabled() -> bool:
+    """Automatic test run after each successful edit: needs BOTH an explicit opt-in and an existing grant."""
+    return os.environ.get("NEXUS_AGENT_AUTO_CHECK") == "1" and execution_allowed_without_asking()
+
+
 def execution_allowed() -> Tuple[bool, str]:
     if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") == "1":
         return True, "environment variable"

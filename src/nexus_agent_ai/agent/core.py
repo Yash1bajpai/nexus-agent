@@ -412,6 +412,14 @@ class Agent:
                                 unresolved_tool.pop(error_key, None)
                             if tool_call.name in _WRITE_TOOLS:
                                 wrote_ok = True
+                                from .consent import auto_check_enabled
+                                if auto_check_enabled() and any(getattr(t, "name", None) == "run_tests" for t in use_tools):
+                                    # Opt-in (NEXUS_AGENT_AUTO_CHECK=1) and already permitted: run the tests now, show the real result.
+                                    from .tools import execute_run_tests
+                                    check = execute_run_tests()
+                                    if guard:
+                                        check = guard.after_tool("run_tests", {}, check)
+                                    result = f"{result}\n\n[AUTO CHECK after this edit, run_tests result]\n{check}"
                                 # State changed: re-running run_tests / read_file / git_* is legitimate now.
                                 executed_tools.clear()
                         duration = time.time() - start
