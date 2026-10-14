@@ -5,6 +5,7 @@ from nexus_agent_ai.utils import pathfix
 
 
 def _fake_install(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.base_prefix", __import__("sys").prefix)  # behave like a non-venv Python
     d = tmp_path / "scripts"
     d.mkdir()
     (d / ("nexus-agent-ai.exe" if os.name == "nt" else "nexus-agent-ai")).write_text("x")
@@ -55,3 +56,13 @@ def test_setup_path_command_exists_and_skips_wizard():
     import nexus_agent_ai.cli.app as appmod
     r = CliRunner().invoke(appmod.app, ["setup-path", "--help"])
     assert r.exit_code == 0 and "user PATH" in r.output
+
+
+def test_inside_a_virtualenv_nothing_is_offered_and_nothing_is_changed(tmp_path, monkeypatch):
+    _fake_install(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.prefix", str(tmp_path / "venv"))
+    monkeypatch.setattr("sys.base_prefix", str(tmp_path / "base"))
+    assert pathfix.folder_missing_from_path("/usr/bin") is None
+    asked = []
+    assert pathfix.offer(ask=lambda p: asked.append(p) or "y", say=lambda *_: None) is False
+    assert not asked

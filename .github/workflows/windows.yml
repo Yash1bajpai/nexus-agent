@@ -218,3 +218,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "profile isolation failed" }
           & "$env:RUNNER_TEMP\nx-venv\Scripts\nexus-agent-ai.exe" doctor --no-network
           Write-Host "files in the fresh profile:"; Get-ChildItem -Force -Recurse $fake | Select-Object -First 20 FullName
+          # direct venv executable (no Activate.ps1, no execution-policy dependency) works, and the venv never triggers a PATH edit
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\nexus-agent-ai.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "direct venv executable failed" }
+          $userPathBefore = [Environment]::GetEnvironmentVariable('Path','User')
+          $offer = & "$env:RUNNER_TEMP\nx-venv\Scripts\python.exe" -c "from nexus_agent_ai.utils import pathfix; print(pathfix.folder_missing_from_path())"
+          Write-Host "PATH offer inside venv: $offer"
+          if ($offer -ne "None") { throw "venv should never be offered a PATH edit" }
+          if ([Environment]::GetEnvironmentVariable('Path','User') -ne $userPathBefore) { throw "user PATH changed" }

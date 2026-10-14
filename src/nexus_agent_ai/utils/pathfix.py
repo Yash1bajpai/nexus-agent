@@ -33,6 +33,8 @@ def install_script_dir() -> Optional[str]:
 
 def folder_missing_from_path(path_value: Optional[str] = None) -> Optional[str]:
     """The script folder when it exists and is not on PATH; None when the bare command should already work."""
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        return None  # inside a virtual environment: the user activates it; never edit PATH (or the registry) for a venv
     d = install_script_dir()
     if d and _norm(d) not in _path_entries(path_value):
         return d
