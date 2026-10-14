@@ -185,3 +185,36 @@ jobs:
           $count = (([Environment]::GetEnvironmentVariable('Path','User')) -split ';' | Where-Object { $_.TrimEnd('\') -eq $userScripts.TrimEnd('\') }).Count
           Write-Host "entries for the folder after a second run: $count"
           if ($count -ne 1) { throw "duplicate PATH entry" }
+
+  isolated-profile:
+    # A brand-new-user simulation: new venv + a brand-new, empty USER PROFILE folder (USERPROFILE override).
+    # Proves config, keys, first-run flag, models and engine all land in the override and the real profile is untouched.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+      - name: Fresh venv plus fresh profile
+        shell: pwsh
+        run: |
+          $real = $env:USERPROFILE
+          python -m venv "$env:RUNNER_TEMP\nx-venv"
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\python.exe" -m pip install --only-binary :all: (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          $fake = "$env:RUNNER_TEMP\nexus-test-home"
+          New-Item -ItemType Directory $fake | Out-Null
+          $env:USERPROFILE = $fake
+          Remove-Item Env:HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:HOMEDRIVE -ErrorAction SilentlyContinue
+          Remove-Item Env:HOMEPATH -ErrorAction SilentlyContinue
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\python.exe" ci\profile_isolation.py $real $fake
+          if ($LASTEXITCODE -ne 0) { throw "profile isolation failed" }
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\nexus-agent-ai.exe" doctor --no-network
+          Write-Host "files in the fresh profile:"; Get-ChildItem -Force -Recurse $fake | Select-Object -First 20 FullName
