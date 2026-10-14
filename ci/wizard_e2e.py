@@ -33,7 +33,7 @@ while time.time() - t0 < TMO:
     if not d:
         break
     out += d
-    txt = strip(out)
+    txt = re.sub(r"[ \t]*\n[ \t]*", " ", strip(out))  # prompts wrap at 80 columns
     def reply(key, marker, answer):
         if key not in sent and marker in txt[-1500:]:
             sent.add(key); os.write(fd, answer.encode() + b"\n")
@@ -42,7 +42,7 @@ while time.time() - t0 < TMO:
     reply("oai", "Enter OpenAI GPT API key", "")
     reply("prov", "Enter number (or Enter to keep current)", "")
     if "model" not in sent and "Enter number (or Enter for the suggested model)" in txt[-1500:]:
-        lines = txt.split("Choose a model")[-1]
+        lines = strip(out).split("Choose a model")[-1]
         n = [m.group(1) for m in re.finditer(r"^\s*(\d+)\. qwen2\.5-coder", lines, re.M)]
         sent.add("model"); os.write(fd, (n[0] if n else "").encode() + b"\n")
     reply("anyway", "Use it anyway?", "y")
