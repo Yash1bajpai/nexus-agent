@@ -32,18 +32,71 @@ def local_path(repo: str, filename: str) -> Path:
 
 def find_cached(repo: str, filename: str) -> Optional[str]:
     """Return the path of an already-downloaded model, or None. Also finds files an older
-    nexus version stored in the Hugging Face cache (only if huggingface_hub happens to be installed)."""
+    nexus version stored in the Hugging Face cache (read directly from the cache folders)."""
     p = local_path(repo, filename)
     if p.is_file() and p.stat().st_size > 0:
         return str(p)
+    return _find_in_hf_cache(repo, filename)
+
+
+def _hf_cache_dir() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    home = os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+    return Path(home) / "hub"
+
+
+def _find_in_hf_cache(repo: str, filename: str) -> Optional[str]:
+    """Look for the file in the Hugging Face cache layout used by older nexus versions
+    (models--org--name/snapshots/<rev>/file). Reads the folders directly; needs no extra package."""
     try:
-        from huggingface_hub import hf_hub_download  # optional, legacy cache only
-        legacy = hf_hub_download(repo_id=repo, filename=filename, local_files_only=True)
-        if os.path.isfile(legacy):
-            return os.path.realpath(legacy)
+        snaps = _hf_cache_dir() / ("models--" + repo.replace("/", "--")) / "snapshots"
+        for rev in sorted(snaps.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            cand = rev / filename
+            if cand.is_file() and cand.stat().st_size > 0:
+                return os.path.realpath(cand)
     except Exception:
         pass
     return None
+
+
+def _hf_token() -> Optional[str]:
+    for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        if os.environ.get(k, "").strip():
+            return os.environ[k].strip()
+    try:
+        home = os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+        t = (Path(home) / "token").read_text().strip()
+        return t or None
+    except Exception:
+        return None
+
+
+class _KeepAuthOnlyOnSameHost(urllib.request.HTTPRedirectHandler):
+    """Follow redirects (Hugging Face sends files from a CDN) but never forward the token to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            from urllib.parse import urlsplit
+            if urlsplit(newurl).netloc != urlsplit(req.full_url).netloc:
+                for h in ("Authorization", "authorization"):
+                    new.headers.pop(h, None)
+                    new.unredirected_hdrs.pop(h, None)
+        return new
+
+
+def _opener():
+    return urllib.request.build_opener(_KeepAuthOnlyOnSameHost)
+
+
+def _auth_headers(url: str) -> dict:
+    """Token only for Hugging Face hosts (or the configured NEXUS_AGENT_HF_ENDPOINT), never a random mirror."""
+    from urllib.parse import urlsplit
+    host = urlsplit(url).netloc
+    allowed = {urlsplit(HF_BASE).netloc, "huggingface.co"}
+    tok = _hf_token()
+    return {"Authorization": f"Bearer {tok}"} if tok and host in allowed else {}
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -56,7 +109,7 @@ def expected_digest(url: str, timeout: float = 15.0) -> "tuple[Optional[int], Op
     response. (None, None) for hosts that do not send them; then only the size check from the download applies."""
     try:
         opener = urllib.request.build_opener(_NoRedirect)
-        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "nexus-agent-ai"})
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "nexus-agent-ai", **_auth_headers(url)})
         try:
             resp = opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as e:  # the 302 carries the headers
@@ -103,11 +156,11 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         have = part.stat().st_size if part.exists() else 0
-        req = urllib.request.Request(url, headers={"User-Agent": "nexus-agent-ai"})
+        req = urllib.request.Request(url, headers={"User-Agent": "nexus-agent-ai", **_auth_headers(url)})
         if have:
             req.add_header("Range", f"bytes={have}-")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _opener().open(req, timeout=timeout) as resp:
                 if have and getattr(resp, "status", 200) != 206:
                     have = 0  # server ignored Range; restart
                 total = _total_size(resp, have)
@@ -135,7 +188,7 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
                 os.replace(part, final)
                 return str(final)
             if e.code in (401, 403, 404):
-                raise RuntimeError(f"Download refused (HTTP {e.code}) for {url}") from e
+                raise RuntimeError(f"Download refused (HTTP {e.code}) for {url}. For a private or gated model, set HF_TOKEN to a Hugging Face access token that can read it.") from e
             last_err = e
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             last_err = e

@@ -81,6 +81,11 @@ def _is_local_provider(provider: BaseProvider) -> bool:
 
 _EDIT_INTENT = re.compile(r"\b(fix|change|edit|modify|update|replace|rewrite|refactor|patch|rename|implement|add|remove|delete)\b", re.IGNORECASE)
 _WRITE_TOOLS = ("patch_file", "write_file")
+_VERBS = r"(?:fixed|updated|changed|modified|patched|applied|corrected|replaced|rewrote|rewritten|edited|implemented|added|removed|renamed|resolved)"
+# The model says it changed something ("I've fixed...", "the bug has been fixed", "I fixed the bug").
+_CHANGE_CLAIM = re.compile(r"\b(?:i(?:'ve|\s+have)?\s+(?:now\s+|successfully\s+)?" + _VERBS + r"|(?:has|have|was|were|is|are)\s+(?:now\s+|successfully\s+)?(?:been\s+)?" + _VERBS + r")\b", re.IGNORECASE)
+# Legitimate "nothing to change" answers must not be flagged.
+_NO_CHANGE_OK = re.compile(r"\b(already\b|no\s+(?:code\s+)?(?:change|changes|fix|fixes|edit|edits)\s+(?:is\s+|are\s+)?(?:needed|necessary|required)|nothing\s+(?:to\s+(?:change|fix)|needs?)|not\s+(?:a\s+)?bug|(?:did\s+not|didn't|have\s+not|haven't|could\s+not|couldn't|was\s+unable\s+to|unable\s+to)\b)", re.IGNORECASE)
 
 
 def _wants_edit(user_input: str) -> bool:
@@ -186,6 +191,7 @@ class Agent:
         self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
         self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
+        self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -275,6 +281,7 @@ class Agent:
         wrote_ok = False
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
+        self.claimed_unapplied_edit = False
         try:
             while iteration < effective_max_iter:
                 iteration += 1
@@ -458,6 +465,10 @@ class Agent:
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in (use_tools or []))):
                         final_text += ("\n\nWarning: no file was changed. No successful patch_file or write_file call "
                                        "happened in this run, so do not assume the edit was applied.")
+                        if _CHANGE_CLAIM.search(final_text.split("\n\nWarning: no file was changed")[0]) and not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
+                            # Not just "nothing to change": the model claimed an edit that never happened.
+                            self.claimed_unapplied_edit = True
+                            final_text += "\nThe claim above that the code was changed is false: the files were not modified."
                     if self.unresolved_errors:
                         final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
                     if self.event_callback:

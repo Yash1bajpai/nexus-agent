@@ -228,6 +228,9 @@ def chat(
         if no_stream:
             display.print_response(response_text)
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+        if getattr(agent, "claimed_unapplied_edit", False):
+            display.print_error("The model said it changed code but no file was modified. Exiting with code 1.")
+            raise typer.Exit(code=1)
         if getattr(agent, "unresolved_errors", None) or str(response_text).startswith("Max tool iterations reached"):
             display.print_error("Did not finish cleanly (unresolved tool errors or iteration limit). Exiting with code 1.")
             raise typer.Exit(code=1)

@@ -232,3 +232,68 @@ def test_reading_a_file_does_not_clear_a_failed_edit(tmp_path, monkeypatch):
     out = agent.run("fix f.txt")
     assert agent.unresolved_errors and "Tool errors occurred" in out
     assert (tmp_path / "f.txt").read_text() == "alpha"
+
+
+class _Say(BaseProvider):
+    def __init__(self, text):
+        self.text, self.model = text, "stub"
+
+    def complete(self, messages, tools, system):
+        return ProviderResponse(text=self.text)
+
+    def stream(self, **kw):
+        yield self.complete(**kw)
+
+    def format_tool_result_message(self, tool_call_id, result):
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": result}
+
+
+def test_false_claim_of_edit_without_write_is_flagged(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    agent = Agent(_Say("I've fixed the bug in f.txt."), verbose=False)
+    out = agent.run("fix f.txt")
+    assert agent.claimed_unapplied_edit
+    assert "false" in out and (tmp_path / "f.txt").read_text() == "alpha"
+
+
+@pytest.mark.parametrize("text", [
+    "f.txt is already correct, nothing to change.",
+    "No changes are needed here.",
+    "I could not apply a fix because the target was not found.",
+    "That is not a bug, it behaves as designed.",
+])
+def test_legitimate_no_change_answers_are_not_flagged(tmp_path, monkeypatch, text):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    agent = Agent(_Say(text), verbose=False)
+    agent.run("fix f.txt")
+    assert not agent.claimed_unapplied_edit
+
+
+def test_real_edit_is_not_flagged(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    agent = Agent(prov, verbose=False)
+    agent.run("fix f.txt")
+    assert not agent.claimed_unapplied_edit and (tmp_path / "f.txt").read_text() == "beta"
+
+
+def test_cli_exits_nonzero_on_false_edit_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr(appmod, "get_provider_instance", lambda *a, **k: (_Say("I've fixed the bug in f.txt."), "stub"))
+    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
+    assert result.exit_code == 1
+
+
+def test_cli_exits_zero_when_nothing_to_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr(appmod, "get_provider_instance", lambda *a, **k: (_Say("f.txt is already correct."), "stub"))
+    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
+    assert result.exit_code == 0
