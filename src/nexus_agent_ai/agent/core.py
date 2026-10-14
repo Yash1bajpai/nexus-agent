@@ -282,6 +282,7 @@ class Agent:
         unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
         window_scale = 1.0
         wrote_ok = False
+        offered_tools = list(use_tools)  # use_tools is emptied by the anti-loop stop; keep what was offered
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
         self.claimed_unapplied_edit = False
@@ -378,13 +379,18 @@ class Agent:
                             result = f"ERROR: Tool '{tool_call.name}' is not allowed in this session."
                         elif tool_sig in executed_tools:
                             duplicate_counts[tool_sig] = duplicate_counts.get(tool_sig, 0) + 1
-                            if duplicate_counts[tool_sig] >= 2:
+                            reread_while_editing = (tool_call.name == "read_file" and not wrote_ok and _wants_edit(user_input)
+                                                    and any(getattr(t, "name", None) in _WRITE_TOOLS for t in offered_tools))
+                            if duplicate_counts[tool_sig] >= (3 if reread_while_editing else 2):
                                 # Hard stop: the model is stuck in a loop.
                                 # Strip tools on the next request and force a direct answer.
                                 force_final = True
                                 result = ("[SYSTEM: TOOL BUDGET EXHAUSTED] You have repeated this exact tool call "
                                           "multiple times. Do NOT call any more tools. Answer the user's original "
                                           "question directly now using the information you already have.")
+                            elif reread_while_editing:
+                                result = ("[SYSTEM] You already read this file; its content is in the earlier tool result. Do not read it "
+                                          "again. Call patch_file (or write_file) now to make the change, then run_tests.")
                             else:
                                 result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
                         else:
@@ -488,7 +494,7 @@ class Agent:
                         continue
                     self.unresolved_errors = list(unresolved.values())
                     if (not wrote_ok and not self.unresolved_errors and _wants_edit(user_input)
-                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in (use_tools or []))):
+                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in offered_tools)):
                         final_text += ("\n\nWarning: no file was changed. No successful patch_file or write_file call "
                                        "happened in this run, so do not assume the edit was applied.")
                         if _CHANGE_CLAIM.search(final_text.split("\n\nWarning: no file was changed")[0]) and not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):

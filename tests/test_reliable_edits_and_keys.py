@@ -356,3 +356,24 @@ def test_claim_tests_pass_without_running_is_not_success(tmp_path, monkeypatch):
     (tmp_path / "f.txt").write_text("alpha")
     result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
     assert result.exit_code == 1
+
+
+
+def test_rereading_the_same_file_does_not_end_an_edit_request_early(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}), ("read_file", {"path": "f.txt"}),
+                     ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    Agent(prov, verbose=False).run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "beta"
+
+
+def test_forced_loop_stop_still_says_no_file_was_changed(tmp_path, monkeypatch):
+    """The anti-loop stop removes the tools; the 'no file was changed' warning must survive that."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"})] * 4 + [None])
+    out = Agent(prov, verbose=False).run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "alpha"
+    assert "no file was changed" in out
