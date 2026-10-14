@@ -4,6 +4,8 @@ name: Tiny fix benchmark (manual)
 # the app already ships or recommends. Free CPU runners, no GPU, manual trigger only. Small sample.
 on:
   workflow_dispatch:
+  pull_request:
+    paths: ['.github/workflows/bench.yml', 'ci/bench_fixes.py']
 
 jobs:
   bench:
