@@ -17,7 +17,6 @@ dependencies = [
     "duckduckgo-search>=6.0.0",
     "python-dotenv>=1.0.0",
     "psutil>=5.9.0; sys_platform == 'win32' or sys_platform == 'darwin'",
-    "huggingface-hub>=0.24.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +47,7 @@ cpu = [
 ]
 
 [project.scripts]
+nexus-agent-ai = "nexus_agent_ai.cli.app:app"
 nexus-agent = "nexus_agent_ai.cli.app:app"
 agent = "nexus_agent_ai.cli.app:app"
 

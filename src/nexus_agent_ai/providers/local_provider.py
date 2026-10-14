@@ -193,31 +193,17 @@ class LocalProvider(BaseProvider):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         print("🚀 Initializing nexus-agent...")
         try:
-            from huggingface_hub import hf_hub_download
+            from ..utils import model_download
             print(f"⚡ Downloading/Verifying Local Liquid LFM engine ({self.filename})...")
-            # Check the local HF cache first: avoids a network round-trip (and
-            # the unauthenticated-request warning) when the model is cached.
-            model_path = None
-            try:
-                model_path = hf_hub_download(repo_id=self.model_id, filename=self.filename, local_files_only=True)
-            except Exception:
-                pass
-            if not model_path or not os.path.isfile(model_path):
-                model_path = hf_hub_download(repo_id=self.model_id, filename=self.filename, local_files_only=False)
-            # Resolve symlinks to get the real file (needed on Windows where HF cache uses symlinks)
-            if os.path.isfile(model_path):
-                model_path = os.path.realpath(model_path)
+            model_path = model_download.find_cached(self.model_id, self.filename)
+            if not model_path:
+                model_path = model_download.download(
+                    self.model_id, self.filename, progress=model_download.console_progress())
+                sys.stderr.write("\n")
+            model_path = os.path.realpath(model_path)
             print("✅ Core engine ready! Booting up...")
             self._model_path = model_path
             return model_path
-        except ImportError as e:
-            if verify_download:
-                raise RuntimeError(
-                    "huggingface_hub package is not installed. "
-                    "Run `pip install huggingface_hub` to download the model."
-                ) from e
-            self._model_path = self.model_id
-            return self.model_id
         except Exception as e:
             if verify_download:
                 raise RuntimeError(f"Failed to pull model '{self.model_id}': {str(e)}") from e

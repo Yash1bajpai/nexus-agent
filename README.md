@@ -2,7 +2,7 @@
 
 A terminal coding assistant with a ReAct tool loop, local GGUF inference and optional cloud providers. It can inspect a workspace, make targeted edits, search documentation and help debug code. Model output can be wrong. Review changes before keeping them.
 
-Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent`, `agent`
+Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `nexus-agent`, `agent`
 
 ## Release status
 
@@ -28,11 +28,13 @@ For the published release:
 
 ```bash
 python -m pip install nexus-agent-ai
-nexus-agent --version
+nexus-agent-ai --version
 nexus-agent --help
 ```
 
-**Windows:** if PowerShell says `nexus-agent` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder printed by `nexus-agent doctor` to PATH. Windows support is covered by CI on a real Windows runner (see Release status), and install and startup were also seen on one Windows PC.
+**Python versions:** tested on 3.11, 3.12 and 3.13 (CI). Newer versions may work but are untested. nexus no longer needs any compiled dependency (the model download is built in, no PyYAML), so install should not need a C++ compiler; this was checked by a wheel-only dependency resolve for Windows, not yet by a real Windows install.
+
+**Windows:** if PowerShell says `nexus-agent-ai` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder pip printed after installing to PATH (`nexus-agent doctor` also prints it). If the model download is interrupted, run the same command again: it resumes from the saved partial file. Windows support is covered by CI on a real Windows runner (see Release status), and install and startup were also seen on one Windows PC.
 
 For this checkout:
 

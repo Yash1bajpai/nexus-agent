@@ -133,6 +133,35 @@ def parse_at_mentions(user_input: str) -> str:
         return clean_input + "\n\n" + "\n\n".join(attachments)
     return clean_input
 
+_FILE_TOKEN = re.compile(r'(?<![\w@/\\.-])([\w][\w.\-]*(?:[/\\][\w.\-]+)*\.[A-Za-z0-9]{1,6})(?=[\s.,;:!?)\'"]|$)')
+
+
+def attach_named_files(user_input: str) -> str:
+    """For edit requests, turn bare names of files that exist in the current folder (calc.py) into
+    @mentions, so their content is attached up front. Small local models often skip read_file and
+    then every edit is refused. Only files inside the working folder are used; a handful at most."""
+    if not _wants_edit(user_input):
+        return user_input
+    cwd = Path.cwd().resolve()
+    seen = []
+    for m in _FILE_TOKEN.finditer(user_input):
+        tok = m.group(1)
+        if tok in seen:
+            continue
+        try:
+            p = (cwd / tok).resolve()
+            if p.is_file() and (cwd == p or cwd in p.parents) and p.stat().st_size <= 100_000:
+                seen.append(tok)
+        except Exception:
+            continue
+        if len(seen) >= 4:
+            break
+    out = user_input
+    for tok in seen:
+        out = re.sub(r'(?<![\w@/\\.-])' + re.escape(tok) + r'(?![\w/\\-])', '@' + tok, out, count=1)
+    return out
+
+
 class Agent:
     """Core autonomous coding agent implementing the ReAct tool-use loop."""
 
@@ -210,8 +239,9 @@ class Agent:
 
     def run(self, user_input: str, stream: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
-        processed_input = parse_at_mentions(user_input)
+        processed_input = parse_at_mentions(attach_named_files(user_input))
         self.memory.add("user", processed_input)
+        error_nudges = 0
         messages = self.memory.get()
 
         # Smart Tool Routing: for local models, only pass tools when the query
@@ -400,6 +430,16 @@ class Agent:
                                 status = display.create_status("Thinking...")
                             continue
                         final_text = reviewed
+                    if (local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
+                        # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
+                        error_nudges += 1
+                        self.memory.add("assistant", final_text or "(no answer)")
+                        self.memory.add("user", "[SYSTEM] Your last tool call failed: " + "; ".join(dict.fromkeys(unresolved.values()))[:400]
+                                        + " Do not just describe a plan. Fix this by calling the tools now (read_file first if needed), then finish the task.")
+                        messages = self.memory.get()
+                        if self.verbose and status is None:
+                            status = display.create_status("Thinking...")
+                        continue
                     self.unresolved_errors = list(unresolved.values())
                     if (not wrote_ok and not self.unresolved_errors and _wants_edit(user_input)
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in (use_tools or []))):

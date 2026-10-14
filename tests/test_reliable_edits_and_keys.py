@@ -133,7 +133,7 @@ def test_recovered_error_is_not_reported_as_failure(tmp_path):
         None,
     ])
     agent = Agent(prov, verbose=False)
-    out = agent.run("fix f.txt")
+    out = agent.run("fix the file")
     assert agent.unresolved_errors == []
     assert "Tool errors occurred" not in out
     assert (tmp_path / "f.txt").read_text() == "beta"
@@ -143,14 +143,14 @@ def test_unfixed_error_stays_and_chat_exits_nonzero(tmp_path, monkeypatch):
     (tmp_path / "f.txt").write_text("alpha")
     prov = Scripted([("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
     agent = Agent(prov, verbose=False)
-    out = agent.run("fix f.txt")
+    out = agent.run("fix the file")
     assert agent.unresolved_errors and "Tool errors occurred" in out
 
     T.reset_file_tracking()
     monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
     monkeypatch.setattr(appmod, "get_provider_instance",
                         lambda *a, **k: (Scripted([("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None]), "stub"))
-    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
+    result = CliRunner().invoke(appmod.app, ["chat", "fix the file", "-p", "local", "--no-stream"])
     assert result.exit_code == 1
 
 
