@@ -26,6 +26,11 @@ chk("engine folder is under the override", inside(local_provider._NEXUS_HOME), s
 chk("first-run wizard would show (no flag in the real profile is consulted)", not (real / ".nexus_agent_initialized").exists() or inside(onboarding.INIT_FILE))
 after = sorted(p.name for p in real.iterdir()) if real.exists() else []
 chk("real profile folder gained no new entries", before == after, f"new: {sorted(set(after) - set(before))}")
-leak = [str(p) for p in real.rglob("*") if p.is_file() and p.stat().st_size < 100000 and FAKE in p.read_text(errors="ignore")] if real.exists() else []
+def _has_fake(p):
+    try:
+        return p.is_file() and p.stat().st_size < 100000 and FAKE in p.read_text(errors="ignore")
+    except OSError:
+        return False  # unreadable system files cannot hold what this process just wrote
+leak = [str(p) for p in (real.rglob("*") if real.exists() else []) if _has_fake(p)]
 chk("fake key not found anywhere in the real profile", not leak, str(leak[:3]))
 sys.exit(0 if all(ok) else 1)
