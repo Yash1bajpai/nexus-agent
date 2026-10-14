@@ -527,6 +527,62 @@ def _step_default_provider() -> str:
     return current
 
 
+def _model_options(suggested: dict) -> list:
+    """Models the wizard can offer: the suggestion first, then the app's own other options."""
+    from ..utils import model_select
+    opts = [dict(suggested, label="Suggested for this machine")]
+    extra = [
+        ("LiquidAI/LFM2.5-2.6B-GGUF", "LFM2.5-2.6B-Q6_K.gguf", 2.2, "LFM 2.6B, better quality, needs more free RAM"),
+        (*_ALTERNATIVE_MODELS["gpu_or_16gb"], 2.1, "Qwen2.5-Coder 3B, tuned for code"),
+        (*_ALTERNATIVE_MODELS["large"], 4.4, "Mistral 7B, largest, slow on CPU"),
+        (model_select.SMALL_MODEL["repo"], model_select.SMALL_MODEL["filename"], model_select.SMALL_MODEL["size_gb"], "LFM 1.2B, smallest and fastest"),
+    ]
+    for repo, fn, gb, label in extra:
+        if fn != suggested["filename"]:
+            opts.append({"repo": repo, "filename": fn, "size": f"~{gb} GB", "size_gb": gb, "label": label})
+    return opts
+
+
+def _step_model_choice(cfg: dict) -> dict:
+    """Let the user pick a different model than the suggested one. Enter keeps the suggestion.
+
+    The suggestion is not saved (the final pick still uses free RAM at first launch). A model the user
+    picks here is saved as their explicit choice and then used as is, so warn when it may not fit.
+    """
+    if os.getenv("NEXUS_AGENT_MODEL_REPO") or os.getenv("NEXUS_AGENT_MODEL_FILENAME"):
+        return cfg
+    from ..utils import model_select
+    opts = _model_options(cfg)
+    avail = detect_system_specs().get("available_ram_gb")
+    _print("  Choose a model (small local models are weak at editing code; bigger ones need more RAM and are slower):")
+    for i, o in enumerate(opts, 1):
+        need = model_select.required_ram_gb({"size_gb": float(o.get("size_gb") or str(o["size"]).replace("~", "").replace(" GB", ""))})
+        _print(f"    {i}. {o['filename']} ({_size_txt(o['size'])}, about {need} GB free RAM) - {o['label']}")
+    if avail is not None:
+        _print(f"  Free RAM now: {avail:.1f} GB")
+    try:
+        choice = _input("  Enter number (or Enter for the suggested model): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return cfg
+    if not (choice.isdigit() and 2 <= int(choice) <= len(opts)):
+        return cfg
+    picked = opts[int(choice) - 1]
+    need = model_select.required_ram_gb({"size_gb": float(str(picked["size"]).replace("~", "").replace(" GB", ""))})
+    if avail is not None and avail < need:
+        try:
+            ok = _input(f"  Only {avail:.1f} GB free; this model needs about {need} GB and may fail or swap. Use it anyway? (y/N): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return cfg
+        if ok != "y":
+            return cfg
+    _write_env_key("NEXUS_AGENT_MODEL_REPO", picked["repo"])
+    _write_env_key("NEXUS_AGENT_MODEL_FILENAME", picked["filename"])
+    os.environ["NEXUS_AGENT_MODEL_REPO"] = picked["repo"]
+    os.environ["NEXUS_AGENT_MODEL_FILENAME"] = picked["filename"]
+    _print(f"  Model set to {picked['filename']}. Change it later with `nexus-agent-ai setup`.")
+    return picked
+
+
 def _size_txt(size) -> str:
     """Size label with exactly one leading ~ (recommended sizes already carry one)."""
     return "~" + str(size).lstrip("~").strip()
@@ -554,6 +610,7 @@ def _step_local_model_setup():
     except Exception:
         pass
 
+    cfg = _step_model_choice(cfg)
     try:
         consent = _input(f"  Download model weights now? Requires {_size_txt(cfg['size'])} disk space. (y/N): ").strip().lower()
         if consent != "y":
@@ -588,21 +645,9 @@ def run_if_first_time():
         _print("  Non-interactive run: skipping first-time setup. Run `nexus-agent` in a terminal to set up keys.")
         return
 
-    _show_welcome()
-    # Local-first: a brand-new user with no cloud keys and no provider choice goes straight to the local
-    # model; nothing about cloud keys is asked. Anyone who already has keys or a provider set keeps the
-    # full setup. Cloud keys can be added any time with `nexus-agent-ai setup`.
-    if _has_cloud_config():
-        run_full_setup(show_welcome=False)
-    else:
-        _print("  Local mode needs no account or API key. Add cloud keys later with: nexus-agent-ai setup")
-        _step_system_specs()
-        _step_local_model_setup()
-        _mark_initialized()
-        _print()
-        _print("[bold green][OK] Setup complete! Starting Nexus-Agent...[/bold green]\n" if console else
-               "\n[OK] Setup complete! Starting Nexus-Agent...\n")
-        return
+    # Full first-run setup: optional cloud keys (Enter skips each), system detection, default provider
+    # (local stays the default), local model choice and download consent.
+    run_full_setup()
     _mark_initialized()
     _print()
     _print("[bold green][OK] Setup complete! Starting Nexus-Agent...[/bold green]\n" if console else
