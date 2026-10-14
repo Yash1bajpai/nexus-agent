@@ -148,3 +148,17 @@ jobs:
           python -m nexus_agent_ai --version
           if ($LASTEXITCODE -ne 0) { throw "python -m nexus_agent_ai failed" }
           python -m nexus_agent_ai doctor --no-network | Select-String "Command"
+      - name: Same install with the user Scripts folder NOT on PATH (python.org style)
+        shell: pwsh
+        run: |
+          $userScripts = python -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ne $userScripts.TrimEnd('\') }) -join ';'
+          $found = [bool](Get-Command nexus-agent-ai -ErrorAction SilentlyContinue)
+          Write-Host "bare command found with folder removed from PATH: $found"
+          if ($found) { throw "expected the bare command to be missing in this simulation" }
+          python -m nexus_agent_ai --version
+          if ($LASTEXITCODE -ne 0) { throw "python -m nexus_agent_ai failed" }
+          $out = python -m nexus_agent_ai doctor --no-network | Out-String
+          Write-Host $out
+          if ($out -notmatch [regex]::Escape($userScripts)) { throw "doctor did not name the Scripts folder" }
+          if ($out -notmatch "python -m nexus_agent_ai") { throw "doctor did not give the python -m fallback" }
