@@ -332,3 +332,27 @@ def test_local_model_saying_nothing_to_change_is_not_nudged(tmp_path):
     agent = Agent(prov, verbose=False)
     out = agent.run("fix f.txt")
     assert prov.i == 1 and (tmp_path / "f.txt").read_text() == "alpha"
+
+
+def test_claim_tests_pass_without_running_is_not_success(tmp_path, monkeypatch):
+    """A written file is not enough: 'tests pass' without a passing run exits 1."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    class P(Scripted):
+        def complete(self, messages, tools, system):
+            r = super().complete(messages, tools, system)
+            if r.tool_calls == [] or not r.tool_calls:
+                return ProviderResponse(text="Fixed the bug. All tests pass now.")
+            return r
+    agent = Agent(P(prov.steps), verbose=False)
+    out = agent.run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "beta"
+    assert agent.claim_unverified and "unverified" in out
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr(appmod, "get_provider_instance", lambda *a, **k: (P(prov.steps), "stub"))
+    T.reset_file_tracking()
+    (tmp_path / "f.txt").write_text("alpha")
+    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
+    assert result.exit_code == 1

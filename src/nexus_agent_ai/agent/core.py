@@ -194,6 +194,7 @@ class Agent:
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
         self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
+        self.claim_unverified = False  # model said tests pass but they were not run / last run failed
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -284,6 +285,7 @@ class Agent:
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
         self.claimed_unapplied_edit = False
+        self.claim_unverified = False
         try:
             while iteration < effective_max_iter:
                 iteration += 1
@@ -452,6 +454,7 @@ class Agent:
                                 status = display.create_status("Thinking...")
                             continue
                         final_text = reviewed
+                        self.claim_unverified = bool(guard.claim_unverified and _wants_edit(user_input))
                     if (local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
                         # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
                         error_nudges += 1

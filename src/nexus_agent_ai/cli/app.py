@@ -231,6 +231,9 @@ def chat(
         if getattr(agent, "claimed_unapplied_edit", False):
             display.print_error("The model said it changed code but no file was modified. Exiting with code 1.")
             raise typer.Exit(code=1)
+        if getattr(agent, "claim_unverified", False):
+            display.print_error("The model claimed the tests pass, but no passing test run backs that up. Exiting with code 1.")
+            raise typer.Exit(code=1)
         if getattr(agent, "unresolved_errors", None) or str(response_text).startswith("Max tool iterations reached"):
             display.print_error("Did not finish cleanly (unresolved tool errors or iteration limit). Exiting with code 1.")
             raise typer.Exit(code=1)
@@ -897,6 +900,37 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+trust_app = typer.Typer(help="Folders where Nexus may run the project's tests (pytest runs the project's code).")
+app.add_typer(trust_app, name="trust")
+
+
+@trust_app.command("list")
+def trust_list():
+    """Show folders you have allowed."""
+    from ..agent import consent
+    folders = consent.list_trusted()
+    if not folders:
+        typer.echo("No folders are remembered. Nexus asks before running tests in a folder.")
+    for f in folders:
+        typer.echo(f)
+
+
+@trust_app.command("add")
+def trust_add(path: str = typer.Argument(".", help="Folder to allow (this exact folder only).")):
+    """Allow running tests in this exact folder, until revoked."""
+    from ..agent import consent
+    typer.echo(f"Allowed: {consent.trust(path)}\nUndo with: nexus-agent trust revoke")
+
+
+@trust_app.command("revoke")
+def trust_revoke(path: str = typer.Argument(".", help="Folder to remove."),
+                 all_folders: bool = typer.Option(False, "--all", help="Remove every remembered folder.")):
+    """Stop allowing test runs in a folder (or all)."""
+    from ..agent import consent
+    n = consent.revoke(path, all_folders=all_folders)
+    typer.echo(f"Removed {n} folder(s).")
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -913,7 +947,7 @@ def main(
             ctx.invoke(repl)
         return
 
-    if ctx.invoked_subcommand == "doctor":
+    if ctx.invoked_subcommand in ("doctor", "trust"):
         return  # diagnostics must work before (and without) the setup wizard
 
     try:

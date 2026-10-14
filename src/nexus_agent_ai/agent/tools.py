@@ -837,10 +837,11 @@ RUN_FILE_TOOL = Tool(
 
 def execute_run_tests(path: str = "", args: str = "") -> str:
     """Execute pytest in the workspace with safety controls, timeout, and output formatting."""
-    if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") != "1":
-        return ("ERROR: Project test execution is disabled. Pytest imports arbitrary project code "
-                "with your user permissions; it is NOT sandboxed. For trusted code only, "
-                "set NEXUS_ALLOW_PROJECT_EXECUTION=1 before launching Nexus.")
+    from .consent import execution_allowed
+    allowed, why = execution_allowed()
+    if not allowed:
+        return ("ERROR: Project test execution is not approved. Pytest imports arbitrary project code "
+                "with your user permissions; it is NOT sandboxed. " + why)
     cmd = [sys.executable, "-m", "pytest", "-o", "addopts="]
 
     # Target path validation
@@ -965,7 +966,8 @@ def get_all_tools() -> List[Tool]:
         GIT_STATUS_TOOL,
         GIT_DIFF_TOOL,
     ]
-    if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") == "1":
+    from .consent import offer_run_tests
+    if offer_run_tests():
         tools.append(RUN_TESTS_TOOL)
     if os.environ.get("NEXUS_ALLOW_GIT_COMMIT") == "1":
         tools.append(GIT_COMMIT_TOOL)
