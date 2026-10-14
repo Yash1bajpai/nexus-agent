@@ -133,3 +133,12 @@ def test_auto_check_runs_after_edit_when_opted_in_and_granted(monkeypatch, tmp_p
     agent.run("fix f.py")
     assert "AUTO CHECK after this edit" in str(agent.memory.get())
     assert "PASSED" in str(agent.memory.get())
+
+
+def test_missing_pytest_is_a_clear_error_not_a_test_failure(monkeypatch):
+    import importlib.util
+    monkeypatch.setenv("NEXUS_ALLOW_PROJECT_EXECUTION", "1")
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda n, *a, **k: None if n == "pytest" else real(n, *a, **k))
+    out = T.execute_run_tests()
+    assert out.startswith("ERROR:") and "pip install pytest" in out and "FAILED" not in out

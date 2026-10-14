@@ -64,7 +64,7 @@ class LoopGuard:
             self.last_tests_output = text
             self.edited_since_tests = False
         elif name == "run_tests":
-            if "not approved" in text or "declined" in text:
+            if "not approved" in text or "declined" in text or "pytest is not installed" in text:
                 self.last_tests, self.last_tests_output = "unavailable", text  # could not run: not a test failure
             else:
                 self.last_tests, self.last_tests_output = "failed", text

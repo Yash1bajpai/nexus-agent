@@ -842,6 +842,10 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
     if not allowed:
         return ("ERROR: Project test execution is not approved. Pytest imports arbitrary project code "
                 "with your user permissions; it is NOT sandboxed. " + why)
+    import importlib.util
+    if importlib.util.find_spec("pytest") is None:
+        return (f"ERROR: pytest is not installed for the Python Nexus runs on. Install it with: "
+                f"\"{sys.executable}\" -m pip install pytest")
     cmd = [sys.executable, "-m", "pytest", "-o", "addopts="]
 
     # Target path validation
