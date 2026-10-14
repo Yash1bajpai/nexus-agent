@@ -53,3 +53,33 @@ jobs:
           set -o pipefail
           nexus-agent chat -p local "say hi in five words" 2>&1 | tee chat.log
           test "$(wc -c < chat.log)" -gt 3
+
+  wizard-e2e:
+    # First-run wizard through a real pty on Linux and macOS: fake key, pick a non-default model, download,
+    # chat, then relaunch from another folder. Manual only (downloads ~2 GB).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheel, clean venv
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m venv "$RUNNER_TEMP/clean"
+          "$RUNNER_TEMP/clean/bin/python" -m pip install --only-binary :all: dist/*.whl
+      - name: Wizard end to end
+        run: |
+          python ci/wizard_e2e.py "$RUNNER_TEMP/clean/bin/nexus-agent-ai" 1500
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wizard-e2e-${{ matrix.os }}
+          path: wizard_e2e.log
