@@ -33,7 +33,7 @@ while time.time() - t0 < TMO:
     if not d:
         break
     out += d
-    txt = re.sub(r"[ \t]*\n[ \t]*", " ", strip(out))  # prompts wrap at 80 columns
+    txt = re.sub(r"\s*[\r\n]+\s*", " ", strip(out))  # prompts wrap at 80 columns
     def reply(key, marker, answer):
         if key not in sent and marker in txt[-1500:]:
             sent.add(key); os.write(fd, answer.encode() + b"\n")
