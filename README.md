@@ -6,19 +6,20 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `
 
 ## Release status
 
-**Current release: 2.10.1** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+**Current release: 2.10.2** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
 
 What changed since 2.8.1:
 
 - 2.10.0: loop guardrails for small local models (see Loop guardrails below).
 - 2.10.1: fixes `/pull-model` crashing inside the interactive REPL.
+- 2.10.2: adds the `nexus-agent-ai` command, resumable verified model downloads with no compiled dependencies, per-folder permission before running a project's tests, and honest failure when an edit is requested but not applied.
 - First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes). The first-run setup asks, in order: optional cloud API keys (Enter skips each, local mode works without any), the default provider (local by default), and the local model (the suggested one for your free RAM, or pick another with its size and RAM need; Enter keeps the suggestion), then asks before downloading. `nexus-agent-ai setup` repeats it at any time.
 - `nexus-agent doctor` checks Python, RAM, disk, download speed, engine, model fit and PATH. `nexus-agent` and `nexus-agent chat` with no question open the REPL.
 - `--context-size` and `/context`, token-based history trimming, `/compact`, a context meter, and one retry on context overflow.
 - Reliable edits: read before patch, CRLF tolerant matching, closest-text hint on a miss, a warning when an edit request ends without a successful write, and a nonzero exit code on unresolved tool errors.
 - API keys are typed hidden and stored owner-only (0600 on Linux/macOS, an owner-only ACL on Windows).
 - Sessions are saved by default; `--continue` resumes the last one.
-- Windows is covered by CI on a real Windows runner (tests, `doctor`, key-file ACL, session IDs from paths with spaces and unicode, CRLF patching). A full local-model download and chat on Windows has not been run in CI because the runner downloads slowly.
+- Windows is covered by CI on a real Windows runner (tests, `doctor`, key-file ACL, session IDs from paths with spaces and unicode, CRLF patching). A real model first run and one chat have passed on Windows in a manual CI run (Python 3.12); a full interactive setup session has not been run on Windows.
 
 `pip install nexus-agent` is an unrelated package. Use `nexus-agent-ai`.
 
