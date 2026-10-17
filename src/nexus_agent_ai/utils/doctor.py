@@ -67,15 +67,10 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
 
     import shutil
     import sysconfig
-    if shutil.which("nexus-agent"):
-        checks.append(("ok", "Command", "nexus-agent is on PATH"))
+    if shutil.which("nexus-agent-ai"):
+        checks.append(("ok", "Command", "nexus-agent-ai is on PATH"))
     else:
-        scheme = "nt_user" if os.name == "nt" else "posix_user"
-        try:
-            scripts = sysconfig.get_path("scripts", scheme)
-        except Exception:
-            scripts = "your Python Scripts folder"
-        checks.append(("warn", "Command", f"nexus-agent is not on PATH. Run it as: python -m nexus_agent_ai   (or add {scripts} to PATH)"))
+        checks.append(("warn", "Command", _path_advice()))
 
     keys = [k for k in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY") if os.getenv(k)]
     checks.append(("info", "Cloud keys", ", ".join(keys) if keys else "none set (local mode works without them)"))
@@ -98,3 +93,31 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
     except Exception as exc:
         checks.append(("fail", "Data folder", f"{home} is not writable ({exc})"))
     return checks
+
+
+def _script_dirs():
+    """Folders where pip may have put the console script for this Python (environment, then user install)."""
+    import sysconfig
+    dirs = []
+    for scheme in (None, "nt_user" if os.name == "nt" else "posix_user"):
+        try:
+            d = sysconfig.get_path("scripts", scheme) if scheme else sysconfig.get_path("scripts")
+        except Exception:
+            d = None
+        if d and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _path_advice() -> str:
+    """Why the bare command is not found and the exact, copy-pasteable fix. pip cannot edit PATH itself."""
+    exe = "nexus-agent-ai.exe" if os.name == "nt" else "nexus-agent-ai"
+    where = next((d for d in _script_dirs() if (Path(d) / exe).exists()), None)
+    run_as = "python -m nexus_agent_ai"
+    if where is None:
+        return f"nexus-agent-ai was not found on PATH or in this Python's script folders. Run it as: {run_as}"
+    if os.name == "nt":
+        fix = f'add {where} to your user PATH (Settings > System > About > Advanced system settings > Environment Variables), then open a new terminal'
+    else:
+        fix = f'add this line to your shell profile (~/.profile, ~/.zshrc or ~/.bashrc): export PATH="{where}:$PATH"'
+    return f"installed in {where}, which is not on PATH (pip does not change PATH). Run it as: {run_as}  or run: {run_as} setup-path (asks first, then adds the folder to your user PATH)  or {fix}"

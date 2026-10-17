@@ -173,3 +173,19 @@ def test_run_tests_maxfail_validation(tmp_path: Path, monkeypatch):
     res_good = execute_tool("run_tests", {"path": str(test_file), "args": "-q --maxfail=1"})
     assert "PASSED" in res_good
 
+
+
+def test_patch_miss_on_small_file_shows_whole_file(tmp_path, monkeypatch):
+    from nexus_agent_ai.agent import tools as T
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("def add(a, b):\n    return a - b\n")
+    T.reset_file_tracking()
+    T.execute_read_file("a.py")
+    out = T.execute_patch_file("a.py", "zzzzzzzzzz qqqqqqqqq", "x")
+    assert "Target content not found" in out and "return a - b" in out
+
+
+def test_run_code_refusal_points_to_run_tests():
+    from nexus_agent_ai.agent import tools as T
+    out = T.execute_run_code("import os\nprint(os.getcwd())")
+    assert "run_tests" in out

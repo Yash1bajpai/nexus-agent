@@ -124,7 +124,8 @@ class Scripted(BaseProvider):
         return {"role": "tool", "tool_call_id": tool_call_id, "content": result}
 
 
-def test_recovered_error_is_not_reported_as_failure(tmp_path):
+def test_recovered_error_is_not_reported_as_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")  # exercise the refused-then-read path itself
     (tmp_path / "f.txt").write_text("alpha")
     prov = Scripted([
         ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}),  # refused: unread
@@ -140,6 +141,7 @@ def test_recovered_error_is_not_reported_as_failure(tmp_path):
 
 
 def test_unfixed_error_stays_and_chat_exits_nonzero(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
     (tmp_path / "f.txt").write_text("alpha")
     prov = Scripted([("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
     agent = Agent(prov, verbose=False)
@@ -214,3 +216,204 @@ def test_doctor_warns_on_readable_key_file(tmp_path, monkeypatch):
     monkeypatch.setattr(doctor.Path, "home", classmethod(lambda cls: home))
     checks = doctor.run_checks(probe_network=False)
     assert any(c[1] == "Key file" and c[0] == "warn" for c in checks)
+
+
+def test_reading_a_file_does_not_clear_a_failed_edit(tmp_path, monkeypatch):
+    """Regression: a failed patch followed by a successful read_file of the same file used to count as fixed,
+    so the CLI exited 0 while the file was unchanged."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([
+        ("patch_file", {"path": "f.txt", "target": "nothere", "replacement": "beta"}),
+        ("read_file", {"path": "f.txt"}),
+        None,
+    ])
+    agent = Agent(prov, verbose=False)
+    out = agent.run("fix f.txt")
+    assert agent.unresolved_errors and "Tool errors occurred" in out
+    assert (tmp_path / "f.txt").read_text() == "alpha"
+
+
+class _Say(BaseProvider):
+    def __init__(self, text):
+        self.text, self.model = text, "stub"
+
+    def complete(self, messages, tools, system):
+        return ProviderResponse(text=self.text)
+
+    def stream(self, **kw):
+        yield self.complete(**kw)
+
+    def format_tool_result_message(self, tool_call_id, result):
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": result}
+
+
+def test_false_claim_of_edit_without_write_is_flagged(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    agent = Agent(_Say("I've fixed the bug in f.txt."), verbose=False)
+    out = agent.run("fix f.txt")
+    assert agent.claimed_unapplied_edit
+    assert "false" in out and (tmp_path / "f.txt").read_text() == "alpha"
+
+
+@pytest.mark.parametrize("text", [
+    "f.txt is already correct, nothing to change.",
+    "No changes are needed here.",
+    "I could not apply a fix because the target was not found.",
+    "That is not a bug, it behaves as designed.",
+])
+def test_legitimate_no_change_answers_are_not_flagged(tmp_path, monkeypatch, text):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    agent = Agent(_Say(text), verbose=False)
+    agent.run("fix f.txt")
+    assert not agent.claimed_unapplied_edit
+
+
+def test_real_edit_is_not_flagged(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    agent = Agent(prov, verbose=False)
+    agent.run("fix f.txt")
+    assert not agent.claimed_unapplied_edit and (tmp_path / "f.txt").read_text() == "beta"
+
+
+def test_cli_exits_nonzero_on_false_edit_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr(appmod, "get_provider_instance", lambda *a, **k: (_Say("I've fixed the bug in f.txt."), "stub"))
+    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
+    assert result.exit_code == 1
+
+
+def test_cli_exits_zero_when_nothing_to_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr(appmod, "get_provider_instance", lambda *a, **k: (_Say("f.txt is already correct."), "stub"))
+    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
+    assert result.exit_code == 0
+
+
+class _Local(Scripted):
+    """Looks like a local model (name contains 'local') and first just talks, then acts when nudged."""
+    def __init__(self, steps):
+        super().__init__(steps)
+        self.model = "lfm-stub"
+
+    def complete(self, messages, tools, system):
+        step = self.steps[min(self.i, len(self.steps) - 1)]
+        self.i += 1
+        if isinstance(step, str):
+            return ProviderResponse(text=step)
+        if step is None:
+            return ProviderResponse(text="Done, patched.")
+        name, args = step
+        return ProviderResponse(tool_calls=[ToolCall(f"c{self.i}", name, args)],
+                                raw_assistant_message={"role": "assistant", "content": "x"})
+
+
+def test_local_model_that_only_talks_gets_nudged_to_edit(tmp_path, monkeypatch):
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = _Local(["The bug is that alpha is wrong; fixing it will help.",
+                   ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    agent = Agent(prov, verbose=False)
+    agent.run("fix f.txt")   # f.txt auto-attached, so patch_file is allowed
+    assert (tmp_path / "f.txt").read_text() == "beta"
+
+
+def test_local_model_saying_nothing_to_change_is_not_nudged(tmp_path):
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = _Local(["f.txt is already correct, nothing to change."])
+    agent = Agent(prov, verbose=False)
+    out = agent.run("fix f.txt")
+    assert prov.i == 1 and (tmp_path / "f.txt").read_text() == "alpha"
+
+
+def test_claim_tests_pass_without_running_is_not_success(tmp_path, monkeypatch):
+    """A written file is not enough: 'tests pass' without a passing run exits 1."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    class P(Scripted):
+        def complete(self, messages, tools, system):
+            r = super().complete(messages, tools, system)
+            if r.tool_calls == [] or not r.tool_calls:
+                return ProviderResponse(text="Fixed the bug. All tests pass now.")
+            return r
+    agent = Agent(P(prov.steps), verbose=False)
+    out = agent.run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "beta"
+    assert agent.claim_unverified and "unverified" in out
+    monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
+    monkeypatch.setattr(appmod, "get_provider_instance", lambda *a, **k: (P(prov.steps), "stub"))
+    T.reset_file_tracking()
+    (tmp_path / "f.txt").write_text("alpha")
+    result = CliRunner().invoke(appmod.app, ["chat", "fix f.txt", "-p", "local", "--no-stream"])
+    assert result.exit_code == 1
+
+
+
+def test_rereading_the_same_file_does_not_end_an_edit_request_early(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}), ("read_file", {"path": "f.txt"}),
+                     ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
+    Agent(prov, verbose=False).run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "beta"
+
+
+def test_forced_loop_stop_still_says_no_file_was_changed(tmp_path, monkeypatch):
+    """The anti-loop stop removes the tools; the 'no file was changed' warning must survive that."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"})] * 4 + [None])
+    out = Agent(prov, verbose=False).run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "alpha"
+    assert "no file was changed" in out
+
+
+def test_no_change_after_edit_request_is_incomplete_but_valid_no_change_is_not(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    a = Agent(Scripted([("read_file", {"path": "f.txt"}), None]), verbose=False)
+    a.run("fix f.txt")
+    assert a.edit_not_applied is True
+    b = Agent(_Local(["f.txt is already correct, nothing to change."]), verbose=False)
+    b.run("fix f.txt")
+    assert b.edit_not_applied is False
+    c = Agent(Scripted([None]), verbose=False)
+    c.run("explain what f.txt does")
+    assert c.edit_not_applied is False
+
+
+def test_chat_exits_1_when_edit_requested_and_nothing_changed(tmp_path, monkeypatch):
+    import nexus_agent_ai.cli.app as appmod
+    from typer.testing import CliRunner
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    monkeypatch.setattr(appmod, "get_provider_instance",
+                        lambda *a, **k: (Scripted([("read_file", {"path": "f.txt"}), None]), "stub"))
+    r = CliRunner().invoke(appmod.app, ["chat", "-p", "local", "fix f.txt"])
+    assert r.exit_code == 1
+
+
+def test_reread_after_a_successful_edit_and_a_failed_patch_is_not_a_loop(tmp_path, monkeypatch):
+    """Transcript from the 2.6B diagnostic (sub.py): read, read again, patch ok, read, failed patch, read again.
+    The last read is needed to recover and must not be treated as a repeat of the reads made before the edit."""
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    (tmp_path / "f.txt").write_text("alpha")
+    prov = Scripted([("read_file", {"path": "f.txt"}), ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "gamma"}),
+                     ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}),  # stale target: fails
+                     ("read_file", {"path": "f.txt"}),
+                     ("patch_file", {"path": "f.txt", "target": "gamma", "replacement": "beta"}), None])
+    Agent(prov, verbose=False).run("fix f.txt")
+    assert (tmp_path / "f.txt").read_text() == "beta"

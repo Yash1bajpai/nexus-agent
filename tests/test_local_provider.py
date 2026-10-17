@@ -1,3 +1,4 @@
+import os
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -42,20 +43,23 @@ def test_local_provider_convert_tools():
     assert converted[0]["function"]["parameters"]["type"] == "object"
 
 
-def test_local_provider_setup_model(monkeypatch, capsys):
+def test_local_provider_setup_model(monkeypatch, capsys, tmp_path):
     prov = LocalProvider()
-    mock_hub_download = MagicMock(return_value="/mock/path/to/liquid-gguf")
-    mock_hf = MagicMock()
-    mock_hf.hf_hub_download = mock_hub_download
+    f = tmp_path / "liquid.gguf"
+    f.write_bytes(b"x")
+    calls = {"dl": 0}
 
-    with patch.dict("sys.modules", {"huggingface_hub": mock_hf}):
-        path = prov.setup_model()
-        assert path == "/mock/path/to/liquid-gguf"
-        # Cache-first probe (no network), then full download if missing
-        assert mock_hub_download.call_count == 2
-        assert mock_hub_download.call_args_list[0].kwargs["local_files_only"] is True
-        assert mock_hub_download.call_args_list[1].kwargs["local_files_only"] is False
-        
+    def fake_download(repo, filename, **kw):
+        calls["dl"] += 1
+        return str(f)
+
+    from nexus_agent_ai.utils import model_download
+    monkeypatch.setattr(model_download, "find_cached", lambda r, n: None)
+    monkeypatch.setattr(model_download, "download", fake_download)
+    path = prov.setup_model()
+    assert path == os.path.realpath(str(f))
+    assert calls["dl"] == 1
+
     captured = capsys.readouterr()
     assert "Initializing nexus-agent..." in captured.out
     assert "Local Liquid LFM engine" in captured.out

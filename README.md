@@ -2,7 +2,7 @@
 
 A terminal coding assistant with a ReAct tool loop, local GGUF inference and optional cloud providers. It can inspect a workspace, make targeted edits, search documentation and help debug code. Model output can be wrong. Review changes before keeping them.
 
-Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent`, `agent`
+Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `nexus-agent`, `agent`
 
 ## Release status
 
@@ -12,7 +12,7 @@ What changed since 2.8.1:
 
 - 2.10.0: loop guardrails for small local models (see Loop guardrails below).
 - 2.10.1: fixes `/pull-model` crashing inside the interactive REPL.
-- First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes).
+- First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes). The first-run setup asks, in order: optional cloud API keys (Enter skips each, local mode works without any), the default provider (local by default), and the local model (the suggested one for your free RAM, or pick another with its size and RAM need; Enter keeps the suggestion), then asks before downloading. `nexus-agent-ai setup` repeats it at any time.
 - `nexus-agent doctor` checks Python, RAM, disk, download speed, engine, model fit and PATH. `nexus-agent` and `nexus-agent chat` with no question open the REPL.
 - `--context-size` and `/context`, token-based history trimming, `/compact`, a context meter, and one retry on context overflow.
 - Reliable edits: read before patch, CRLF tolerant matching, closest-text hint on a miss, a warning when an edit request ends without a successful write, and a nonzero exit code on unresolved tool errors.
@@ -28,11 +28,43 @@ For the published release:
 
 ```bash
 python -m pip install nexus-agent-ai
-nexus-agent --version
+nexus-agent-ai --version
 nexus-agent --help
 ```
 
-**Windows:** if PowerShell says `nexus-agent` is not recognized, the Python Scripts folder is not on PATH (common with `pip install --user`). Run `python -m nexus_agent_ai repl -p local` instead, or add the folder printed by `nexus-agent doctor` to PATH. Windows support is covered by CI on a real Windows runner (see Release status), and install and startup were also seen on one Windows PC.
+### Running tests safely (permission)
+
+`run_tests` runs the project's own code (pytest imports it) on your computer, with your permissions, not sandboxed. Nexus never does this without your say-so:
+
+- In a terminal, when the model first wants to run tests in a folder, Nexus asks: `[o]` once (this folder, until Nexus exits, nothing saved), `[a]` always (this exact folder only, saved in `~/.nexus-agent/trusted_folders.json`), or `[N]` no (default).
+- A saved folder covers only that folder, not its subfolders or parent.
+- See and undo your choices: `nexus-agent-ai trust list`, `nexus-agent-ai trust add [folder]`, `nexus-agent-ai trust revoke [folder]` (`--all` removes everything).
+- Non-interactive runs (scripts, CI) never run tests unless `NEXUS_ALLOW_PROJECT_EXECUTION=1` is set, as before. Use that only for code you trust.
+- Optional: set `NEXUS_AGENT_AUTO_CHECK=1` to run the tests automatically after each successful edit. It only works in folders you already allowed, and is off by default.
+
+If the model says "the tests pass" but no passing test run backs it up, `nexus-agent-ai chat "..."` exits with code 1 and says so.
+
+### Model downloads
+
+Local models come from Hugging Face. The download resumes if interrupted (run the same command again), and size and SHA-256 are checked when Hugging Face provides them. Public models need nothing. For a private or gated model, set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`, or log in with the Hugging Face CLI so `~/.cache/huggingface/token` exists). The token is sent only to huggingface.co and is not forwarded to the download servers it redirects to. Private-repo access has been tested against local test servers only, not a real private repo.
+
+**Known limits:** small local models (1.2B) often fail file edits and may not follow multi-step instructions. In our small checks (5 one-line bug fixes, 2 runs each, CPU only) the 1.2B model fixed 0 to 1 out of 10, so check every change it makes. Windows is covered by CI for the editable install; the plain wheel-install check on Windows is new and unproven.
+
+**Python versions:** tested on 3.11, 3.12 and 3.13 (CI). Newer versions may work but are untested. nexus no longer needs any compiled dependency (the model download is built in, no PyYAML), so install should not need a C++ compiler; this was checked by a wheel-only dependency resolve for Windows, not yet by a real Windows install.
+
+**Supported platforms (what has actually been run).** Python 3.11 or newer. An engine download exists for more platforms than have been tested, so the two are listed separately.
+
+| Platform | Engine asset available | Tested in CI |
+|---|---|---|
+| Windows x64 | yes | wheel install on Python 3.11-3.14; full tests on 3.11 and 3.12; real model first run and one chat (3.12); permission prompt through a real Windows pseudo-console (3.12) |
+| macOS arm64 (GitHub runner) | yes | wheel install and tests on Python 3.11-3.13; real model first run and one chat (3.12) |
+| Linux x64 | yes | tests on Python 3.11-3.13; real model chat and permission prompt checked by hand on 3.13 |
+| Windows ARM, macOS Intel | yes | not tested |
+| Linux ARM | no prebuilt engine (build llama.cpp yourself or use Ollama) | not tested |
+
+CI machines have fast datacenter networks and are not a measure of your hardware, RAM or download speed. Python 3.15 and GPUs are untested; the model download and the engine are CPU only.
+
+**Command not found.** `pip` cannot edit your PATH. If `nexus-agent-ai` is not recognized (common after `pip install --user`, or when the Python installer's "Add to PATH" box was not ticked), run `python -m nexus_agent_ai`; `nexus-agent-ai doctor` prints the exact folder to add to PATH. CI checks this on Windows with the user Scripts folder removed from PATH. If the model download is interrupted, run the same command again: it resumes from the saved partial file.
 
 For this checkout:
 

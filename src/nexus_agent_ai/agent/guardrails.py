@@ -50,6 +50,7 @@ class LoopGuard:
         self._list_directory = list_directory
         self.last_tests: Optional[str] = None  # "passed" | "failed" | None
         self.last_tests_output = ""
+        self.claim_unverified = False
         self.edited_since_tests = False
         self.git_outputs: List[str] = []
         self.test_retries = 0
@@ -63,7 +64,10 @@ class LoopGuard:
             self.last_tests_output = text
             self.edited_since_tests = False
         elif name == "run_tests":
-            self.last_tests, self.last_tests_output = "failed", text
+            if "not approved" in text or "declined" in text or "pytest is not installed" in text:
+                self.last_tests, self.last_tests_output = "unavailable", text  # could not run: not a test failure
+            else:
+                self.last_tests, self.last_tests_output = "failed", text
         elif name in ("patch_file", "write_file") and not text.startswith("ERROR:"):
             self.edited_since_tests = True
         elif name in ("git_status", "git_diff") and not text.startswith("ERROR:"):
@@ -102,10 +106,14 @@ class LoopGuard:
                     "Fix the code with patch_file or write_file, run run_tests again, and only report success if it says PASSED. "
                     "Last result:\n" + self.last_tests_output[-800:]
                 )
+            self.claim_unverified = True
             return "ok", text + "\n\nCorrection: run_tests last reported FAILED. The tests do not pass.\n" + self.last_tests_output[-600:]
         extra = ""
-        if claims_success and self.last_tests is None:
-            extra = "\n\nNote: run_tests was not run, so the claim that tests pass is unverified."
+        if claims_success and self.last_tests in (None, "unavailable"):
+            self.claim_unverified = True
+            extra = ("\n\nNote: the tests were not run, so the claim that they pass is unverified."
+                     if self.last_tests is None else
+                     "\n\nNote: the tests could not be run (permission not given), so the claim that they pass is unverified.")
         elif claims_success and self.edited_since_tests and self.last_tests == "passed":
             extra = "\n\nNote: files changed after the last run_tests, so rerun it to confirm."
         if self.git_outputs and not self._mentions_git_facts(text):

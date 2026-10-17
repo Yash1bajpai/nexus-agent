@@ -108,9 +108,8 @@ def pick_model(available_gb: Optional[float], context_size: int = 4096, android:
 
 def is_cached(repo: str, filename: str) -> bool:
     try:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=repo, filename=filename, local_files_only=True)
-        return os.path.isfile(path)
+        from . import model_download
+        return model_download.find_cached(repo, filename) is not None
     except Exception:
         return False
 
@@ -119,8 +118,8 @@ def probe_speed_mbps(repo: str, filename: str, timeout: float = 6.0, probe_bytes
     """Measure real download speed (MB/s) by fetching a small range of the model file."""
     try:
         import urllib.request
-        from huggingface_hub import hf_hub_url
-        url = hf_hub_url(repo_id=repo, filename=filename)
+        from .model_download import model_url
+        url = model_url(repo, filename)
         req = urllib.request.Request(url, headers={"Range": f"bytes=0-{probe_bytes - 1}"})
         start = time.time()
         with urllib.request.urlopen(req, timeout=timeout) as resp:

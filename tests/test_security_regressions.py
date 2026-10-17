@@ -65,7 +65,7 @@ def test_project_execution_default_denied(tmp_path, monkeypatch):
     monkeypatch.delenv("NEXUS_ALLOW_PROJECT_EXECUTION", raising=False)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "test_canary.py").write_text("from pathlib import Path\nPath('canary').write_text('bad')\n")
-    assert "disabled" in execute_run_tests()
+    assert "not approved" in execute_run_tests()
     assert "run_tests" not in {t.name for t in get_all_tools()}
     assert not (tmp_path / "canary").exists()
 

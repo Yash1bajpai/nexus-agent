@@ -81,6 +81,11 @@ def _is_local_provider(provider: BaseProvider) -> bool:
 
 _EDIT_INTENT = re.compile(r"\b(fix|change|edit|modify|update|replace|rewrite|refactor|patch|rename|implement|add|remove|delete)\b", re.IGNORECASE)
 _WRITE_TOOLS = ("patch_file", "write_file")
+_VERBS = r"(?:fixed|updated|changed|modified|patched|applied|corrected|replaced|rewrote|rewritten|edited|implemented|added|removed|renamed|resolved)"
+# The model says it changed something ("I've fixed...", "the bug has been fixed", "I fixed the bug").
+_CHANGE_CLAIM = re.compile(r"\b(?:i(?:'ve|\s+have)?\s+(?:now\s+|successfully\s+)?" + _VERBS + r"|(?:has|have|was|were|is|are)\s+(?:now\s+|successfully\s+)?(?:been\s+)?" + _VERBS + r")\b", re.IGNORECASE)
+# Legitimate "nothing to change" answers must not be flagged.
+_NO_CHANGE_OK = re.compile(r"\b(already\b|no\s+(?:code\s+)?(?:change|changes|fix|fixes|edit|edits)\s+(?:is\s+|are\s+)?(?:needed|necessary|required)|nothing\s+(?:to\s+(?:change|fix)|needs?)|not\s+(?:a\s+)?bug|(?:did\s+not|didn't|have\s+not|haven't|could\s+not|couldn't|was\s+unable\s+to|unable\s+to)\b)", re.IGNORECASE)
 
 
 def _wants_edit(user_input: str) -> bool:
@@ -133,6 +138,43 @@ def parse_at_mentions(user_input: str) -> str:
         return clean_input + "\n\n" + "\n\n".join(attachments)
     return clean_input
 
+_FILE_TOKEN = re.compile(r'(?<![\w@/\\.-])([\w][\w.\-]*(?:[/\\][\w.\-]+)*\.[A-Za-z0-9]{1,6})(?=[\s.,;:!?)\'"]|$)')
+
+
+def attach_named_files(user_input: str) -> str:
+    if os.environ.get("NEXUS_AGENT_AUTO_ATTACH", "1") == "0":
+        return user_input
+    return _attach_named_files(user_input)
+
+
+def _attach_named_files(user_input: str) -> str:
+    """For edit requests, turn bare names of files that exist in the current folder (calc.py) into
+    @mentions, so their content is attached up front. Small local models often skip read_file and
+    then every edit is refused. Only files inside the working folder are used; a handful at most."""
+    if not _wants_edit(user_input):
+        return user_input
+    cwd = Path.cwd().resolve()
+    seen = []
+    for m in _FILE_TOKEN.finditer(user_input):
+        tok = m.group(1)
+        if tok in seen:
+            continue
+        try:
+            p = (cwd / tok).resolve()
+            if p.is_file() and (cwd == p or cwd in p.parents) and p.stat().st_size <= 100_000:
+                seen.append(tok)
+        except Exception:
+            continue
+        if len(seen) >= 4:
+            break
+    if not seen:
+        return user_input
+    # Append the mentions instead of rewriting the sentence: parse_at_mentions removes "@name" from the
+    # prompt text, and the model must still see which files the user is talking about.
+    out = user_input.rstrip() + " " + " ".join("@" + t for t in seen)
+    return out
+
+
 class Agent:
     """Core autonomous coding agent implementing the ReAct tool-use loop."""
 
@@ -151,6 +193,9 @@ class Agent:
         self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
         self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
+        self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
+        self.edit_not_applied = False  # an edit was requested, nothing was written, and the model did not say nothing needs changing
+        self.claim_unverified = False  # model said tests pass but they were not run / last run failed
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -210,8 +255,9 @@ class Agent:
 
     def run(self, user_input: str, stream: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
-        processed_input = parse_at_mentions(user_input)
+        processed_input = parse_at_mentions(attach_named_files(user_input))
         self.memory.add("user", processed_input)
+        error_nudges = 0
         messages = self.memory.get()
 
         # Smart Tool Routing: for local models, only pass tools when the query
@@ -234,10 +280,15 @@ class Agent:
         force_final = False
         tool_errors = []
         unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
+        unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
         window_scale = 1.0
         wrote_ok = False
+        offered_tools = list(use_tools)  # use_tools is emptied by the anti-loop stop; keep what was offered
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
+        self.claimed_unapplied_edit = False
+        self.edit_not_applied = False
+        self.claim_unverified = False
         try:
             while iteration < effective_max_iter:
                 iteration += 1
@@ -330,13 +381,18 @@ class Agent:
                             result = f"ERROR: Tool '{tool_call.name}' is not allowed in this session."
                         elif tool_sig in executed_tools:
                             duplicate_counts[tool_sig] = duplicate_counts.get(tool_sig, 0) + 1
-                            if duplicate_counts[tool_sig] >= 2:
+                            reread_while_editing = (tool_call.name == "read_file" and not wrote_ok and _wants_edit(user_input)
+                                                    and any(getattr(t, "name", None) in _WRITE_TOOLS for t in offered_tools))
+                            if duplicate_counts[tool_sig] >= (3 if reread_while_editing else 2):
                                 # Hard stop: the model is stuck in a loop.
                                 # Strip tools on the next request and force a direct answer.
                                 force_final = True
                                 result = ("[SYSTEM: TOOL BUDGET EXHAUSTED] You have repeated this exact tool call "
                                           "multiple times. Do NOT call any more tools. Answer the user's original "
                                           "question directly now using the information you already have.")
+                            elif reread_while_editing:
+                                result = ("[SYSTEM] You already read this file; its content is in the earlier tool result. Do not read it "
+                                          "again. Call patch_file (or write_file) now to make the change, then run_tests.")
                             else:
                                 result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
                         else:
@@ -349,17 +405,32 @@ class Agent:
                         if str(result).startswith("ERROR:"):
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
+                            unresolved_tool[error_key] = tool_call.name
                             # A failed call may legitimately be retried unchanged (e.g. after
                             # read_file). Only a repeated failure counts as a loop.
                             failed_counts[tool_sig] = failed_counts.get(tool_sig, 0) + 1
                             if failed_counts[tool_sig] < 2:
                                 executed_tools.discard(tool_sig)
                         elif not str(result).startswith("[SYSTEM"):
-                            unresolved.pop(error_key, None)  # a later success on the same file fixes it
+                            # A later success fixes the error only if it is the same tool succeeding, or a
+                            # write. Reading the file is not a fix for a failed edit.
+                            failed_tool = unresolved_tool.get(error_key)
+                            if failed_tool is None or tool_call.name == failed_tool or tool_call.name in _WRITE_TOOLS:
+                                unresolved.pop(error_key, None)
+                                unresolved_tool.pop(error_key, None)
                             if tool_call.name in _WRITE_TOOLS:
                                 wrote_ok = True
+                                from .consent import auto_check_enabled
+                                if auto_check_enabled() and any(getattr(t, "name", None) == "run_tests" for t in use_tools):
+                                    # Opt-in (NEXUS_AGENT_AUTO_CHECK=1) and already permitted: run the tests now, show the real result.
+                                    from .tools import execute_run_tests
+                                    check = execute_run_tests()
+                                    if guard:
+                                        check = guard.after_tool("run_tests", {}, check)
+                                    result = f"{result}\n\n[AUTO CHECK after this edit, run_tests result]\n{check}"
                                 # State changed: re-running run_tests / read_file / git_* is legitimate now.
                                 executed_tools.clear()
+                                duplicate_counts.clear()  # repeats made before the file changed are not repeats now
                         duration = time.time() - start
 
                         if self.event_callback:
@@ -400,11 +471,41 @@ class Agent:
                                 status = display.create_status("Thinking...")
                             continue
                         final_text = reviewed
+                        self.claim_unverified = bool(guard.claim_unverified and _wants_edit(user_input))
+                    if (local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
+                        # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
+                        error_nudges += 1
+                        self.memory.add("assistant", final_text or "(no answer)")
+                        self.memory.add("user", "[SYSTEM] Your last tool call failed: " + "; ".join(dict.fromkeys(unresolved.values()))[:400]
+                                        + " Do not just describe a plan. Fix this by calling the tools now (read_file first if needed), then finish the task.")
+                        messages = self.memory.get()
+                        if self.verbose and status is None:
+                            status = display.create_status("Thinking...")
+                        continue
+                    if (local_mode and use_tools and not wrote_ok and not unresolved and error_nudges < 2
+                            and iteration < effective_max_iter and _wants_edit(user_input)
+                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in use_tools)
+                            and not _NO_CHANGE_OK.search(final_text or "")):
+                        # An edit was requested, nothing was written, and the model did not say there is nothing to change.
+                        error_nudges += 1
+                        self.memory.add("assistant", final_text or "(no answer)")
+                        self.memory.add("user", "[SYSTEM] No file has been changed yet. Do not explain; act. Call patch_file "
+                                        "(or write_file) now using the exact text from the file, then call run_tests to check.")
+                        messages = self.memory.get()
+                        if self.verbose and status is None:
+                            status = display.create_status("Thinking...")
+                        continue
                     self.unresolved_errors = list(unresolved.values())
                     if (not wrote_ok and not self.unresolved_errors and _wants_edit(user_input)
-                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in (use_tools or []))):
+                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in offered_tools)):
                         final_text += ("\n\nWarning: no file was changed. No successful patch_file or write_file call "
                                        "happened in this run, so do not assume the edit was applied.")
+                        if not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
+                            self.edit_not_applied = True
+                        if _CHANGE_CLAIM.search(final_text.split("\n\nWarning: no file was changed")[0]) and not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
+                            # Not just "nothing to change": the model claimed an edit that never happened.
+                            self.claimed_unapplied_edit = True
+                            final_text += "\nThe claim above that the code was changed is false: the files were not modified."
                     if self.unresolved_errors:
                         final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
                     if self.event_callback:

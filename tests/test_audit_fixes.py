@@ -150,20 +150,17 @@ def test_search_web_offline_labeling():
         assert "[Offline/Cached Reference Data (as of 2025) - Live search unavailable or rate-limited]:" in res
 
 def test_local_provider_setup_model_verify(monkeypatch):
-    """Verify setup_model(verify_download=True) raises RuntimeError if huggingface_hub is missing or fails."""
+    """setup_model(verify_download=True) raises RuntimeError if the download fails."""
     prov = LocalProvider()
-    
-    import builtins
-    orig_import = builtins.__import__
-    def mock_import(name, *args, **kwargs):
-        if name == "huggingface_hub":
-            raise ImportError("No module named huggingface_hub")
-        return orig_import(name, *args, **kwargs)
-    
-    monkeypatch.setattr(builtins, "__import__", mock_import)
+    from nexus_agent_ai.utils import model_download
+    monkeypatch.setattr(model_download, "find_cached", lambda r, n: None)
+
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(model_download, "download", boom)
     with pytest.raises(RuntimeError) as excinfo:
         prov.setup_model(verify_download=True)
-    assert "huggingface_hub package is not installed" in str(excinfo.value)
+    assert "Failed to pull model" in str(excinfo.value)
 
 class MockStreamProvider(BaseProvider):
     def __init__(self):

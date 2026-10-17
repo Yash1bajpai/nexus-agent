@@ -36,6 +36,45 @@ jobs:
         shell: pwsh
         run: python scripts/windows_smoke.py
 
+  wheel-install:
+    # What a new user does: only Python present, plain pip install of the built wheel, no extras.
+    # --only-binary :all: proves nothing needs a compiler. Not the same as the editable-install job above.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+      - name: Clean venv install, binary wheels only
+        shell: pwsh
+        run: |
+          python -m venv $env:RUNNER_TEMP\clean
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip install --only-binary :all: $wheel
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip list
+      - name: Command works and no PyYAML pulled in
+        shell: pwsh
+        run: |
+          $env:Path = "$env:RUNNER_TEMP\clean\Scripts;$env:Path"
+          nexus-agent-ai --version
+          if ($LASTEXITCODE -ne 0) { throw "nexus-agent-ai failed" }
+          nexus-agent-ai doctor --no-network
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+          $pl = & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip list
+          if ($pl -match "(?i)pyyaml|huggingface") { throw "unexpected dependency present" }
+
   first-run:
     # Real model download + chat. Slow (the runner measured ~1 MB/s from Hugging Face), so manual only.
     if: github.event_name == 'workflow_dispatch'
@@ -59,3 +98,131 @@ jobs:
           nexus-agent chat -p local "say hi in five words" 2>&1 | Tee-Object -FilePath chat.log
           if ($LASTEXITCODE -ne 0) { throw "chat failed with exit code $LASTEXITCODE" }
           if ((Get-Content chat.log -Raw).Trim().Length -lt 3) { throw "empty chat output" }
+
+  permission-prompt-conpty:
+    # Real Windows pseudo-console. Scratch folder, throwaway home, answers typed by the script.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheel and install it into a clean venv
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m venv $env:RUNNER_TEMP\clean
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe -m pip install --only-binary :all: $wheel pywinpty
+      - name: Permission prompt through ConPTY
+        shell: pwsh
+        run: |
+          & $env:RUNNER_TEMP\clean\Scripts\python.exe ci\pty_consent_windows.py $env:RUNNER_TEMP\clean\Scripts\python.exe
+          if ($LASTEXITCODE -ne 0) { throw "ConPTY permission flow failed" }
+
+  user-install-path:
+    # What a plain `pip install --user` leaves behind: is the bare command found, and does the fallback work?
+    # Reports the real result; PATH is not edited to make it pass.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install with --user and look for the command
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          python -m pip install --user --only-binary :all: $wheel
+          $userScripts = python -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          Write-Host "user Scripts folder: $userScripts"
+          Write-Host ("script exists there: " + (Test-Path "$userScripts\nexus-agent-ai.exe"))
+          $onPath = ($env:PATH -split ';') -contains $userScripts
+          Write-Host "user Scripts folder on PATH: $onPath"
+          Write-Host ("Get-Command nexus-agent-ai: " + [bool](Get-Command nexus-agent-ai -ErrorAction SilentlyContinue))
+          python -m nexus_agent_ai --version
+          if ($LASTEXITCODE -ne 0) { throw "python -m nexus_agent_ai failed" }
+          python -m nexus_agent_ai doctor --no-network | Select-String "Command"
+      - name: Same install with the user Scripts folder NOT on PATH (python.org style)
+        shell: pwsh
+        run: |
+          $userScripts = python -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ne $userScripts.TrimEnd('\') }) -join ';'
+          $found = [bool](Get-Command nexus-agent-ai -ErrorAction SilentlyContinue)
+          Write-Host "bare command found with folder removed from PATH: $found"
+          if ($found) { throw "expected the bare command to be missing in this simulation" }
+          python -m nexus_agent_ai --version
+          if ($LASTEXITCODE -ne 0) { throw "python -m nexus_agent_ai failed" }
+          $out = python -m nexus_agent_ai doctor --no-network | Out-String
+          Write-Host $out
+          if ($out -notmatch [regex]::Escape($userScripts)) { throw "doctor did not name the Scripts folder" }
+          if ($out -notmatch "python -m nexus_agent_ai") { throw "doctor did not give the python -m fallback" }
+      - name: setup-path adds the folder to the USER PATH when asked, and a fresh terminal then finds the bare command
+        shell: pwsh
+        run: |
+          $userScripts = python -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ne $userScripts.TrimEnd('\') }) -join ';'
+          python -m nexus_agent_ai setup-path --yes
+          if ($LASTEXITCODE -ne 0) { throw "setup-path failed" }
+          $user = [Environment]::GetEnvironmentVariable('Path','User')
+          Write-Host "user PATH now contains the folder: $(($user -split ';') -contains $userScripts)"
+          if (-not (($user -split ';') -contains $userScripts)) { throw "user PATH not updated" }
+          # what a NEW terminal would see: machine PATH + user PATH from the registry
+          $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + $user
+          $cmd = Get-Command nexus-agent-ai -ErrorAction SilentlyContinue
+          Write-Host "fresh-terminal Get-Command: $([bool]$cmd)"
+          if (-not $cmd) { throw "bare command still not found after setup-path" }
+          nexus-agent-ai --version
+          if ($LASTEXITCODE -ne 0) { throw "bare nexus-agent-ai failed" }
+          # idempotent: second run adds nothing
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ne $userScripts.TrimEnd('\') }) -join ';'
+          python -m nexus_agent_ai setup-path --yes
+          $count = (([Environment]::GetEnvironmentVariable('Path','User')) -split ';' | Where-Object { $_.TrimEnd('\') -eq $userScripts.TrimEnd('\') }).Count
+          Write-Host "entries for the folder after a second run: $count"
+          if ($count -ne 1) { throw "duplicate PATH entry" }
+
+  isolated-profile:
+    # A brand-new-user simulation: new venv + a brand-new, empty USER PROFILE folder (USERPROFILE override).
+    # Proves config, keys, first-run flag, models and engine all land in the override and the real profile is untouched.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+      - name: Fresh venv plus fresh profile
+        shell: pwsh
+        run: |
+          $real = $env:USERPROFILE
+          python -m venv "$env:RUNNER_TEMP\nx-venv"
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\python.exe" -m pip install --only-binary :all: (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          $fake = "$env:RUNNER_TEMP\nexus-test-home"
+          New-Item -ItemType Directory $fake | Out-Null
+          $env:USERPROFILE = $fake
+          Remove-Item Env:HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:HOMEDRIVE -ErrorAction SilentlyContinue
+          Remove-Item Env:HOMEPATH -ErrorAction SilentlyContinue
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\python.exe" ci\profile_isolation.py $real $fake
+          if ($LASTEXITCODE -ne 0) { throw "profile isolation failed" }
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\nexus-agent-ai.exe" doctor --no-network
+          Write-Host "files in the fresh profile:"; Get-ChildItem -Force -Recurse $fake | Select-Object -First 20 FullName
+          # direct venv executable (no Activate.ps1, no execution-policy dependency) works, and the venv never triggers a PATH edit
+          & "$env:RUNNER_TEMP\nx-venv\Scripts\nexus-agent-ai.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "direct venv executable failed" }
+          $userPathBefore = [Environment]::GetEnvironmentVariable('Path','User')
+          $offer = & "$env:RUNNER_TEMP\nx-venv\Scripts\python.exe" -c "from nexus_agent_ai.utils import pathfix; print(pathfix.folder_missing_from_path())"
+          Write-Host "PATH offer inside venv: $offer"
+          if ($offer -ne "None") { throw "venv should never be offered a PATH edit" }
+          if ([Environment]::GetEnvironmentVariable('Path','User') -ne $userPathBefore) { throw "user PATH changed" }

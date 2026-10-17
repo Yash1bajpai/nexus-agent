@@ -223,6 +223,10 @@ def _target_not_found_message(path: str, content: str, target: str) -> str:
     if best_i >= 0 and best_ratio >= 0.4:
         snippet = "\n".join(f"{best_i + k + 1}: {ln}" for k, ln in enumerate(lines[best_i:best_i + min(n, 12)]))
         msg += f"\nClosest text in the file (lines {best_i + 1}-{best_i + min(n, 12)}):\n{snippet}\nCopy the target from these lines exactly and retry."
+    elif len(lines) <= 40:
+        # Nothing similar: show the whole (small) file so the model copies real text instead of inventing it.
+        numbered = "\n".join(f"{k + 1}: {ln}" for k, ln in enumerate(lines))
+        msg += f"\nThe whole file ({len(lines)} lines):\n{numbered}\nCopy the target from these lines exactly and retry."
     return msg
 
 
@@ -464,7 +468,7 @@ def _sandbox_check(code: str) -> str | None:
             f"run_code is for pure computation only (math, algorithms, data processing).\n"
             f"For file I/O -> use read_file / write_file tools.\n"
             f"For shell commands -> use git_status / git_diff tools.\n"
-            f"Existing scripts cannot be executed by the agent."
+            f"Existing scripts cannot be executed by run_code. To run the project's tests use the run_tests tool."
         )
     return None
 
@@ -833,10 +837,15 @@ RUN_FILE_TOOL = Tool(
 
 def execute_run_tests(path: str = "", args: str = "") -> str:
     """Execute pytest in the workspace with safety controls, timeout, and output formatting."""
-    if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") != "1":
-        return ("ERROR: Project test execution is disabled. Pytest imports arbitrary project code "
-                "with your user permissions; it is NOT sandboxed. For trusted code only, "
-                "set NEXUS_ALLOW_PROJECT_EXECUTION=1 before launching Nexus.")
+    from .consent import execution_allowed
+    allowed, why = execution_allowed()
+    if not allowed:
+        return ("ERROR: Project test execution is not approved. Pytest imports arbitrary project code "
+                "with your user permissions; it is NOT sandboxed. " + why)
+    import importlib.util
+    if importlib.util.find_spec("pytest") is None:
+        return (f"ERROR: pytest is not installed for the Python Nexus runs on. Install it with: "
+                f"\"{sys.executable}\" -m pip install pytest")
     cmd = [sys.executable, "-m", "pytest", "-o", "addopts="]
 
     # Target path validation
@@ -961,7 +970,8 @@ def get_all_tools() -> List[Tool]:
         GIT_STATUS_TOOL,
         GIT_DIFF_TOOL,
     ]
-    if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") == "1":
+    from .consent import offer_run_tests
+    if offer_run_tests():
         tools.append(RUN_TESTS_TOOL)
     if os.environ.get("NEXUS_ALLOW_GIT_COMMIT") == "1":
         tools.append(GIT_COMMIT_TOOL)
