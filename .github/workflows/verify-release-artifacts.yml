@@ -1,0 +1,59 @@
+name: Verify exact release artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "release-asset or pypi"
+        required: true
+        default: "release-asset"
+jobs:
+  verify-wheel:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Fetch exact wheel (GitHub release asset) and verify SHA-256
+        if: inputs.source == 'release-asset'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/Yash1bajpai/nexus-agent/releases/download/v2.10.2/nexus_agent_ai-2.10.2-py3-none-any.whl"
+          Invoke-WebRequest -Uri $url -OutFile exact.whl
+          $h = (Get-FileHash exact.whl -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne "f260d6d8ca60c4225d80459b471e9c40999abdab535cf5d920cb5bd47abb712b") { throw "hash mismatch: $h" }
+          "hash ok: $h"
+      - name: Fetch exact wheel (PyPI) and verify SHA-256
+        if: inputs.source == 'pypi'
+        shell: pwsh
+        run: |
+          $j = Invoke-RestMethod -Uri "https://pypi.org/pypi/nexus-agent-ai/2.10.2/json"
+          $f = $j.urls | Where-Object { $_.filename -eq "nexus_agent_ai-2.10.2-py3-none-any.whl" }
+          if (-not $f) { throw "wheel not found on PyPI" }
+          if ($f.digests.sha256 -ne "f260d6d8ca60c4225d80459b471e9c40999abdab535cf5d920cb5bd47abb712b") { throw "PyPI hash mismatch: $($f.digests.sha256)" }
+          "PyPI hash ok: $($f.digests.sha256)"
+          Invoke-WebRequest -Uri $f.url -OutFile exact.whl
+          $h = (Get-FileHash exact.whl -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne "f260d6d8ca60c4225d80459b471e9c40999abdab535cf5d920cb5bd47abb712b") { throw "downloaded hash mismatch: $h" }
+      - name: Clean venv install of exact wheel, binary wheels only
+        shell: pwsh
+        run: |
+          python -m venv $env:RUNNER_TEMP\exact
+          & $env:RUNNER_TEMP\exact\Scripts\python.exe -m pip install --only-binary :all: .\exact.whl
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+      - name: Smoke the exact artifact
+        shell: pwsh
+        run: |
+          $env:Path = "$env:RUNNER_TEMP\exact\Scripts;$env:Path"
+          $v = nexus-agent-ai --version
+          if ($LASTEXITCODE -ne 0) { throw "version failed" }
+          "version output: $v"
+          if ("$v" -notmatch "2\.10\.2") { throw "unexpected version: $v" }
+          nexus-agent --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "nexus-agent --help failed" }
+          agent --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "agent --help failed" }
+          nexus-agent-ai doctor --no-network
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+          $pl = & $env:RUNNER_TEMP\exact\Scripts\python.exe -m pip list
+          if ($pl -match "(?i)pyyaml|huggingface|torch") { throw "unexpected compiled/heavy dependency present" }
