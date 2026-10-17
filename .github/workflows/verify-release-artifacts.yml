@@ -1,21 +1,18 @@
 name: Verify exact release artifacts
 on:
-  workflow_dispatch:
-    inputs:
-      source:
-        description: "release-asset or pypi"
-        required: true
-        default: "release-asset"
+  push:
+    branches: [verify-release-wheel]
 jobs:
   verify-wheel:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Fetch exact wheel (GitHub release asset) and verify SHA-256
-        if: inputs.source == 'release-asset'
+        if: ${{ !contains(github.event.head_commit.message, 'source=pypi') }}
         shell: pwsh
         run: |
           $url = "https://github.com/Yash1bajpai/nexus-agent/releases/download/v2.10.2/nexus_agent_ai-2.10.2-py3-none-any.whl"
@@ -24,7 +21,7 @@ jobs:
           if ($h -ne "f260d6d8ca60c4225d80459b471e9c40999abdab535cf5d920cb5bd47abb712b") { throw "hash mismatch: $h" }
           "hash ok: $h"
       - name: Fetch exact wheel (PyPI) and verify SHA-256
-        if: inputs.source == 'pypi'
+        if: ${{ contains(github.event.head_commit.message, 'source=pypi') }}
         shell: pwsh
         run: |
           $j = Invoke-RestMethod -Uri "https://pypi.org/pypi/nexus-agent-ai/2.10.2/json"
