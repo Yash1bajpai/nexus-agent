@@ -6,12 +6,13 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `
 
 ## Release status
 
-**Current release: 2.10.1** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+**Current release: 2.10.2** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
 
 What changed since 2.8.1:
 
 - 2.10.0: loop guardrails for small local models (see Loop guardrails below).
 - 2.10.1: fixes `/pull-model` crashing inside the interactive REPL.
+- 2.10.2: adds the `nexus-agent-ai` command, resumable verified model downloads with no compiled dependencies, per-folder permission before running a project's tests, and honest failure when an edit is requested but not applied.
 - First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes). The first-run setup asks, in order: optional cloud API keys (Enter skips each, local mode works without any), the default provider (local by default), and the local model (the suggested one for your free RAM, or pick another with its size and RAM need; Enter keeps the suggestion), then asks before downloading. `nexus-agent-ai setup` repeats it at any time.
 - `nexus-agent doctor` checks Python, RAM, disk, download speed, engine, model fit and PATH. `nexus-agent` and `nexus-agent chat` with no question open the REPL.
 - `--context-size` and `/context`, token-based history trimming, `/compact`, a context meter, and one retry on context overflow.
