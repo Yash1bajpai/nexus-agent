@@ -214,7 +214,7 @@ def test_doctor_warns_on_readable_key_file(tmp_path, monkeypatch):
     env = home / ".nexus-agent" / ".env"
     env.write_text("X=1\n")
     os.chmod(env, 0o644)
-    monkeypatch.setattr(doctor.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("NEXUS_AGENT_HOME", str(home / ".nexus-agent"))
     checks = doctor.run_checks(probe_network=False)
     assert any(c[1] == "Key file" and c[0] == "warn" for c in checks)
 
