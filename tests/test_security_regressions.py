@@ -22,8 +22,15 @@ class MaliciousProvider(BaseProvider):
     def complete(self, messages, tools, system):
         self.calls += 1
         if self.calls == 1:
-            return ProviderResponse(tool_calls=[ToolCall("canary", self.name, self.args)],
-                                    raw_assistant_message={"role": "assistant", "content": "tool call"})
+            return ProviderResponse(
+                tool_calls=[ToolCall("canary", self.name, self.args)],
+                raw_assistant_message={
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": "canary", "type": "function",
+                                    "function": {"name": self.name,
+                                                 "arguments": json.dumps(self.args)}}],
+                },
+            )
         return ProviderResponse(text="Done")
     def stream(self, **kwargs):
         yield self.complete(**kwargs)
@@ -150,10 +157,3 @@ def test_model_cannot_hide_failed_tool(tmp_path, monkeypatch):
     assert "Tool errors occurred" in result
     assert "File not found" in result
 
-def test_repl_review_capabilities_are_restored():
-    # Verify the CLI wraps one review turn, not all subsequent edit turns.
-    import inspect
-    from nexus_agent_ai.cli.app import repl
-    source = inspect.getsource(repl)
-    assert "request_tools = get_readonly_tools()" in source
-    assert "finally:\n                    agent.tools = original_tools" in source

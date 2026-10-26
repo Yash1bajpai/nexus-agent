@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 # pyrefly: ignore [missing-import]
 from ..utils.config import get_env_or_raise
+from .messages import assistant_message, gemini_messages, tool_result
 
 class GeminiProvider(BaseProvider):
     """LLM Provider implementation for Google Gemini models via google-genai SDK."""
@@ -21,39 +22,7 @@ class GeminiProvider(BaseProvider):
         self.model = model
 
     def _format_messages(self, messages: List[Dict[str, Any]]) -> List[Any]:
-        formatted = []
-        for msg in messages:
-            if not isinstance(msg, dict):
-                formatted.append(msg)
-            elif "parts" in msg:
-                msg_copy = dict(msg)
-                if msg_copy.get("role") == "tool":
-                    msg_copy["role"] = "user"
-                formatted.append(msg_copy)
-            else:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if role == "assistant":
-                    role = "model"
-                elif role == "tool":
-                    role = "user"
-                    tool_name = msg.get("name") or msg.get("tool_call_id", "unknown_tool")
-                    if "_" in tool_name and not tool_name.startswith("call_"):
-                        tool_name = tool_name.rsplit("_", 1)[0]
-                    formatted.append({
-                        "role": "user",
-                        "parts": [{
-                            "function_response": {
-                                "name": tool_name,
-                                "response": {"result": content},
-                            }
-                        }]
-                    })
-                    continue
-                elif role == "system":
-                    continue
-                formatted.append({"role": role, "parts": [{"text": content}]})
-        return formatted
+        return gemini_messages(messages)
 
     def _convert_tools(self, tools: List[Tool]) -> Any:
         if not tools:
@@ -93,6 +62,10 @@ class GeminiProvider(BaseProvider):
         text = ""
         tool_calls = []
 
+        if not getattr(response, "candidates", None):
+            feedback = getattr(response, "prompt_feedback", None)
+            reason = getattr(feedback, "block_reason", None) or "empty response"
+            raise RuntimeError(f"Gemini returned no candidates ({reason}).")
         candidate = response.candidates[0]
         parts = None
         if candidate.content and candidate.content.parts:
@@ -106,7 +79,7 @@ class GeminiProvider(BaseProvider):
                     fc = part.function_call
                     tool_calls.append(
                         ToolCall(
-                            id=f"{fc.name}_{uuid.uuid4().hex[:8]}",
+                            id=fc.id if isinstance(getattr(fc, "id", None), str) and fc.id else f"call_{uuid.uuid4().hex}",
                             name=fc.name,
                             args=dict(fc.args) if fc.args else {},
                         )
@@ -120,7 +93,7 @@ class GeminiProvider(BaseProvider):
             except Exception:
                 pass
 
-        raw_msg = candidate.content
+        raw_msg = assistant_message(text, tool_calls)
 
         in_tokens = 0
         out_tokens = 0
@@ -165,22 +138,23 @@ class GeminiProvider(BaseProvider):
                                     fc = part.function_call
                                     tool_calls.append(
                                         ToolCall(
-                                            id=f"{fc.name}_{uuid.uuid4().hex[:8]}",
+                                            id=fc.id if isinstance(getattr(fc, "id", None), str) and fc.id else f"call_{uuid.uuid4().hex}",
                                             name=fc.name,
                                             args=dict(fc.args) if fc.args else {},
                                         )
                                     )
 
+            if not full_text and not tool_calls:
+                feedback = getattr(last_chunk, "prompt_feedback", None)
+                reason = getattr(feedback, "block_reason", None) or "empty stream"
+                raise RuntimeError(f"Gemini returned no usable content ({reason}).")
             in_tokens = 0
             out_tokens = 0
             if last_chunk and hasattr(last_chunk, "usage_metadata") and last_chunk.usage_metadata:
                 in_tokens = int(getattr(last_chunk.usage_metadata, "prompt_token_count", 0) or 0)
                 out_tokens = int(getattr(last_chunk.usage_metadata, "candidates_token_count", 0) or 0)
 
-            raw_parts = [{"text": "".join(full_text)}] if full_text else []
-            for tc in tool_calls:
-                raw_parts.append({"function_call": {"name": tc.name, "args": tc.args}})
-            raw_msg = {"role": "model", "parts": raw_parts}
+            raw_msg = assistant_message("".join(full_text), tool_calls)
             yield ProviderResponse(
                 text="".join(full_text),
                 tool_calls=tool_calls,
@@ -195,15 +169,4 @@ class GeminiProvider(BaseProvider):
             raise
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
-        func_name = tool_call_id.rsplit("_", 1)[0] if ("_" in tool_call_id and not tool_call_id.startswith("call_")) else tool_call_id
-        return {
-            "role": "user",
-            "parts": [
-                {
-                    "function_response": {
-                        "name": func_name,
-                        "response": {"result": result},
-                    }
-                }
-            ],
-        }
+        return tool_result(tool_call_id, result)

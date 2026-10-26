@@ -183,7 +183,7 @@ def test_local_provider_stop_and_cleanup(tmp_path, monkeypatch):
     assert mock_proc.terminate.called
     assert prov._server_proc is None
     assert mock_proc not in _ACTIVE_SERVER_PROCS
-    assert not pid_file.exists()
+    assert pid_file.read_text(encoding="utf-8") == "12345"
 
 
 def test_terminate_proc_force_kills_on_timeout():

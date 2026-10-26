@@ -13,6 +13,7 @@ os.environ["HOME"] = str(home)
 from nexus_agent_ai.cli import onboarding as o  # noqa: E402
 from nexus_agent_ai.agent.persistence import get_workspace_session_id  # noqa: E402
 from nexus_agent_ai.agent import tools as T  # noqa: E402
+from nexus_agent_ai.utils.private_files import restrict_permissions  # noqa: E402
 
 results = []
 
@@ -26,7 +27,7 @@ def check(name, cond, detail=""):
 o.USER_CONFIG_DIR = home / ".nexus-agent"
 o.ENV_FILE = o.USER_CONFIG_DIR / ".env"
 o.USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-o._restrict_permissions(o.USER_CONFIG_DIR, 0o700)
+restrict_permissions(o.USER_CONFIG_DIR, 0o700)
 o._write_env_key("OPENAI_API_KEY", "sk-test-not-real")
 if os.name == "nt":
     acl = subprocess.run(["icacls", str(o.ENV_FILE)], capture_output=True, text=True).stdout

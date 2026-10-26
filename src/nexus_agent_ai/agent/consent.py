@@ -4,7 +4,8 @@ Three ways to be allowed, none automatic:
   - NEXUS_ALLOW_PROJECT_EXECUTION=1 in the environment (existing behaviour, applies everywhere),
   - the user answers "once" at the prompt (this folder, until the program exits, nothing saved),
   - the user answers "always" or runs `nexus-agent trust add` (this exact folder, saved until revoked).
-Nothing is ever allowed without a person answering or setting the variable. A non-interactive run is refused.
+Without an existing grant, non-interactive runs are refused. Saved exact-folder
+grants and explicit environment opt-ins also work non-interactively.
 """
 from __future__ import annotations
 
@@ -114,8 +115,8 @@ def execution_allowed() -> Tuple[bool, str]:
 
 
 def offer_run_tests() -> bool:
-    """Should the model be told run_tests exists? Yes if the variable is set, this folder is remembered, or a
-    person is at the terminal (they get asked when it is called). Never in a non-interactive run."""
+    """Offer execution for explicit opt-ins, saved exact-folder grants, or an
+    interactive terminal (where calling the tool asks for permission)."""
     if os.environ.get("NEXUS_ALLOW_PROJECT_EXECUTION") == "1":
         return True
     return folder_key() in list_trusted() or _interactive()

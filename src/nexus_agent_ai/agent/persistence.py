@@ -1,8 +1,12 @@
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from ..providers.messages import normalize_messages
 from ..utils.config import MAX_CONVERSATION_MESSAGES
+from ..utils.private_files import restrict_permissions
+
 
 def get_workspace_session_id(cwd: Optional[Path] = None) -> str:
     """Generate a stable, unique session ID based on the workspace directory path."""
@@ -17,21 +21,23 @@ def get_workspace_session_id(cwd: Optional[Path] = None) -> str:
     clean_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in folder_name)
     return f"{clean_name}_{path_hash}"
 
+
 class SQLiteMemory:
-    """Persistent SQLite-backed conversation buffer for Nexus-Agent sessions."""
+    """Persistent canonical history. Every operation closes its SQLite handle."""
 
     def __init__(self, db_path: Optional[Path] = None, session_id: Optional[str] = None, max_messages: int = MAX_CONVERSATION_MESSAGES):
-        if db_path is None:
-            home_dir = Path.home() / ".nexus-agent"
-            home_dir.mkdir(parents=True, exist_ok=True)
-            db_path = home_dir / "history.db"
-        self.db_path = db_path
+        self.db_path = Path(db_path) if db_path is not None else Path.home() / ".nexus-agent" / "history.db"
         self.session_id = session_id or get_workspace_session_id()
         self.max_messages = max_messages
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # The containing directory protects SQLite journal/sidecar files too.
+        restrict_permissions(self.db_path.parent, 0o700)
+        self.db_path.touch(exist_ok=True)
+        restrict_permissions(self.db_path, 0o600)
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS conversation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,100 +47,71 @@ class SQLiteMemory:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            conn.commit()
 
     def add(self, role: str, content: str):
-        """Add a text message to persistent SQLite storage."""
-        msg = {"role": role, "content": content}
-        self.add_raw(msg)
+        self.add_raw({"role": role, "content": content})
 
-    def add_raw(self, message: Dict[str, Any]):
-        """Add a raw message object to SQLite storage and prune older entries."""
-        role = message.get("role", "unknown")
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT INTO conversation_history (session_id, role, message_json) VALUES (?, ?, ?)",
-                (self.session_id, role, json.dumps(message))
-            )
-            self._prune(conn)
-            conn.commit()
+    def add_raw(self, message: Any):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            rows = self._rows(conn)
+            old = [json.loads(row[1]) for row in rows]
+            messages = normalize_messages([*old, message])
+            from .memory import ConversationMemory
+            memory = ConversationMemory(max_messages=self.max_messages)
+            memory.messages = messages
+            memory._prune()
+            self._replace(conn, memory.messages)
 
-    def _prune(self, conn):
-        """Enforce sliding window limit cleanly without breaking tool_call / tool_result pairs.
-        Detects Anthropic tool_result (content with type='tool_result'), Gemini function_response
-        (parts with function_response), and OpenAI tool role to avoid orphaned messages."""
-        cursor = conn.execute(
-            "SELECT id, role, message_json FROM conversation_history WHERE session_id = ? ORDER BY id ASC",
-            (self.session_id,)
-        )
-        rows = cursor.fetchall()
-        if len(rows) <= self.max_messages:
-            return
-
-        # Use exactly the in-memory policy so active turns and tool pairs stay together.
-        from .memory import ConversationMemory
-        memory = ConversationMemory(max_messages=self.max_messages)
-        memory.messages = [json.loads(row[2]) for row in rows]
-        memory._prune()
-        removed = len(rows) - len(memory.messages)
-        if removed:
-            cutoff_id = rows[removed][0]
-            conn.execute("DELETE FROM conversation_history WHERE session_id = ? AND id < ?", (self.session_id, cutoff_id))
+    def _rows(self, conn):
+        return conn.execute(
+            "SELECT id, message_json FROM conversation_history WHERE session_id = ? ORDER BY id ASC",
+            (self.session_id,),
+        ).fetchall()
 
     def get(self) -> List[Dict[str, Any]]:
-        """Retrieve recent messages for the active session."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "SELECT message_json FROM conversation_history WHERE session_id = ? ORDER BY id ASC",
-                (self.session_id,)
-            )
-            rows = cursor.fetchall()
-        return [json.loads(row[0]) for row in rows]
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            old = [json.loads(row[1]) for row in self._rows(conn)]
+            messages = normalize_messages(old)
+            if messages != old:
+                self._replace(conn, messages)
+            return messages
+
+    def _replace(self, conn, messages):
+        conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (self.session_id,))
+        conn.executemany(
+            "INSERT INTO conversation_history (session_id, role, message_json) VALUES (?, ?, ?)",
+            [(self.session_id, message["role"], json.dumps(message)) for message in messages],
+        )
 
     def replace(self, messages: List[Dict[str, Any]]):
-        """Replace the stored history for this session (used by /compact)."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (self.session_id,))
-            for message in messages:
-                conn.execute(
-                    "INSERT INTO conversation_history (session_id, role, message_json) VALUES (?, ?, ?)",
-                    (self.session_id, message.get("role", "unknown"), json.dumps(message)),
-                )
-            conn.commit()
+        messages = normalize_messages(messages)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            self._replace(conn, messages)
 
     def clear(self):
-        """Clear session history from database."""
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (self.session_id,))
-            conn.commit()
 
     @classmethod
     def list_sessions(cls, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
-        """List all stored sessions with message counts and last activity."""
-        if db_path is None:
-            db_path = Path.home() / ".nexus-agent" / "history.db"
+        db_path = Path(db_path) if db_path is not None else Path.home() / ".nexus-agent" / "history.db"
         if not db_path.exists():
             return []
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.execute("""
+        restrict_permissions(db_path.parent, 0o700)
+        restrict_permissions(db_path, 0o600)
+        with closing(sqlite3.connect(db_path)) as conn:
+            rows = conn.execute("""
                 SELECT session_id, COUNT(*) as msg_count, MAX(timestamp) as last_active
-                FROM conversation_history
-                GROUP BY session_id
-                ORDER BY last_active DESC
-            """)
-            return [
-                {"session_id": row[0], "message_count": row[1], "last_active": row[2]}
-                for row in cursor.fetchall()
-            ]
+                FROM conversation_history GROUP BY session_id ORDER BY last_active DESC
+            """).fetchall()
+            return [{"session_id": row[0], "message_count": row[1], "last_active": row[2]} for row in rows]
 
     @classmethod
     def delete_session(cls, session_id: str, db_path: Optional[Path] = None):
-        """Delete all messages for a specific session."""
-        if db_path is None:
-            db_path = Path.home() / ".nexus-agent" / "history.db"
+        db_path = Path(db_path) if db_path is not None else Path.home() / ".nexus-agent" / "history.db"
         if not db_path.exists():
             return
-        with sqlite3.connect(db_path) as conn:
+        restrict_permissions(db_path.parent, 0o700)
+        restrict_permissions(db_path, 0o600)
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (session_id,))
-            conn.commit()
-

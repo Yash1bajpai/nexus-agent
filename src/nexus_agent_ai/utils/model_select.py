@@ -67,8 +67,10 @@ def available_ram_gb() -> Optional[float]:
 
 
 def free_disk_gb(path: Optional[Path] = None) -> Optional[float]:
+    """Free space on the model destination's filesystem (or an explicit path)."""
     import shutil
-    target = Path(path) if path else Path.home()
+    from .model_download import models_dir
+    target = Path(path) if path is not None else models_dir()
     while not target.exists() and target != target.parent:
         target = target.parent
     try:
@@ -115,14 +117,17 @@ def is_cached(repo: str, filename: str) -> bool:
 
 
 def probe_speed_mbps(repo: str, filename: str, timeout: float = 6.0, probe_bytes: int = 1_000_000) -> Optional[float]:
-    """Measure real download speed (MB/s) by fetching a small range of the model file."""
+    """Measure a small authenticated model range, stripping auth on CDN redirects."""
     try:
         import urllib.request
-        from .model_download import model_url
+        from .model_download import model_url, _auth_headers, _opener
         url = model_url(repo, filename)
-        req = urllib.request.Request(url, headers={"Range": f"bytes=0-{probe_bytes - 1}"})
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "nexus-agent-ai", "Range": f"bytes=0-{probe_bytes - 1}",
+            **_auth_headers(url),
+        })
         start = time.time()
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener().open(req, timeout=timeout) as resp:
             data = resp.read(probe_bytes)
         elapsed = max(time.time() - start, 1e-3)
         return len(data) / elapsed / 1_000_000
@@ -154,9 +159,10 @@ def confirm_download(
 ) -> Optional[Dict]:
     """Show size, speed and the small/large options, then ask before downloading.
 
-    Returns the model dict to download, or None if the user declined.
-    NEXUS_AGENT_ASSUME_YES=1 or a non-interactive terminal skips the question
-    (the size line is still printed).
+    Returns the model dict to download, or None for a decline, EOF, or Ctrl+C at
+    the prompt. Non-interactive terminals and NEXUS_AGENT_ASSUME_YES=1/true/yes
+    accept automatically (including the small speed probe); they do not cancel
+    downloads. Ctrl+C during transfer leaves a resumable partial file.
     """
     if interactive is None:
         interactive = sys.stdin.isatty() and os.environ.get("NEXUS_AGENT_ASSUME_YES", "") not in ("1", "true", "yes")

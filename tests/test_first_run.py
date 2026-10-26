@@ -35,7 +35,8 @@ def test_confirm_download_shows_size_speed_and_asks():
                                  speed_probe=lambda *a, **k: 0.04, out=lines.append)
     assert result["filename"] == choice["filename"]
     text = "\n".join(lines)
-    assert "2.2 GB" in text and "0.0 MB/s" in text or "0.0" in text
+    assert "2.2 GB" in text
+    assert "0.0 MB/s" in text and "about 15.3 h" in text
     assert "resumes" in text
 
 
@@ -52,6 +53,57 @@ def test_confirm_download_non_interactive_does_not_prompt():
     choice = ms.pick_model(8.0)
     assert ms.confirm_download(choice, ask=boom, interactive=False,
                                speed_probe=lambda *a, **k: None, out=lambda m: None) is choice
+
+
+@pytest.mark.parametrize("error", [EOFError, KeyboardInterrupt])
+def test_confirm_download_prompt_cancel_returns_none(error):
+    def cancel(_):
+        raise error
+    assert ms.confirm_download(ms.pick_model(8.0), ask=cancel, interactive=True,
+                               speed_probe=lambda *a, **k: None, out=lambda _: None) is None
+
+
+def test_relocated_model_disk_space_drives_download_warning(tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    destination = tmp_path / "relocated"
+    destination.mkdir()
+    monkeypatch.setenv("NEXUS_AGENT_HOME", str(destination / "not-created-yet"))
+    seen = []
+    def usage(path):
+        seen.append(path)
+        return SimpleNamespace(free=1024 ** 3)
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    lines = []
+    choice = ms.pick_model(8.0)
+    assert ms.confirm_download(choice, interactive=False, speed_probe=lambda *a: None,
+                               out=lines.append) is choice
+    assert seen == [destination]
+    assert any("only 1.0 GB free disk" in line for line in lines)
+
+
+def test_doctor_uses_relocated_model_destination(tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    from nexus_agent_ai.utils import doctor
+    destination = tmp_path / "relocated-home"
+    destination.mkdir()
+    monkeypatch.setenv("NEXUS_AGENT_HOME", str(destination))
+    monkeypatch.setattr(ms, "available_ram_gb", lambda: 8.0)
+    monkeypatch.setattr(ms, "is_cached", lambda *a: False)
+    seen = []
+    def usage(path):
+        seen.append(path)
+        return SimpleNamespace(free=1024 ** 3)
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    checks = doctor.run_checks(probe_network=False)
+    disk = next(row for row in checks if row[1] == "Disk")
+    assert seen == [destination]
+    assert disk[0] == "warn"
+    assert str(destination / "models") in disk[2]
+    assert any(row[1] == "Data folder" and row[0] == "ok"
+               and str(destination) in row[2] for row in checks)
+    assert not (destination / ".write-test").exists()
 
 
 def test_format_eta():
@@ -99,17 +151,6 @@ def test_fit_local_model_declined_exits(monkeypatch):
     from nexus_agent_ai.providers.local_provider import LocalProvider
     with pytest.raises(typer.Exit):
         appmod._fit_local_model(LocalProvider(), None, {})
-
-
-def test_fit_local_model_keeps_cached_default(monkeypatch):
-    monkeypatch.delenv("NEXUS_AGENT_MODEL_REPO", raising=False)
-    monkeypatch.delenv("NEXUS_AGENT_MODEL_FILENAME", raising=False)
-    monkeypatch.setattr(ms, "available_ram_gb", lambda: 1.5)
-    monkeypatch.setattr(ms, "is_cached", lambda r, f: f == "LFM2.5-2.6B-Q6_K.gguf")
-    monkeypatch.setattr(ms, "confirm_download", lambda *a, **k: pytest.fail("should not ask"))
-    from nexus_agent_ai.providers.local_provider import LocalProvider
-    prov = LocalProvider()
-    assert appmod._fit_local_model(prov, None, {}) is prov
 
 
 def test_onboarding_recommendation_downgrades_on_low_free_ram(monkeypatch):

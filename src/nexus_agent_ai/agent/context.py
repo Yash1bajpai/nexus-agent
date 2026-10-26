@@ -22,6 +22,10 @@ _OVERFLOW_PATTERNS = (
     "context_length_exceeded",
 )
 
+class ContextBudgetError(ValueError):
+    """The current turn cannot fit without corrupting structured tool history."""
+
+
 
 def estimate_tokens(text: str) -> int:
     return int(len(text) / CHARS_PER_TOKEN) + 1
@@ -122,20 +126,31 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
         total = history_tokens(msgs)
 
     if total > budget_tokens:
-        # Shrink the biggest payloads first until the request fits.
-        max_chars = int(budget_tokens * CHARS_PER_TOKEN)
-        for _ in range(8):
+        # Tool-call arguments are immutable: truncating their JSON could change
+        # what the assistant actually executed. Only shrink text payloads.
+        limit = max(200, int(budget_tokens * CHARS_PER_TOKEN * 0.5))
+        for _ in range(16):
             if total <= budget_tokens:
                 break
-            sizes = sorted(range(len(msgs)), key=lambda i: message_tokens(msgs[i]), reverse=True)
-            biggest = sizes[0]
-            limit = max(400, int(max_chars * 0.5))
-            shrunk = _shrink_message(msgs[biggest], limit)
-            if shrunk != msgs[biggest]:
-                msgs[biggest] = shrunk
+            candidates = [
+                (message_tokens(m) - message_tokens(shrunk), i, shrunk)
+                for i, m in enumerate(msgs)
+                for shrunk in [_shrink_message(m, limit)]
+            ]
+            saved, index, shrunk = max(candidates, default=(0, 0, None), key=lambda item: item[0])
+            if saved > 0:
+                msgs[index] = shrunk
                 stats["truncated_messages"] += 1
-            max_chars = int(max_chars * 0.6)
-            total = history_tokens(msgs)
+                total = history_tokens(msgs)
+            elif limit <= 200:
+                break
+            limit = max(200, int(limit * 0.6))
+    if total > budget_tokens:
+        raise ContextBudgetError(
+            f"Current conversation needs at least {total} estimated tokens but only "
+            f"{budget_tokens} are available. Tool arguments and call/result bindings "
+            "were preserved; no over-budget request was sent. Start a new turn or use a larger context window."
+        )
     stats["tokens"] = total
     return msgs, stats
 
@@ -173,13 +188,26 @@ def compact_messages(messages: List[Dict[str, Any]], keep_turns: int = 2) -> Tup
                 asks.append(text[:160])
             elif text.startswith("[Earlier conversation compacted"):
                 asks.append("(earlier compacted history) " + text[text.find("\n") + 1:][:300].replace("\n", " "))
-        blob = json.dumps(m, default=str)
-        for name in re.findall(r'"name": "([a-z_]+)"', blob):
-            if name not in tools:
-                tools.append(name)
-        for path in re.findall(r'"(?:path|file_path|filepath|filename)\\?": \\?"([^"\\]+)', blob):
-            if path not in files:
-                files.append(path)
+        def collect(value):
+            if isinstance(value, dict):
+                name = value.get("name")
+                if isinstance(name, str) and name not in tools:
+                    tools.append(name)
+                for key, child in value.items():
+                    if key in ("path", "file_path", "filepath", "filename") and isinstance(child, str):
+                        if child not in files:
+                            files.append(child)
+                    elif key == "arguments" and isinstance(child, str):
+                        try:
+                            collect(json.loads(child))
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+        collect(m)
     lines = ["[Earlier conversation compacted to save context]"]
     lines.append("Earlier requests:")
     lines += [f"- {a}" for a in asks[-12:]]

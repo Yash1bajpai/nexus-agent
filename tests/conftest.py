@@ -3,15 +3,12 @@ from pathlib import Path
 import nexus_agent_ai.agent.tools as tools_module
 
 @pytest.fixture(autouse=True)
-def mock_workspace_path_validator(monkeypatch):
-    """
-    Since the agent correctly restricts file access to the actual workspace directory,
-    we must bypass this check during tests to allow reading/writing to pytest's tmp_path.
-    """
-    def mock_validate(path):
-        return Path(path).resolve()
-        
-    monkeypatch.setattr(tools_module, "_validate_workspace_path", mock_validate)
+def isolated_workspace(monkeypatch, tmp_path):
+    """Exercise the real sandbox inside a fresh, per-test project directory."""
+    monkeypatch.chdir(tmp_path)
+    tools_module.reset_file_tracking()
+    yield
+    tools_module.reset_file_tracking()
 
 @pytest.fixture(autouse=True)
 def isolate_local_model_configuration(monkeypatch):
@@ -25,3 +22,4 @@ def isolate_home_directory(monkeypatch, tmp_path_factory):
     """Keep session history and config out of the developer's real ~/.nexus-agent."""
     fake_home = tmp_path_factory.mktemp("home")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setenv("NEXUS_AGENT_HOME", str(fake_home / ".nexus-agent"))

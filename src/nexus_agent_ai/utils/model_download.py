@@ -8,10 +8,11 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import re
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Optional
 
 HF_BASE = os.environ.get("NEXUS_AGENT_HF_ENDPOINT", "https://huggingface.co").rstrip("/")
@@ -27,7 +28,22 @@ def models_dir() -> Path:
 
 
 def local_path(repo: str, filename: str) -> Path:
-    return models_dir() / repo.replace("/", "--") / filename
+    """Keep repository and nested HF filenames inside the configured model cache."""
+    for value in (repo, filename):
+        if (not isinstance(value, str) or not value or "\\" in value or ":" in value
+                or "\0" in value or value.startswith("/") or PureWindowsPath(value).drive
+                or any(p in ("", ".", "..") or p.endswith((" ", "."))
+                       for p in value.split("/"))):
+            raise ValueError("Repository and filename must be safe relative HF paths")
+    if len(repo.split("/")) > 2:
+        raise ValueError("Repository must be a name or owner/name")
+    root = models_dir().resolve()
+    repository = root / repo.replace("/", "--")
+    candidate = repository / filename
+    if (not repository.resolve().is_relative_to(root)
+            or not candidate.resolve().is_relative_to(repository.resolve())):
+        raise ValueError("Model path escapes its cache directory through a symlink")
+    return candidate
 
 
 def find_cached(repo: str, filename: str) -> Optional[str]:
@@ -105,8 +121,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def expected_digest(url: str, timeout: float = 15.0) -> "tuple[Optional[int], Optional[str]]":
-    """Best-effort (size, sha256) of the real file from Hugging Face's X-Linked-* headers on the first
-    response. (None, None) for hosts that do not send them; then only the size check from the download applies."""
+    """Read optional size/SHA-256 from the first Hugging Face X-Linked-* headers.
+
+    Missing metadata means only advertised HTTP framing can be checked; with no
+    size or digest headers, download integrity remains best-effort.
+    """
     try:
         opener = urllib.request.build_opener(_NoRedirect)
         req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "nexus-agent-ai", **_auth_headers(url)})
@@ -117,6 +136,7 @@ def expected_digest(url: str, timeout: float = 15.0) -> "tuple[Optional[int], Op
         size = resp.headers.get("X-Linked-Size")
         etag = (resp.headers.get("X-Linked-ETag") or "").strip('"').lower()
         sha = etag if len(etag) == 64 and all(c in "0123456789abcdef" for c in etag) else None
+        resp.close()
         return (int(size) if size and size.isdigit() else None), sha
     except Exception:
         return None, None
@@ -130,29 +150,59 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _total_size(resp, start: int) -> Optional[int]:
-    cr = resp.headers.get("Content-Range")  # "bytes 100-999/1000"
-    if cr and "/" in cr:
-        try:
-            return int(cr.rsplit("/", 1)[1])
-        except ValueError:
-            return None
-    cl = resp.headers.get("Content-Length")
-    return int(cl) + start if cl and cl.isdigit() else None
+def _response_sizes(resp, start: int) -> tuple[Optional[int], Optional[int]]:
+    """Validate range framing and return (full size, response body size)."""
+    length = resp.headers.get("Content-Length")
+    if length is not None and not length.isdigit():
+        raise ValueError("Invalid Content-Length")
+    body_size = int(length) if length is not None else None
+    if getattr(resp, "status", 200) == 206:
+        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)",
+                             resp.headers.get("Content-Range", ""))
+        if not match:
+            raise ValueError("Missing or invalid Content-Range")
+        first, last = int(match[1]), int(match[2])
+        total = None if match[3] == "*" else int(match[3])
+        if first != start or last < first or (total is not None and last >= total):
+            raise ValueError("Content-Range does not match the requested bytes")
+        range_size = last - first + 1
+        if body_size is not None and body_size != range_size:
+            raise ValueError("Content-Length does not match Content-Range")
+        return total, range_size
+    if resp.headers.get("Content-Range") is not None:
+        raise ValueError("Unexpected Content-Range on a full response")
+    return body_size, body_size
+
+
+def _integrity_error(path: Path, size: Optional[int], sha: Optional[str]) -> Optional[str]:
+    actual = path.stat().st_size
+    if not actual:
+        return "empty model file"
+    if size is not None and actual != size:
+        return f"size {actual} does not match expected {size}"
+    if sha is not None and _sha256(path) != sha:
+        return "SHA-256 mismatch"
+    return None
 
 
 def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
              progress: Optional[Callable[[int, Optional[int]], None]] = None,
              url: Optional[str] = None) -> str:
-    """Download to ~/.nexus-agent/models/..., resuming a partial `.part` file and retrying on
-    timeouts or dropped connections. Returns the final path. Raises RuntimeError after `retries` failures."""
+    """Resume/retry into a `.part` file, validating advertised sizes and SHA-256.
+
+    Without digest headers, integrity is best-effort: HTTP size/range framing can
+    detect truncation but cannot detect same-size corruption. KeyboardInterrupt
+    propagates, preserving the partial file for the next invocation.
+    """
     final = local_path(repo, filename)
-    if final.is_file() and final.stat().st_size > 0:
-        return str(final)
-    final.parent.mkdir(parents=True, exist_ok=True)
-    part = final.with_name(final.name + ".part")
+    part = local_path(repo, filename + ".part")
     url = url or model_url(repo, filename)
     want_size, want_sha = expected_digest(url)
+    if final.is_file():
+        if _integrity_error(final, want_size, want_sha) is None:
+            return str(final)
+        final.unlink()
+    final.parent.mkdir(parents=True, exist_ok=True)
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         have = part.stat().st_size if part.exists() else 0
@@ -163,7 +213,11 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
             with _opener().open(req, timeout=timeout) as resp:
                 if have and getattr(resp, "status", 200) != 206:
                     have = 0  # server ignored Range; restart
-                total = _total_size(resp, have)
+                total, body_size = _response_sizes(resp, have)
+                if (getattr(resp, "status", 200) == 206 and total is None
+                        and want_size is None and want_sha is None):
+                    raise ValueError("Cannot establish completion from an unknown range total")
+                before = have
                 with open(part, "ab" if have else "wb") as f:
                     while True:
                         chunk = resp.read(CHUNK)
@@ -173,22 +227,42 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
                         have += len(chunk)
                         if progress:
                             progress(have, total)
+            if body_size is not None and have - before != body_size:
+                raise OSError(f"incomplete response ({have - before} of {body_size} bytes)")
             if total is not None and have != total:
                 raise OSError(f"incomplete download ({have} of {total} bytes)")
-            if want_size is not None and have != want_size:
-                raise OSError(f"size {have} does not match expected {want_size}")
-            if want_sha is not None and _sha256(part) != want_sha:
-                part.unlink(missing_ok=True)  # corrupt: do not resume from bad bytes
+            error = _integrity_error(part, want_size, want_sha)
+            if error:
+                part.unlink(missing_ok=True)
                 have = 0
-                raise OSError("SHA-256 mismatch, discarded the partial file")
+                raise OSError(error + ", discarded the partial file")
             os.replace(part, final)
             return str(final)
         except urllib.error.HTTPError as e:
-            if e.code == 416 and part.exists():  # already complete
-                os.replace(part, final)
-                return str(final)
-            if e.code in (401, 403, 404):
+            if e.code == 416 and part.exists():
+                # A rejected range is not proof of completion. Check every known
+                # piece of metadata, including the server's unsatisfied-range size.
+                match = re.fullmatch(r"bytes \*/(\d+)", e.headers.get("Content-Range", ""))
+                range_size = int(match[1]) if match else None
+                error = _integrity_error(part, want_size, want_sha)
+                if error is None and range_size is not None and have != range_size:
+                    error = f"partial size {have} does not match server size {range_size}"
+                if error is None and (range_size is not None or want_size is not None or want_sha is not None):
+                    os.replace(part, final)
+                    e.close()
+                    return str(final)
+                part.unlink(missing_ok=True)
+                have = 0
+                last_err = OSError(error or "Cannot validate completion from HTTP 416")
+            elif e.code in (401, 403, 404):
+                e.close()
                 raise RuntimeError(f"Download refused (HTTP {e.code}) for {url}. For a private or gated model, set HF_TOKEN to a Hugging Face access token that can read it.") from e
+            else:
+                last_err = e
+            e.close()
+        except ValueError as e:
+            part.unlink(missing_ok=True)  # malformed ranges must restart, not append
+            have = 0
             last_err = e
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             last_err = e

@@ -6,20 +6,22 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `
 
 ## Release status
 
-**Current release: 2.10.2** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+**Version: 2.10.3** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+
+**2.10.3 fixes:** atomic file edits and backups preserve access permissions and reject linked backup destinations; workspace tools protect agent state; Git inspection filters protected paths and disables execution helpers. Provider histories are JSON-safe across persistence and fallback, local llama-server streams real tokens on a private per-instance port, and command outcomes distinguish actual edits from unsupported success claims. Download refusal no longer persists a replacement model or allows same-run local startup downloads; automatic cached-model selection respects free RAM.
 
 What changed since 2.8.1:
 
 - 2.10.0: loop guardrails for small local models (see Loop guardrails below).
 - 2.10.1: fixes `/pull-model` crashing inside the interactive REPL.
 - 2.10.2: adds the `nexus-agent-ai` command, resumable verified model downloads with no compiled dependencies, per-folder permission before running a project's tests, and honest failure when an edit is requested but not applied.
-- First run picks a local model by free RAM, shows size, measured speed and ETA, and asks before any download. The setup wizard no longer pins a model and is skipped when there is no terminal (CI, pipes). The first-run setup asks, in order: optional cloud API keys (Enter skips each, local mode works without any), the default provider (local by default), and the local model (the suggested one for your free RAM, or pick another with its size and RAM need; Enter keeps the suggestion), then asks before downloading. `nexus-agent-ai setup` repeats it at any time.
+- Interactive first-run setup asks for optional cloud keys, the default provider, a local model, and permission before downloading either the engine or weights. The provider choice applies immediately; an explicit `--provider` still wins. Enter keeps an existing configured model, or the hardware suggestion if none is configured. A replacement model choice is saved only after download approval. Declining leaves saved model settings unchanged and prevents local startup downloads in that invocation; a configured cloud provider can still run. `nexus-agent-ai setup` can replace a saved model. The wizard is skipped without a terminal; non-interactive local startup can download its selected model without prompting.
 - `nexus-agent doctor` checks Python, RAM, disk, download speed, engine, model fit and PATH. `nexus-agent` and `nexus-agent chat` with no question open the REPL.
 - `--context-size` and `/context`, token-based history trimming, `/compact`, a context meter, and one retry on context overflow.
 - Reliable edits: read before patch, CRLF tolerant matching, closest-text hint on a miss, a warning when an edit request ends without a successful write, and a nonzero exit code on unresolved tool errors.
 - API keys are typed hidden and stored owner-only (0600 on Linux/macOS, an owner-only ACL on Windows).
 - Sessions are saved by default; `--continue` resumes the last one.
-- Windows is covered by CI on a real Windows runner (tests, `doctor`, key-file ACL, session IDs from paths with spaces and unicode, CRLF patching). A real model first run and one chat have passed on Windows in a manual CI run (Python 3.12); a full interactive setup session has not been run on Windows.
+- Windows CI covers tests, diagnostics, key-file ACLs, session IDs, CRLF patching and pseudo-console permission prompts. A historical manual CI run exercised a real model first run and one chat on Python 3.12. The current checkout's first-run wizard and REPL were also exercised through a real Windows pseudo-console on Python 3.13, using a hidden fake key and a local HTTP provider fixture while declining engine/weight downloads; that verifies the interaction, not live cloud or model quality.
 
 `pip install nexus-agent` is an unrelated package. Use `nexus-agent-ai`.
 
@@ -40,18 +42,18 @@ nexus-agent --help
 - In a terminal, when the model first wants to run tests in a folder, Nexus asks: `[o]` once (this folder, until Nexus exits, nothing saved), `[a]` always (this exact folder only, saved in `~/.nexus-agent/trusted_folders.json`), or `[N]` no (default).
 - A saved folder covers only that folder, not its subfolders or parent.
 - See and undo your choices: `nexus-agent-ai trust list`, `nexus-agent-ai trust add [folder]`, `nexus-agent-ai trust revoke [folder]` (`--all` removes everything).
-- Non-interactive runs (scripts, CI) never run tests unless `NEXUS_ALLOW_PROJECT_EXECUTION=1` is set, as before. Use that only for code you trust.
+- Non-interactive runs require a saved grant for that exact folder or `NEXUS_ALLOW_PROJECT_EXECUTION=1`. Use either only for code you trust.
 - Optional: set `NEXUS_AGENT_AUTO_CHECK=1` to run the tests automatically after each successful edit. It only works in folders you already allowed, and is off by default.
 
-If the model says "the tests pass" but no passing test run backs it up, `nexus-agent-ai chat "..."` exits with code 1 and says so.
+If the model says "the tests pass" without a current passing run, one-shot commands exit with code 1, including verification-only questions. Streaming output displays the correction; the REPL reports the failure and remains open.
 
 ### Model downloads
 
-Local models come from Hugging Face. The download resumes if interrupted (run the same command again), and size and SHA-256 are checked when Hugging Face provides them. Public models need nothing. For a private or gated model, set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`, or log in with the Hugging Face CLI so `~/.cache/huggingface/token` exists). The token is sent only to huggingface.co and is not forwarded to the download servers it redirects to. Private-repo access has been tested against local test servers only, not a real private repo.
+Local models come from Hugging Face. Downloads resume from `.part` files after interruption, and every completion path, including HTTP 416, checks available size and SHA-256 metadata. Without a digest, checks are best-effort: HTTP framing can detect truncation but not same-size corruption. Cache destinations reject traversal and escaping symlinks while allowing nested repository filenames. For private or gated models, set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`, or use the Hugging Face CLI token file). Downloads and speed probes send the token only to the configured Hugging Face host and strip it on cross-host redirects. Private-repo access is covered by local server fixtures, not a real private-repository run.
 
-**Known limits:** small local models (1.2B) often fail file edits and may not follow multi-step instructions. In our small checks (5 one-line bug fixes, 2 runs each, CPU only) the 1.2B model fixed 0 to 1 out of 10, so check every change it makes. Windows is covered by CI for the editable install; the plain wheel-install check on Windows is new and unproven.
+**Known limits:** small local models (1.2B) often fail file edits and may not follow multi-step instructions. In our small checks (5 one-line bug fixes, 2 runs each, CPU only) the 1.2B model fixed 0 to 1 out of 10, so check every change it makes. Harness correctness is not a model-quality benchmark.
 
-**Python versions:** tested on 3.11, 3.12 and 3.13 (CI). Newer versions may work but are untested. nexus no longer needs any compiled dependency (the model download is built in, no PyYAML), so install should not need a C++ compiler; this was checked by a wheel-only dependency resolve for Windows, not yet by a real Windows install.
+**Python versions:** CI covers 3.11, 3.12 and 3.13; newer versions have separate platform-specific coverage below. The downloader uses the standard library, not huggingface-hub/PyYAML. Default dependencies can use binary wheels on supported Windows versions, so a compiler is not needed when those wheels are available.
 
 **Supported platforms (what has actually been run).** Python 3.11 or newer. An engine download exists for more platforms than have been tested, so the two are listed separately.
 
@@ -104,13 +106,13 @@ Run inside the project you want Nexus to inspect. Regular chat/generate/debug se
 
 **Loop guardrails (since 2.10.0):** when a model asks for a file that does not exist, the tool result now includes the real directory listing. Before a model may say "tests pass", the loop checks the actual test result and appends an "unverified" note if the run failed. Answers to `git_status` and `git_diff` questions are grounded with the real git output. These checks fix the loop, not the model: on a 12-task local re-score, the guardrails moved CodeForge adapters from 4/12 to 6/12, and both gains came from the git tasks. Wrong code and wrong arithmetic from small models are not fixed.
 
-`@file.py`, REPL review/debug reads and `read_file` share workspace and sensitive-path checks. Credential-like filenames, `.env` files, keys and sensitive configuration directories are blocked, including resolved symlink targets. This is not content-based secret detection: an innocently named source file may still contain a secret. Do not ask Nexus to inspect such files.
+`@file.py`, REPL review/debug reads and `read_file` share workspace and sensitive-path checks. Credential-like filenames, `.env` files, keys, sensitive configuration directories, and Nexus's own configuration/history/grant directories are blocked, including resolved symlink targets. Git inspection omits protected and outside-workspace paths, including both sides of a rename, and disables external diff, textconv, fsmonitor, hooks and configured clean/process filters. This is not content-based secret detection: an innocently named source file may still contain a secret.
 
 ## Project execution and Git mutations
 
 Pytest imports arbitrary project code. A working-directory check and allowed arguments do **not** sandbox that code. It can read/write outside the workspace, access the network and run commands with your account's permissions.
 
-`run_tests` is **disabled and omitted from the model's tools by default**. For a project you trust, opt in before launching Nexus:
+In a terminal `run_tests` is offered, but its first execution requires the permission prompt described above. In non-interactive runs it is omitted unless an exact-folder saved grant or the environment opt-in allows it. To opt in explicitly for trusted code:
 
 ```bash
 # Linux/macOS
@@ -145,14 +147,16 @@ nexus-agent repl -p local --context-size 8192 --persist --session my-project
 
 Priority: `--context-size` > `NEXUS_CONTEXT_SIZE` > 4096. Values must be integer token counts of at least 512. The setting covers the whole window, including instructions, tool schemas, conversation, and generated output. It does not enlarge a model's trained limit, compact history, or guarantee that your RAM can hold the requested window. Start with 4096 on low-memory machines and raise it only within your model and hardware limits.
 
-This option currently applies to local llama-server and llama-cpp-python, not cloud providers, `auto`, Ollama, or Transformers. Unsupported routes fail clearly instead of silently ignoring the option. An already-running server must be stopped before using an explicit override because its window is not verified. In REPL, `/context` shows the configured window and restart guidance. Changing the window requires a restart; the history can be resumed using the same `--persist --session` ID.
+This option applies to local llama-server and llama-cpp-python, not cloud providers, `auto`, Ollama, or Transformers. Unsupported routes fail clearly. Each local provider starts its own server on a private port and verifies its model alias and configured context before reusing that owned process; a foreign healthy server is neither reused nor stopped. Per-instance logs are stored at `~/.nexus-agent/llama-server/server-nexus-*.log` (under `NEXUS_AGENT_HOME` when set). In REPL, `/context` shows the active window. Changing the window requires a restart; resume history with the same session ID.
 
-**Long sessions:** history is trimmed by estimated tokens, not message count. Before each request Nexus drops the oldest whole turns, and cuts the largest file or tool outputs (keeping their start and end), so the request fits the window. If the server still rejects it as too large, Nexus retries once with a tighter budget. After each REPL turn a meter shows how full the window is. `/compact` replaces older turns with a short note (earlier requests, files and tools touched, built without calling the model) and keeps the last 2 turns. `/clear` removes all history, including the current persistent session. Token counts are estimates (about 3.5 characters per token), and the meter only applies to local models with a known window.
+**Long sessions:** history is trimmed by estimated tokens, preserving real user turns and tool-call/result bindings. Internal steering messages do not create new user turns. Large file/tool text can be shortened, but tool arguments remain valid and intact; if the active turn cannot fit, Nexus reports a context-budget error rather than sending a malformed or oversized request. One tighter-budget retry handles server-reported overflow. `/compact` summarizes earlier requests, full file paths and tools without calling a model, retaining the last two turns. `/clear` removes the current history. Counts are estimates (about 3.5 characters per token); auto-fallback requests are budgeted against each active local backend.
 
 
 ### First run and model fit
 
-On a first local run Nexus picks a model by **free** RAM (not total), keeping about 1 GB of headroom plus room for the context window. If the big model will not fit, it falls back to the 1.2B model (~0.7 GB) and says why. Before downloading it shows the file size, a measured download speed and an estimate, and asks `[y]es / [s]mall instead / [n]o`. Downloads resume if interrupted. Set `NEXUS_AGENT_ASSUME_YES=1` to skip the question, or `NEXUS_AGENT_MODEL_REPO` and `NEXUS_AGENT_MODEL_FILENAME` to choose a model yourself.
+On a first local run Nexus picks a model by **free** RAM, keeping about 1 GB of headroom plus context space. It falls back to the 1.2B model (~0.7 GB) when larger models do not fit. Automatic selection shows size, measured speed and ETA, then asks `[y]es / [s]mall instead / [n]o` in a terminal. Enter accepts that selection; EOF/Ctrl+C cancels. Non-interactive startup or `NEXUS_AGENT_ASSUME_YES=1` accepts without a prompt. Explicit `NEXUS_AGENT_MODEL_REPO`/`NEXUS_AGENT_MODEL_FILENAME` choices bypass automatic selection. Disk checks use the actual model destination, including a relocated `NEXUS_AGENT_HOME`.
+
+Before requesting another download, automatic selection reuses an already-cached supported quantization only when it fits measured free RAM. A cached larger model does not override that limit; explicit model overrides remain the user's choice.
 
 `nexus-agent` and `nexus-agent chat` with no question both open the interactive REPL.
 
@@ -194,13 +198,15 @@ Default tools: `read_file`, `write_file`, `patch_file`, `list_directory`, `run_c
 
 Python writes and patches are syntax-checked before changing the file. This detects malformed Python, not logical mistakes.
 
-`patch_file` creates a backup and requires a unique target unless multiple replacements are explicitly requested. Inspect the backup and diff. Workspace path checks resolve symlinks; they are not OS-level isolation or protection against concurrent filesystem changes.
+`patch_file` requires a unique target unless multiple replacements are explicitly requested. Writes and patches encode and validate content before modifying files, save a backup, and atomically replace the destination. Backup symlinks/hardlinks are refused; backup failures abort the edit. Unchanged content is a no-op, not evidence of an applied edit. Workspace path checks are not OS-level isolation or protection against concurrent filesystem changes.
 
-**Edit safety.** `write_file` (over an existing file) and `patch_file` are refused unless the file was read with `read_file` (or an `@file` mention) in this run and has not changed on disk since. If a patch target is not found, Nexus tolerates CRLF line endings and trailing-whitespace differences, otherwise it returns the closest real text so the model can retry. `nexus-agent chat` exits with code 1 if a tool error was never fixed by the end of the run, or the iteration limit was hit; errors the model recovered from do not count.
+**Edit safety.** Existing files must have been read in the current process and remain unchanged on disk before writing or patching. Matching tolerates CRLF and trailing-whitespace differences and provides nearby text on a miss. Atomic replacements and backups preserve the original file's permission bits and Windows DACL, rather than inheriting broader parent-directory access. All one-shot agent commands check unresolved tool errors, iteration exhaustion, unapplied edit claims and unverified test claims. `generate` verifies that this run actually changed its requested output, reporting creation versus update accurately. `debug` explicitly requests an applied fix when needed; read-only review and informational questions such as "How do I add a function?" do not require an edit. The REPL reports the same failures without ending the session.
 
-**API keys.** Keys entered during setup are typed hidden (not echoed) and saved to `~/.nexus-agent/.env`, created with mode 0600 inside a 0700 folder on Linux and macOS. On Windows the file sits in your user profile folder and is restricted to your user with `icacls` (CI-verified). `nexus-agent doctor` warns if the key file is readable by other users.
+**Private storage.** Keys entered during setup are hidden and saved to `~/.nexus-agent/.env`. Key and history files use owner-only permissions: 0600 files in 0700 private directories on POSIX, and a protected current-user-only DACL on Windows. Permission failures are reported rather than silently leaving private data exposed. `doctor` checks POSIX key-file permissions.
 
 Sessions: the REPL now saves the conversation by default, one session per folder, in `~/.nexus-agent/history.db`. Open the REPL again in the same folder and it resumes. `nexus-agent repl --continue` (or `-c`) resumes the most recently used session from any folder, `--session NAME` picks one, and `--no-persist` gives a throwaway session. One-shot `nexus-agent chat "question"` still does not save unless you pass `--persist` or `--continue`. File contents you read can be kept in the saved history, so use `--no-persist` for sensitive work. File context may be retained in that history. Both persistent and in-memory history preserve user-turn/tool-result boundaries when pruning; an active long turn can exceed the nominal message limit rather than lose its original request.
+
+Provider messages are stored as JSON-safe canonical dictionaries. Anthropic/Gemini/OpenAI translations happen at provider boundaries, so saved histories and fallback preserve tool names and IDs without storing SDK objects. Empty or null tool arguments normalize to an empty object; malformed JSON is rejected. Gemini function results remain separate from subsequent user instructions, and blocked or empty replies report a failure rather than an empty success. Existing native-format history is migrated when loaded. SQLite connections close after each operation. Local llama-server uses progressive HTTP SSE streaming; optional non-streaming engines return a final response without fabricated token chunks.
 
 CodeForge-250M integration is planned, not a shipped inference backend.
 
@@ -213,9 +219,9 @@ python -m pip install build
 python -m build
 ```
 
-CI runs Python 3.11, 3.12 and 3.13. The current main suite has 246 passing tests (1 skipped) on Linux, and CI also runs a Windows job (Python 3.11 and 3.12). The September 30 branch suite had 135 tests, including regression coverage for read-only capability bypass, credential attachment, pytest opt-in and environment stripping, Git mutation gating, SQLite history, local cost and detailed context errors. Passing tests are not proof of model accuracy or a hostile-code sandbox.
+CI covers Python 3.11–3.13 and additional Windows/macOS jobs. Regression coverage includes real workspace confinement, linked backup destinations, atomic edit failures, protected state, Git helper suppression and secret filtering, download integrity/resumption, provider-native history migration, multi-turn fallback, streamed corrections and truthful command exits. The current checkout was verified on Windows/Python 3.13; POSIX permission tests require a POSIX runner. Passing tests are not proof of model accuracy or a hostile-code sandbox.
 
-Use a clean environment to install the built wheel and test the CLI before publishing. Publication requires a separate maintainer approval and matching version; branch fixes do not update existing PyPI installations.
+Release publication is maintainer-triggered through the `Publish` workflow with an existing version tag. It builds and checks the wheel/source distribution, tests the installed wheel on Linux, macOS and Windows with Python 3.11–3.13, creates the GitHub release, and uploads those same artifacts to PyPI through trusted publishing. The PyPI trusted publisher must authorize `Yash1bajpai/nexus-agent`, workflow `publish.yml`, environment `pypi`. Publication fails without that account-side authorization; committing a version does not update PyPI.
 
 ## License
 

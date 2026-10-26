@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 from ..utils.config import get_env_or_raise
+from .messages import anthropic_messages, assistant_message, tool_result
+import uuid
 
 class AnthropicProvider(BaseProvider):
     """LLM Provider implementation for Anthropic Claude models."""
@@ -32,7 +34,7 @@ class AnthropicProvider(BaseProvider):
             "model": self.model,
             "max_tokens": 4096,
             "system": system,
-            "messages": messages,
+            "messages": anthropic_messages(messages),
         }
         if converted_tools:
             kwargs["tools"] = converted_tools
@@ -55,13 +57,13 @@ class AnthropicProvider(BaseProvider):
             elif content_block.type == "tool_use":
                 tool_calls.append(
                     ToolCall(
-                        id=content_block.id,
+                        id=content_block.id or f"call_{uuid.uuid4().hex}",
                         name=content_block.name,
                         args=content_block.input,
                     )
                 )
 
-        raw_msg = {"role": "assistant", "content": response.content}
+        raw_msg = assistant_message(text, tool_calls)
 
         return ProviderResponse(
             text=text,
@@ -77,7 +79,7 @@ class AnthropicProvider(BaseProvider):
             "model": self.model,
             "max_tokens": 4096,
             "system": system,
-            "messages": messages,
+            "messages": anthropic_messages(messages),
         }
         if converted_tools:
             kwargs["tools"] = converted_tools
@@ -96,13 +98,13 @@ class AnthropicProvider(BaseProvider):
                 if content_block.type == "tool_use":
                     tool_calls.append(
                         ToolCall(
-                            id=content_block.id,
+                            id=content_block.id or f"call_{uuid.uuid4().hex}",
                             name=content_block.name,
                             args=content_block.input,
                         )
                     )
 
-            raw_msg = {"role": "assistant", "content": final_msg.content}
+            raw_msg = assistant_message(text, tool_calls)
             in_tokens = final_msg.usage.input_tokens if final_msg.usage else 0
             out_tokens = final_msg.usage.output_tokens if final_msg.usage else 0
 
@@ -122,13 +124,4 @@ class AnthropicProvider(BaseProvider):
             raise
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
-        return {
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_call_id,
-                    "content": result,
-                }
-            ],
-        }
+        return tool_result(tool_call_id, result)

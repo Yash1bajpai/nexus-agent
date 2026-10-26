@@ -13,21 +13,21 @@ We chose to implement a custom **ReAct (Reason + Act)** autonomous execution loo
 - **Rationale**: Real-world software engineering tasks require iterative investigation (reading files, searching codebases, checking git diffs) and dynamic reasoning before taking action. A flexible ReAct loop allows the LLM to inspect intermediate tool results and course-correct autonomously up to a configurable max iteration limit.
 
 ### 2. Custom Provider Abstraction vs. LiteLLM / External Gateways
-We designed a lightweight, zero-dependency unified provider interface (`BaseProvider`, `Tool`, `ToolCall`, `ProviderResponse`) supporting Anthropic Claude, Google Gemini, and OpenAI models.
-- **Rationale**: Relying on heavy external wrappers or proxy gateways adds dependency overhead, hides token-level cost accounting, and creates potential points of failure. By implementing native adapters for official SDKs with lazy loading, Nexus-Agent maintains complete control over streaming formats, tool schema translation, and exact billing tracking without requiring users to install unused SDK dependencies.
+We use a small provider interface (`BaseProvider`, `Tool`, `ToolCall`, `ProviderResponse`) with JSON-safe canonical conversation dictionaries. Assistant messages contain text and explicit tool calls; tool results reference stable call IDs. Adapters translate that representation to OpenAI, Anthropic and Gemini wire formats.
+- **Rationale**: SDK-specific objects must not leak into storage or another provider after fallback. Native histories are migrated at ingestion. Optional SDKs remain lazy-loaded; usage and cost are estimates, not exact billing.
 
-### 3. In-Memory Conversation Buffer vs. Heavy External Databases
-We adopted an in-memory conversation buffer (`ConversationMemory`) with configurable rolling truncation (`MAX_CONVERSATION_MESSAGES`).
-- **Rationale**: Terminal sessions are fast-paced and context-sensitive. Keeping memory lightweight ensures snappy REPL performance and predictable token limits while avoiding database locking or migration overheads during day-to-day development.
+### 3. In-Memory and SQLite Conversation Storage
+`ConversationMemory` supports throwaway sessions; `SQLiteMemory` saves REPL sessions by default and closes each connection deterministically. Persistent files and their private directories enforce owner-only access.
+- **Rationale**: Both backends share real-user-turn boundaries and canonical messages. Local request budgeting preserves tool bindings, excludes internal nudges as turn boundaries, and fails explicitly when an active turn cannot fit. Compaction summarizes older turns without a model call.
 
 ### 4. Direct DuckDuckGo Search vs. Paid Search APIs
 We integrated `ddgs` (DuckDuckGo Search) for live web exploration.
 - **Rationale**: Eliminates the barrier to entry by removing the need for paid API keys (like Google Custom Search or Serper) while providing robust live developer documentation retrieval.
 
-### 5. Sandboxed Subprocess Execution with Timeout Enforcement
-All code executions (`run_code`) are executed via isolated Python subprocesses with strict execution timeouts.
-- **Rationale**: Prevents accidental infinite loops or hanging scripts from blocking the REPL interface, demonstrating production-grade security and resource awareness.
+### 5. Restricted Execution and Workspace Edits
+`run_code` uses AST restrictions, a reduced subprocess environment and a timeout. Project pytest execution requires explicit exact-folder consent or environment opt-in and is not sandboxed. Read-only Git inspection disables executable helpers and omits protected/outside-workspace paths.
+- **Rationale**: Timeouts and syntax checks reduce mistakes; they do not isolate hostile code. File edits pre-encode content, reject linked backup destinations and use atomic replacement. Nexus state is never writable through workspace tools. Local inference servers use owned per-instance ports and verified model aliases; foreign processes are not adopted or stopped.
 
 ## Consequences
-- **Positive**: High reliability, zero third-party gateway lock-in, real-time token cost estimation, and robust multi-vendor fallback capabilities.
-- **Negative**: New provider SDK updates require maintaining schema conversion adapters inside `src/providers/`.
+- **Positive**: No gateway lock-in; portable JSON-safe persistence and fallback; explicit execution consent; consistent completion/error reporting after streamed and non-streamed responses.
+- **Negative**: Provider SDK protocols still require maintained adapters and integration tests in `src/nexus_agent_ai/providers/`. Model correctness, hostile-code isolation and changing files concurrently remain outside these guarantees.

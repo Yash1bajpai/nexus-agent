@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 from . import model_select
+from .model_download import models_dir
 
 Check = Tuple[str, str, str]  # (status "ok" | "warn" | "fail" | "info", label, detail)
 
@@ -40,7 +41,7 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
     if disk is None:
         checks.append(("warn", "Disk", "could not measure free space"))
     else:
-        checks.append(("ok" if disk >= 3 else "warn", "Disk", f"{disk} GB free in your home folder"))
+        checks.append(("ok" if disk >= 3 else "warn", "Disk", f"{disk} GB free for models in {models_dir()}"))
 
     choice = model_select.pick_model(avail, context_size)
     cached = model_select.is_cached(choice["repo"], choice["filename"])
@@ -75,7 +76,8 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
     keys = [k for k in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY") if os.getenv(k)]
     checks.append(("info", "Cloud keys", ", ".join(keys) if keys else "none set (local mode works without them)"))
 
-    env_file = Path.home() / ".nexus-agent" / ".env"
+    home = models_dir().parent
+    env_file = home / ".env"
     if env_file.exists() and os.name != "nt":
         mode = env_file.stat().st_mode & 0o777
         if mode & 0o077:
@@ -83,7 +85,6 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
         else:
             checks.append(("ok", "Key file", f"{env_file} is private (mode {oct(mode)})"))
 
-    home = Path.home() / ".nexus-agent"
     try:
         home.mkdir(parents=True, exist_ok=True)
         probe = home / ".write-test"

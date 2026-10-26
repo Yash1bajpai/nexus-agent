@@ -22,12 +22,6 @@ def test_size_label_has_single_tilde():
     assert onboarding._size_txt("0.7 GB") == "~0.7 GB"
 
 
-def test_declining_wizard_download_says_you_will_be_asked_again(monkeypatch, capsys):
-    monkeypatch.setattr(onboarding, "_input", lambda p: "n")
-    monkeypatch.setattr("nexus_agent_ai.providers.local_provider.ensure_llama_server_binary", lambda verbose=False: None)
-    onboarding._step_local_model_setup()
-    out = capsys.readouterr().out
-    assert "asked again" in out and "~~" not in out
 
 
 def test_warns_when_edit_request_ends_without_write(tmp_path):

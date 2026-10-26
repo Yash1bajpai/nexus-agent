@@ -28,7 +28,7 @@ class ProviderResponse:
     """Standardized response from any LLM provider."""
     text: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
-    raw_assistant_message: Any = None
+    raw_assistant_message: Optional[Dict[str, Any]] = None
     input_tokens: int = 0
     output_tokens: int = 0
 
@@ -56,6 +56,6 @@ class BaseProvider(ABC):
     @abstractmethod
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
         """
-        Format a tool execution result into the provider's expected message structure.
+        Return a JSON-safe canonical tool message (translated at the API boundary).
         """
         pass

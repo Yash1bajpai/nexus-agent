@@ -89,11 +89,15 @@ def test_llama_cpp_receives_window(tmp_path, monkeypatch):
     p._ensure_loaded()
     assert calls[0]["n_ctx"] == 8192
 
-def test_existing_server_not_silently_reused(monkeypatch):
+def test_own_verified_server_accepts_explicit_context(tmp_path, monkeypatch):
     p = LocalProvider(context_size=8192)
+    model = tmp_path / "model.gguf"
+    p._server_model_path = str(model.resolve())
+    p._server_context_size = 8192
     monkeypatch.setattr(p, "_is_server_alive", lambda: True)
-    with pytest.raises(RuntimeError, match="context size is unverified"):
-        p._start_llama_server("unused.gguf")
+    monkeypatch.setattr(p, "_download_llama_server", lambda: pytest.fail("must reuse owned matching server"))
+    p._start_llama_server(str(model))
+    assert p._model_instance == "llama_server"
 
 def test_unsupported_ollama_fallback_rejected(monkeypatch):
     p = LocalProvider(context_size=8192)
@@ -122,8 +126,7 @@ def test_server_launch_receives_window(tmp_path, monkeypatch):
     mod = importlib.import_module("nexus_agent_ai.providers.local_provider")
     monkeypatch.setattr(mod, "_SERVER_DIR", tmp_path)
     p = LocalProvider(context_size=8192)
-    checks = iter([False, True])
-    monkeypatch.setattr(p, "_is_server_alive", lambda: next(checks))
+    monkeypatch.setattr(p, "_is_server_alive", lambda: True)
     monkeypatch.setattr(p, "_download_llama_server", lambda: "fake-server")
     monkeypatch.setattr("time.sleep", lambda _: None)
     commands = []

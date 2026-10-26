@@ -23,7 +23,13 @@ class Scripted(BaseProvider):
         t = self.turns.pop(0)
         if isinstance(t, tuple):
             call = ToolCall(f"c{len(self.seen)}", t[0], t[1])
-            return ProviderResponse(text="", tool_calls=[call], raw_assistant_message={"role": "assistant", "content": ""})
+            return ProviderResponse(text="", tool_calls=[call], raw_assistant_message={
+                "role": "assistant", "content": "", "tool_calls": [{
+                    "id": call.id, "type": "function", "function": {
+                        "name": call.name, "arguments": json.dumps(call.args),
+                    },
+                }],
+            })
         return ProviderResponse(text=t, raw_assistant_message={"role": "assistant", "content": t})
 
     def stream(self, **kw):
@@ -113,8 +119,7 @@ def test_honest_failure_report_is_untouched(repo):
 
 def test_success_claim_without_running_tests_is_flagged(repo):
     final, _, _ = run(["All tests pass."], "run the tests and tell me if they pass")
-    # no tools used at all on a non-tool path would be fine; with tools available it is flagged
-    assert "unverified" in final or final == "All tests pass."
+    assert "unverified" in final
 
 
 def test_invented_git_status_answer_gets_real_output(repo):
@@ -133,3 +138,37 @@ def test_clean_tree_claim_checked(repo):
     (repo / "settings.py").write_text("TIMEOUT = 9\n")
     final, _, _ = run([("git_status", {}), "The working tree is clean."], "git status")
     assert "Actual git output:" in final
+
+
+@pytest.mark.parametrize("answer", [
+    "I fixed the bug.",
+    "No tests passed.",
+    "I cannot claim tests pass because I did not run them.",
+    "I have not verified that tests pass.",
+    'The previous answer said "tests pass", but this is unverified.',
+    "The phrase `tests pass` is not execution evidence.",
+    "> Tests pass.\nThat was the model's unsupported quotation.",
+    "Tests should pass after this change.",
+    "If all tests pass, the fix is verified.",
+])
+def test_negative_quoted_and_fix_only_answers_are_not_test_success_claims(answer):
+    guard = LoopGuard(lambda path: "")
+    verdict, reviewed = guard.review_final(answer)
+    assert verdict == "ok" and reviewed == answer
+    assert not guard.claim_unverified
+
+
+def test_stale_success_claim_sets_unverified_flag():
+    guard = LoopGuard(lambda path: "")
+    guard.after_tool("run_tests", {}, "Pytest Results: PASSED")
+    guard.after_tool("patch_file", {"path": "a.py"}, "Successfully patched a.py")
+    verdict, reviewed = guard.review_final("Tests pass now.")
+    assert verdict == "ok" and "files changed after" in reviewed
+    assert guard.claim_unverified
+
+
+def test_failure_admission_does_not_hide_separate_false_success_claim():
+    guard = LoopGuard(lambda path: "")
+    guard.after_tool("run_tests", {}, "Pytest Results: FAILED")
+    verdict, _ = guard.review_final("Some tests failed. All tests pass now.")
+    assert verdict == "retry" and guard.claim_unverified

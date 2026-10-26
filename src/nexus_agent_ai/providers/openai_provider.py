@@ -2,6 +2,8 @@ import json
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
 from ..utils.config import get_env_or_raise
+from .messages import assistant_message, extract_json_tool_calls, openai_messages, tool_result
+import uuid
 
 class OpenAIProvider(BaseProvider):
     """LLM Provider implementation for OpenAI GPT models and local OpenAI-compatible servers (Ollama/LM Studio)."""
@@ -40,8 +42,7 @@ class OpenAIProvider(BaseProvider):
         formatted = []
         if system:
             formatted.append({"role": "system", "content": system})
-        for m in messages:
-            formatted.append(m)
+        formatted.extend(openai_messages(messages))
         return formatted
 
     def complete(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
@@ -70,60 +71,18 @@ class OpenAIProvider(BaseProvider):
 
         text = msg.content or ""
         tool_calls = []
-        raw_tool_calls = []
-
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                try:
-                    parsed_args = json.loads(tc.function.arguments)
-                except Exception:
-                    parsed_args = {}
-
-                tool_calls.append(
-                    ToolCall(
-                        id=tc.id,
-                        name=tc.function.name,
-                        args=parsed_args,
-                    )
-                )
-                raw_tool_calls.append({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    }
-                })
-
-        if not tool_calls and '"name"' in text and '"arguments"' in text:
-            import re, uuid
-            pattern = r'\{[^{}]*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|"[^"]*")\s*\}'
-            matches = re.findall(pattern, text, re.DOTALL)
-            for m in matches:
-                try:
-                    tc_data = json.loads(m)
-                    if "name" in tc_data and "arguments" in tc_data:
-                        args_val = tc_data["arguments"]
-                        parsed_args = args_val if isinstance(args_val, dict) else (json.loads(args_val) if isinstance(args_val, str) else {})
-                        tc_id = f"call_{uuid.uuid4().hex[:8]}"
-                        tool_calls.append(ToolCall(id=tc_id, name=tc_data["name"], args=parsed_args))
-                        raw_tool_calls.append({
-                            "id": tc_id,
-                            "type": "function",
-                            "function": {"name": tc_data["name"], "arguments": json.dumps(parsed_args)}
-                        })
-                        text = text.replace(m, "").strip()
-                except Exception:
-                    pass
-
-        raw_msg: Dict[str, Any] = {"role": "assistant"}
-        if msg.content is not None:
-            raw_msg["content"] = msg.content
-        else:
-            raw_msg["content"] = ""
-
-        if raw_tool_calls:
-            raw_msg["tool_calls"] = raw_tool_calls
+        for tc in msg.tool_calls or []:
+            try:
+                parsed_args = json.loads(tc.function.arguments)
+            except (ValueError, TypeError):
+                parsed_args = {}
+            tool_calls.append(ToolCall(
+                id=tc.id or f"call_{uuid.uuid4().hex}",
+                name=tc.function.name, args=parsed_args,
+            ))
+        if not tool_calls:
+            text, tool_calls = extract_json_tool_calls(text)
+        raw_msg = assistant_message(text, tool_calls)
 
         in_tokens = 0
         out_tokens = 0
@@ -177,12 +136,12 @@ class OpenAIProvider(BaseProvider):
                     for tc_delta in delta.tool_calls:
                         idx = tc_delta.index
                         if idx not in tc_deltas:
-                            tc_deltas[idx] = {"id": "", "name": "", "arguments": ""}
+                            tc_deltas[idx] = {"id": f"call_{uuid.uuid4().hex}", "name": "", "arguments": ""}
                         if tc_delta.id:
                             tc_deltas[idx]["id"] = tc_delta.id
                         if tc_delta.function:
                             if tc_delta.function.name:
-                                tc_deltas[idx]["name"] = tc_delta.function.name
+                                tc_deltas[idx]["name"] += tc_delta.function.name
                             if tc_delta.function.arguments:
                                 tc_deltas[idx]["arguments"] += tc_delta.function.arguments
 
@@ -192,28 +151,16 @@ class OpenAIProvider(BaseProvider):
 
             # Build complete tool calls from accumulated deltas
             tool_calls = []
-            raw_tool_calls = []
             for idx in sorted(tc_deltas):
                 tcd = tc_deltas[idx]
                 try:
                     parsed_args = json.loads(tcd["arguments"]) if tcd["arguments"] else {}
-                except Exception:
+                except (ValueError, TypeError):
                     parsed_args = {}
-                tool_calls.append(
-                    ToolCall(id=tcd["id"], name=tcd["name"], args=parsed_args)
-                )
-                raw_tool_calls.append({
-                    "id": tcd["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tcd["name"],
-                        "arguments": tcd["arguments"],
-                    }
-                })
-
-            raw_msg: Dict[str, Any] = {"role": "assistant", "content": full_text}
-            if raw_tool_calls:
-                raw_msg["tool_calls"] = raw_tool_calls
+                tool_calls.append(ToolCall(id=tcd["id"], name=tcd["name"], args=parsed_args))
+            if not tool_calls:
+                full_text, tool_calls = extract_json_tool_calls(full_text)
+            raw_msg = assistant_message(full_text, tool_calls)
 
             yield ProviderResponse(
                 text=full_text,
@@ -232,8 +179,4 @@ class OpenAIProvider(BaseProvider):
             raise
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
-        return {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": str(result),
-        }
+        return tool_result(tool_call_id, result)

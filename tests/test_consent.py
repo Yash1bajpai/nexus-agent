@@ -1,4 +1,4 @@
-"""Per-folder permission to run the project's tests. Nothing is allowed without a person answering or the env variable."""
+"""Per-folder execution grants, including saved exact-folder grants in noninteractive runs."""
 import pytest
 from typer.testing import CliRunner
 

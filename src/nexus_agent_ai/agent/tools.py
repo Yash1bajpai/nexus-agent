@@ -3,10 +3,12 @@ import sys
 import tempfile
 import subprocess
 import ast
+import stat
 from pathlib import Path
 from typing import Any, Dict, List
 from ..providers.base import Tool
 from ..utils.config import CODE_EXECUTION_TIMEOUT
+from ..utils.private_files import copy_file_permissions
 
 def _validate_workspace_path(path: str | Path) -> Path | str:
     """Validate that path is inside the current workspace."""
@@ -16,6 +18,16 @@ def _validate_workspace_path(path: str | Path) -> Path | str:
         home = Path.home().resolve()
     except Exception:
         home = None
+
+    # Agent tools must never edit their own grants, history, or configuration, even
+    # when a project overlaps a state directory. Check resolved paths for aliases.
+    state_dirs = [home / ".nexus-agent"] if home is not None else []
+    if os.environ.get("NEXUS_AGENT_HOME"):
+        state_dirs.append(Path(os.environ["NEXUS_AGENT_HOME"]))
+    for state_dir in state_dirs:
+        state_root = state_dir.resolve()
+        if p == state_root or state_root in p.parents:
+            return "ERROR: Security Sandbox Access Denied: Nexus state directories are protected."
 
     # Boundary safeguard: When running in home directory (Global Mode), prevent direct operations
     # on the home root itself or root dotfiles/configuration (e.g. ~/.bashrc, ~/.gitconfig).
@@ -36,17 +48,49 @@ def _validate_workspace_path(path: str | Path) -> Path | str:
             pass
     return f"ERROR: Security Sandbox Access Denied: Path '{path}' is outside the project workspace ({cwd})."
 
-def _safe_git_run(args: List[str]) -> subprocess.CompletedProcess:
-    """Execute a git command safely with timeouts, blocked stdin, and captured output."""
+def _safe_git_run(args: List[str], *, execution: bool = False) -> subprocess.CompletedProcess:
+    """Inspect Git without inherited helpers; explicit writes retain normal Git behavior."""
+    kwargs = {}
+    if not execution:
+        safe_env = {
+            key: os.environ[key] for key in
+            ("PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP")
+            if key in os.environ
+        }
+        safe_env.update({
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_LAZY_FETCH": "1", "GIT_PAGER": "cat",
+            "GIT_ATTR_NOSYSTEM": "1",
+        })
+        kwargs["env"] = safe_env
+        options = [
+            "--no-pager", "-c", "core.fsmonitor=false",
+            "-c", f"core.hooksPath={os.devnull}", "-c", "diff.external=",
+            "-c", f"core.attributesFile={os.devnull}", "-c", "submodule.recurse=false",
+            "-c", "core.quotePath=true", "-c", "status.relativePaths=false",
+            "-c", "diff.renameLimit=0",
+        ]
+        location = args[1:3] if len(args) > 2 and args[1] == "-C" else []
+        # --no-textconv does not disable clean/process filters used when Git reads
+        # the worktree. Enumerate configuration without reading worktree content,
+        # then explicitly neutralize every filter driver before inspection.
+        drivers = subprocess.run(
+            [args[0], *options, *location, "config", "--null", "--name-only",
+             "--get-regexp", r"^filter\."],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL, timeout=15.0, check=False, env=safe_env,
+        )
+        if drivers.returncode not in (0, 1):
+            raise ValueError("Could not safely inspect Git filter configuration.")
+        for key in set(drivers.stdout.split("\0")):
+            if key:
+                value = "false" if key.lower().endswith(".required") else ""
+                options.extend(["-c", f"{key}={value}"])
+        args = [args[0], *options, *args[1:]]
     return subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdin=subprocess.DEVNULL,
-        timeout=15.0,
-        check=False
+        args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        stdin=subprocess.DEVNULL, timeout=15.0, check=False, **kwargs,
     )
 
 # Files the model has read (or written) in this process, with their state at that time.
@@ -141,6 +185,53 @@ def _validate_python_content(path: Path, content: str) -> str | None:
             return f"ERROR: Python syntax validation failed at line {exc.lineno}: {exc.msg}. File unchanged."
     return None
 
+def _atomic_file_update(p: Path, content: str) -> bool:
+    """Prepare both files fully before publishing; never truncate a live inode."""
+    old = p.read_bytes() if p.exists() else None
+    if old is not None and b"\r\n" in old and b"\n" not in old.replace(b"\r\n", b""):
+        content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+    elif old is not None and b"\n" in old and b"\r\n" not in old:
+        content = content.replace("\r\n", "\n")
+    encoded = content.encode("utf-8")  # Reject surrogates before touching either file.
+    if encoded == old:
+        return False
+    backup = p.with_name(p.name + ".bak")
+    if old is not None:
+        validated = _validate_workspace_path(backup)
+        if isinstance(validated, str):
+            raise PermissionError(validated)
+        if backup.is_symlink() or (backup.exists() and
+                                   (not backup.is_file() or backup.stat().st_nlink != 1)):
+            raise PermissionError("Unsafe backup destination; file unchanged.")
+    pending = []
+
+    def prepare(destination: Path, data: bytes) -> Path:
+        fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=p.parent)
+        temporary = Path(name)
+        pending.append(temporary)
+        with os.fdopen(fd, "wb") as stream:
+            if old is not None:
+                copy_file_permissions(p, temporary)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return temporary
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        new_file = prepare(p, encoded)
+        if old is not None:
+            new_backup = prepare(backup, old)
+            os.replace(new_backup, backup)
+        os.replace(new_file, p)
+    finally:
+        for temporary in pending:
+            if temporary.exists():
+                if os.name == "nt":
+                    os.chmod(temporary, stat.S_IWRITE | stat.S_IREAD)
+                temporary.unlink()
+    return True
+
 def execute_write_file(path: str, content: str) -> str:
     """Write string content to a file (creating parent directories if needed)."""
     try:
@@ -160,21 +251,11 @@ def execute_write_file(path: str, content: str) -> str:
         if syntax_error:
             return syntax_error
 
-        backup_created = False
-        if p.exists() and p.is_file():
-            backup_path = p.with_name(f"{p.name}.bak")
-            try:
-                with open(p, "rb") as src_f, open(backup_path, "wb") as dst_f:
-                    dst_f.write(src_f.read())
-                backup_created = True
-            except Exception:
-                pass
-
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(content)
+        existed = p.exists()
+        if not _atomic_file_update(p, content):
+            return f"No changes: '{path}' already has the requested content."
         _remember_file(p)
-        backup_msg = f" (backup saved to {p.name}.bak)" if backup_created else ""
+        backup_msg = f" (backup saved to {p.name}.bak)" if existed else ""
         return f"Successfully wrote {len(content)} characters to {path}{backup_msg}"
     except PermissionError:
         return f"ERROR: Permission denied writing to: {path}"
@@ -252,7 +333,7 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         if unread:
             return unread
 
-        with open(p, "r", encoding="utf-8", errors="replace", newline="") as f:
+        with open(p, "r", encoding="utf-8", newline="") as f:
             content = f.read()
 
         note = ""
@@ -282,20 +363,10 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         if syntax_error:
             return syntax_error
 
-        backup_created = False
-        backup_path = p.with_name(f"{p.name}.bak")
-        try:
-            with open(p, "rb") as src_f, open(backup_path, "wb") as dst_f:
-                dst_f.write(src_f.read())
-            backup_created = True
-        except Exception:
-            pass
-
-        with open(p, "w", encoding="utf-8", newline="") as f:
-            f.write(new_content)
+        if not _atomic_file_update(p, new_content):
+            return f"No changes: '{path}' already has the requested content."
         _remember_file(p)
-
-        backup_msg = f" (backup saved to {p.name}.bak)" if backup_created else ""
+        backup_msg = f" (backup saved to {p.name}.bak)"
         return f"Successfully patched '{path}': replaced {count} occurrence(s){backup_msg}.{note}"
     except PermissionError:
         return f"ERROR: Permission denied patching: {path}"
@@ -326,7 +397,11 @@ def execute_list_directory(path: str = ".") -> str:
                 continue
 
             # Filter out ignored directories in-place
-            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+            dirs[:] = [
+                d for d in dirs if d not in ignore_dirs
+                and isinstance(_validate_workspace_path(current_path / d), Path)
+                and not _is_sensitive_path(current_path / d)
+            ]
 
             indent = "    " * depth
             rel_path = current_path.relative_to(root_path)
@@ -337,7 +412,10 @@ def execute_list_directory(path: str = ".") -> str:
                 file_indent = ""
 
             for file in sorted(files):
-                if file not in ignore_dirs and not file.endswith(".bak"):
+                child = current_path / file
+                if (file not in ignore_dirs and not file.endswith(".bak")
+                        and isinstance(_validate_workspace_path(child), Path)
+                        and not _is_sensitive_path(child)):
                     output_lines.append(f"{file_indent}[FILE] {file}")
 
         return "\n".join(output_lines)
@@ -589,51 +667,142 @@ def execute_search_web(query: str) -> str:
     except Exception:
         return f"[Live Search Warning]: {_get_curated_fallback(query)}"
 
+def _git_root() -> Path:
+    result = _safe_git_run(["git", "rev-parse", "--show-toplevel"])
+    if result.returncode:
+        raise ValueError("Not inside a Git repository.")
+    return Path(result.stdout.strip()).resolve()
+
+
+def _git_path_allowed(root: Path, name: str) -> bool:
+    path = root / name
+    return (isinstance(_validate_workspace_path(path), Path)
+            and not _is_sensitive_path(path)
+            and not _is_sensitive_path(path.resolve()))
+
+
+def _git_status_entries(root: Path) -> tuple[list[str], bool, bool]:
+    result = _safe_git_run(["git", "-C", str(root), "status", "--porcelain=v1", "-z",
+                            "--untracked-files=normal", "--ignore-submodules=all"])
+    if result.returncode:
+        raise ValueError("Git status inspection failed.")
+    fields = iter(result.stdout.split("\0"))
+    visible, hidden, untracked = [], False, False
+    for field in fields:
+        if not field:
+            continue
+        code, name = field[:2], field[3:]
+        names = [name]
+        if "R" in code or "C" in code:
+            names.append(next(fields))
+        if not all(_git_path_allowed(root, item) for item in names):
+            hidden = True
+            continue
+        untracked = untracked or code == "??"
+        label = repr(name) if len(names) == 1 else f"{names[1]!r} -> {name!r}"
+        visible.append(f"{code} {label}")
+    return visible, hidden, untracked
+
+
 def execute_git_status() -> str:
-    """Run git status and git diff stats to inspect repository state."""
+    """Report only workspace-visible Git changes, without running repository helpers."""
     try:
-        status_res = _safe_git_run(["git", "status", "--short"])
-        if status_res.returncode != 0:
-            return "ERROR: Not inside a Git repository."
-
-        diff_res = _safe_git_run(["git", "diff", "--stat"])
-
-        status_out = status_res.stdout.strip()
-        diff_out = diff_res.stdout.strip()
-
-        output = []
-        if status_out:
-            output.append(f"Changed Files (git status --short):\n{status_out}")
+        root = _git_root()
+        visible, hidden, _ = _git_status_entries(root)
+        if visible:
+            output = "Changed Files (git status --short):\n" + "\n".join(visible)
+        elif hidden:
+            output = "No visible changes in this workspace."
         else:
-            output.append("Working tree clean (no uncommitted changes).")
+            output = "Working tree clean (no uncommitted changes)."
+        paths, _, _ = _git_diff_paths(root, [])
+        if paths:
+            stats = _safe_git_run([
+                "git", "-C", str(root), "diff", *_GIT_DIFF_FLAGS, "--stat",
+                "--no-renames", "--", *[f":(literal){name}" for name in paths],
+            ])
+            if stats.returncode:
+                raise ValueError("Git diff statistics inspection failed.")
+            if stats.stdout.strip():
+                output += "\n\nDiff Statistics:\n" + stats.stdout.strip()
+        if hidden:
+            output += "\n[Protected or outside-workspace changes omitted.]"
+        return output
+    except ValueError as exc:
+        return f"ERROR: Could not get git status: {exc}"
+    except Exception as exc:
+        return f"ERROR: Could not get git status ({type(exc).__name__})."
 
-        if diff_out:
-            output.append(f"\nDiff Statistics:\n{diff_out}")
 
-        return "\n".join(output)
-    except Exception as e:
-        return f"ERROR: Could not get git status: {str(e)}"
+_GIT_DIFF_FLAGS = [
+    "--no-ext-diff", "--no-textconv", "--ignore-submodules=all",
+    "--no-relative", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
+]
+
+
+def _git_diff_paths(root: Path, revisions: list[str]) -> tuple[list[str], bool, bool]:
+    result = _safe_git_run([
+        "git", "-C", str(root), "diff", *_GIT_DIFF_FLAGS, *revisions,
+        "--name-status", "-z", "--find-renames",
+    ])
+    if result.returncode:
+        raise ValueError("Git diff inspection failed.")
+    fields = iter(result.stdout.split("\0"))
+    paths, hidden, changed = [], False, False
+    for status in fields:
+        if not status:
+            continue
+        changed = True
+        names = [next(fields)]
+        if status[0] in ("R", "C"):
+            names.append(next(fields))
+        if all(_git_path_allowed(root, name) for name in names):
+            paths.extend(names)
+        else:
+            hidden = True
+    return list(dict.fromkeys(paths)), hidden, changed
+
 
 def execute_git_diff() -> str:
-    """Return full git diff of staged changes (or HEAD diff if nothing staged)."""
+    """Show staged or working changes only for permitted workspace paths."""
     try:
-        staged = _safe_git_run(["git", "diff", "--staged"])
-        diff_text = staged.stdout.strip()
-
-        if not diff_text:
-            unstaged = _safe_git_run(["git", "diff", "HEAD"])
-            diff_text = unstaged.stdout.strip()
-
-        if not diff_text:
+        root = _git_root()
+        revisions = ["--cached"]
+        paths, hidden, changed = _git_diff_paths(root, revisions)
+        if not changed:
+            head = _safe_git_run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", "HEAD"])
+            if head.returncode not in (0, 1):
+                raise ValueError("Could not inspect Git HEAD.")
+            revisions = ["HEAD"] if head.returncode == 0 else []
+            paths, hidden, changed = _git_diff_paths(root, revisions)
+        if not paths:
+            if hidden:
+                return "Changes exist, but protected or outside-workspace changes are omitted."
+            visible, status_hidden, untracked = _git_status_entries(root)
+            if untracked:
+                return "Untracked files exist (not included in git diff):\n" + "\n".join(visible)
+            if visible or status_hidden:
+                return "Changes exist, but no visible textual diff is available in this workspace."
             return "No changes to commit. Working tree is clean and nothing is staged."
-
-        lines = diff_text.split("\n")
+        result = _safe_git_run([
+            "git", "-C", str(root), "diff", *_GIT_DIFF_FLAGS, *revisions,
+            "--no-renames", "--", *[f":(literal){name}" for name in paths],
+        ])
+        if result.returncode:
+            raise ValueError("Git diff inspection failed.")
+        diff_text = result.stdout.strip()
+        if not diff_text:
+            return "Changes exist, but no textual diff is available."
+        lines = diff_text.splitlines()
         if len(lines) > 500:
             diff_text = "\n".join(lines[:500]) + f"\n\n[... diff truncated at 500 lines, {len(lines)} total ...]"
-
+        if hidden:
+            diff_text += "\n[Protected or outside-workspace changes omitted.]"
         return diff_text
-    except Exception as e:
-        return f"ERROR: Could not read git diff: {str(e)}"
+    except ValueError as exc:
+        return f"ERROR: Could not read git diff: {exc}"
+    except Exception as exc:
+        return f"ERROR: Could not read git diff ({type(exc).__name__})."
 
 def execute_git_commit(message: str, approved: bool = False) -> str:
     """Run git commit after explicit command confirmation or opt-in."""
@@ -646,13 +815,13 @@ def execute_git_commit(message: str, approved: bool = False) -> str:
         staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
         if not staged_check.stdout.strip():
             # Auto-stage tracked modified files per tool schema description
-            _safe_git_run(["git", "add", "-u"])
+            _safe_git_run(["git", "add", "-u"], execution=True)
             staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
 
         if not staged_check.stdout.strip():
             return "ERROR: No staged changes found to commit. Use git_status to review untracked/modified files."
 
-        result = _safe_git_run(["git", "commit", "-m", message])
+        result = _safe_git_run(["git", "commit", "-m", message], execution=True)
         if result.returncode == 0:
             return f"Committed successfully:\n{result.stdout.strip()}"
         else:

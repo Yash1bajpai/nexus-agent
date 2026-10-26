@@ -1,4 +1,6 @@
 import os
+import hashlib
+import json
 import re
 import time
 from pathlib import Path
@@ -10,6 +12,7 @@ from .tools import get_all_tools, execute_tool, execute_list_directory
 from .guardrails import LoopGuard, guardrails_enabled
 from ..cli import display
 from ..utils.config import estimate_cost
+from ..providers.messages import assistant_message
 
 RULES_PROMPT = """RULES:
 1. Always use read_file tool before answering questions about a specific file.
@@ -73,6 +76,8 @@ _TOOL_PATTERNS = [
 def _is_local_provider(provider: BaseProvider) -> bool:
     """Check if the provider is a local model (needs smart tool routing)."""
     model = getattr(provider, 'model', '') or ''
+    if hasattr(provider, "is_local"):
+        return bool(provider.is_local)
     provider_name = type(provider).__name__.lower()
     return ('local' in provider_name or
             'liquid' in model.lower() or
@@ -85,11 +90,47 @@ _VERBS = r"(?:fixed|updated|changed|modified|patched|applied|corrected|replaced|
 # The model says it changed something ("I've fixed...", "the bug has been fixed", "I fixed the bug").
 _CHANGE_CLAIM = re.compile(r"\b(?:i(?:'ve|\s+have)?\s+(?:now\s+|successfully\s+)?" + _VERBS + r"|(?:has|have|was|were|is|are)\s+(?:now\s+|successfully\s+)?(?:been\s+)?" + _VERBS + r")\b", re.IGNORECASE)
 # Legitimate "nothing to change" answers must not be flagged.
-_NO_CHANGE_OK = re.compile(r"\b(already\b|no\s+(?:code\s+)?(?:change|changes|fix|fixes|edit|edits)\s+(?:is\s+|are\s+)?(?:needed|necessary|required)|nothing\s+(?:to\s+(?:change|fix)|needs?)|not\s+(?:a\s+)?bug|(?:did\s+not|didn't|have\s+not|haven't|could\s+not|couldn't|was\s+unable\s+to|unable\s+to)\b)", re.IGNORECASE)
+_NO_CHANGE_OK = re.compile(
+    r"\b(?:already\s+(?:correct|fixed|implemented|up.to.date)|"
+    r"no\s+(?:code\s+)?(?:changes?|fix(?:es)?|edits?)\s+(?:is\s+|are\s+)?(?:needed|necessary|required)|"
+    r"nothing\s+(?:to\s+(?:change|fix)|needs?\s+(?:changing|fixing))|not\s+(?:a\s+)?bug|"
+    r"(?:did\s+not|didn't|have\s+not|haven't|could\s+not|couldn't|unable\s+to)\s+"
+    r"(?:appl(?:y|ied)|make|made|chang(?:e|ed)|fix(?:ed)?|edit(?:ed)?|modif(?:y|ied)|write|written|patch(?:ed)?))\b", re.IGNORECASE,
+)
+
+
+def _file_state(path: Path):
+    """Fingerprint file bytes without retaining potentially large tool payloads."""
+    try:
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").digest()
+        return ("file", digest)
+    except FileNotFoundError:
+        return ("missing", None)
+    except OSError:
+        return None
+
+def _edit_path(args) -> Optional[Path]:
+    try:
+        path = args.get("path")
+        return Path(path).resolve() if isinstance(path, (str, os.PathLike)) and path else None
+    except (OSError, ValueError):
+        return None
+
 
 
 def _wants_edit(user_input: str) -> bool:
-    return bool(_EDIT_INTENT.search(user_input or ""))
+    text = (user_input or "").strip()
+    informational = re.match(
+        r"^(?:please\s+)?(?:how\b|what\b|why\b|when\b|where\b|explain\b|describe\b|"
+        r"read\b|review\b|inspect\b|(?:can|could|would)\s+you\s+(?:please\s+)?(?:explain|describe)\b)",
+        text, re.IGNORECASE,
+    )
+    if informational:
+        # A clear subsequent imperative can turn an explanation into an edit task.
+        clauses = re.split(r"\bthen\s+|[.;]\s+", text, flags=re.IGNORECASE)
+        return any(_EDIT_INTENT.match(clause.lstrip()) for clause in clauses[1:])
+    return bool(_EDIT_INTENT.search(text))
 
 
 def _query_needs_tools(user_input: str) -> bool:
@@ -196,6 +237,7 @@ class Agent:
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
         self.edit_not_applied = False  # an edit was requested, nothing was written, and the model did not say nothing needs changing
         self.claim_unverified = False  # model said tests pass but they were not run / last run failed
+        self.changed_files: set[str] = set()
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -224,6 +266,22 @@ class Agent:
         model_name = getattr(self.provider, "model", "")
         return estimate_cost(model_name, self.total_input_tokens, self.total_output_tokens)
 
+    def _sync_context_window(self, provider=None):
+        active = provider if provider is not None else getattr(self.provider, "active_provider", self.provider)
+        window = getattr(active, "context_size", None)
+        self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+
+    def _nudge(self, text: str):
+        self.memory.add_raw({"role": "user", "content": text, "metadata": {"internal": True}})
+
+    def _stream_correction(self, text: str):
+        if not text:
+            return
+        if self.event_callback:
+            self.event_callback({"type": "stream_chunk", "content": text})
+        else:
+            display.print_stream_chunk(text)
+
     def _fit(self, messages, tools, scale: float = 1.0):
         """Trim what is sent to the model so it fits the window. Stored history is untouched."""
         if not self.context_window:
@@ -231,7 +289,12 @@ class Agent:
         window = int(self.context_window * scale)
         reserve = min(1024, max(256, window // 4))  # room for the answer
         overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
-        budget = max(256, window - reserve - overhead)
+        budget = window - reserve - overhead
+        if budget <= 0:
+            raise context.ContextBudgetError(
+                f"Context window ({window} tokens) cannot fit instructions, tools and answer reserve "
+                f"({overhead + reserve} tokens). Use a larger context window or fewer tools."
+            )
         fitted, stats = context.fit_messages(messages, budget)
         self.last_trim = stats
         if stats["dropped_messages"] or stats["truncated_messages"]:
@@ -253,8 +316,11 @@ class Agent:
             self.memory.replace(new)
         return before, context.history_tokens(self.memory.get()), info
 
-    def run(self, user_input: str, stream: bool = False) -> str:
+    def run(self, user_input: str, stream: bool = False, require_edit: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
+        wants_edit = require_edit or (
+            any(tool.name in _WRITE_TOOLS for tool in self.tools) and _wants_edit(user_input)
+        )
         processed_input = parse_at_mentions(attach_named_files(user_input))
         self.memory.add("user", processed_input)
         error_nudges = 0
@@ -265,7 +331,7 @@ class Agent:
         # model from looping on tools for simple questions.
         use_tools = self.tools
         local_mode = _is_local_provider(self.provider)
-        if local_mode and not _query_needs_tools(processed_input):
+        if local_mode and not wants_edit and not _query_needs_tools(processed_input):
             use_tools = []  # no tools → model answers directly
             effective_max_iter = 1
         else:
@@ -289,11 +355,21 @@ class Agent:
         self.claimed_unapplied_edit = False
         self.edit_not_applied = False
         self.claim_unverified = False
+        self.changed_files = set()
+        previous_before_request = getattr(self.provider, "before_request", None)
+        managed_fallback = hasattr(self.provider, "before_request")
+        if managed_fallback:
+            def before_request(active, full_messages, tools, system):
+                self._sync_context_window(active)
+                return self._fit(full_messages, tools, window_scale), system
+            self.provider.before_request = before_request
         try:
             while iteration < effective_max_iter:
                 iteration += 1
                 display.update_status(status, "Thinking...")
-                send_messages = self._fit(messages, use_tools, window_scale)
+                self._sync_context_window()
+                local_mode = _is_local_provider(self.provider)
+                send_messages = messages if managed_fallback else self._fit(messages, use_tools, window_scale)
 
                 try:
                     if stream and hasattr(self.provider, "stream"):
@@ -325,7 +401,7 @@ class Agent:
                 except RateLimitError as e:
                     display.stop_status(status)
                     status = None
-                    display.print_warn(f"{e.provider} rate limit hit. Switching to next provider...")
+                    display.print_warn(f"{e.provider} rate limit hit. Request stopped; no fallback provider is available.")
                     raise
                 except Exception as e:
                     # One retry with a tighter budget when the server says the prompt did not fit.
@@ -338,9 +414,11 @@ class Agent:
 
                 self.total_input_tokens += response.input_tokens
                 self.total_output_tokens += response.output_tokens
+                self._sync_context_window()
+                local_mode = _is_local_provider(self.provider)
 
                 if response.has_tool_calls:
-                    self.memory.add_raw(response.raw_assistant_message)
+                    self.memory.add_raw(assistant_message(response.text, response.tool_calls))
 
                     # Show THINKING trace: the LLM's reasoning text before tool call
                     if response.text and not stream:
@@ -352,6 +430,7 @@ class Agent:
                             display.print_thinking(response.text)
 
                     for tool_call in response.tool_calls:
+                        changed = False
                         # Build status display with full argument visibility (up to 150 chars)
                         args_preview = ", ".join(
                             f'{k}="{v[:120]}..."' if isinstance(v, str) and len(v) > 120 else
@@ -372,7 +451,6 @@ class Agent:
 
                         # Check for exact duplicate tool calls
                         # We use json.dumps with sorted_keys to ensure deterministic string representation
-                        import json
                         tool_sig = f"{tool_call.name}:{json.dumps(tool_call.args, sort_keys=True)}"
                         start = time.time()
                         
@@ -381,7 +459,7 @@ class Agent:
                             result = f"ERROR: Tool '{tool_call.name}' is not allowed in this session."
                         elif tool_sig in executed_tools:
                             duplicate_counts[tool_sig] = duplicate_counts.get(tool_sig, 0) + 1
-                            reread_while_editing = (tool_call.name == "read_file" and not wrote_ok and _wants_edit(user_input)
+                            reread_while_editing = (tool_call.name == "read_file" and not wrote_ok and wants_edit
                                                     and any(getattr(t, "name", None) in _WRITE_TOOLS for t in offered_tools))
                             if duplicate_counts[tool_sig] >= (3 if reread_while_editing else 2):
                                 # Hard stop: the model is stuck in a loop.
@@ -397,7 +475,15 @@ class Agent:
                                 result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
                         else:
                             executed_tools.add(tool_sig)
+                            edit_path = _edit_path(tool_call.args) if tool_call.name in _WRITE_TOOLS else None
+                            before_edit = _file_state(edit_path) if edit_path is not None else None
                             result = execute_tool(tool_call.name, tool_call.args)
+                            changed = (edit_path is not None and before_edit is not None
+                                       and (after_edit := _file_state(edit_path)) is not None
+                                       and after_edit != before_edit
+                                       and not str(result).startswith(("ERROR:", "No changes:")))
+                            if changed:
+                                self.changed_files.add(str(edit_path))
                             if guard:
                                 result = guard.after_tool(tool_call.name, tool_call.args, result)
 
@@ -418,7 +504,7 @@ class Agent:
                             if failed_tool is None or tool_call.name == failed_tool or tool_call.name in _WRITE_TOOLS:
                                 unresolved.pop(error_key, None)
                                 unresolved_tool.pop(error_key, None)
-                            if tool_call.name in _WRITE_TOOLS:
+                            if tool_call.name in _WRITE_TOOLS and changed:
                                 wrote_ok = True
                                 from .consent import auto_check_enabled
                                 if auto_check_enabled() and any(getattr(t, "name", None) == "run_tests" for t in use_tools):
@@ -439,11 +525,11 @@ class Agent:
                         if self.verbose:
                             display.print_tool_result(result, duration, tool_call.name)
 
-                        self.memory.add_raw(self.provider.format_tool_result_message(tool_call.id, result))
+                        self.memory.add_raw({"role": "tool", "tool_call_id": tool_call.id, "content": str(result)})
 
                     if force_final:
                         # Anti-loop: no tools next round, model must answer directly
-                        self.memory.add("user", "[SYSTEM] Tool budget exhausted: the same tool call was repeated. "
+                        self._nudge("[SYSTEM] Tool budget exhausted: the same tool call was repeated. "
                                                  "Do not call any more tools. Give your final answer to the user's "
                                                  "original question now.")
                         use_tools = []
@@ -458,11 +544,14 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     final_text = response.text
-                    if guard and use_tools:
+                    if guard:
                         verdict, reviewed = guard.review_final(final_text)
                         if verdict == "retry":
                             self.memory.add("assistant", final_text)
-                            self.memory.add("user", reviewed)
+                            self._nudge(reviewed)
+                            self.claim_unverified = guard.claim_unverified
+                            if stream:
+                                self._stream_correction("\n\nCorrection: the preceding test-pass claim is unverified; run_tests last reported FAILED.\n")
                             if self.event_callback:
                                 self.event_callback({"type": "guardrail", "content": "blocked unverified success claim"})
                             effective_max_iter = max(effective_max_iter, iteration + 1)
@@ -471,35 +560,34 @@ class Agent:
                                 status = display.create_status("Thinking...")
                             continue
                         final_text = reviewed
-                        self.claim_unverified = bool(guard.claim_unverified and _wants_edit(user_input))
+                        self.claim_unverified = guard.claim_unverified
                     if (local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
                         # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
                         error_nudges += 1
                         self.memory.add("assistant", final_text or "(no answer)")
-                        self.memory.add("user", "[SYSTEM] Your last tool call failed: " + "; ".join(dict.fromkeys(unresolved.values()))[:400]
+                        self._nudge("[SYSTEM] Your last tool call failed: " + "; ".join(dict.fromkeys(unresolved.values()))[:400]
                                         + " Do not just describe a plan. Fix this by calling the tools now (read_file first if needed), then finish the task.")
                         messages = self.memory.get()
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
                         continue
                     if (local_mode and use_tools and not wrote_ok and not unresolved and error_nudges < 2
-                            and iteration < effective_max_iter and _wants_edit(user_input)
+                            and iteration < effective_max_iter and wants_edit
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in use_tools)
                             and not _NO_CHANGE_OK.search(final_text or "")):
                         # An edit was requested, nothing was written, and the model did not say there is nothing to change.
                         error_nudges += 1
                         self.memory.add("assistant", final_text or "(no answer)")
-                        self.memory.add("user", "[SYSTEM] No file has been changed yet. Do not explain; act. Call patch_file "
+                        self._nudge("[SYSTEM] No file has been changed yet. Do not explain; act. Call patch_file "
                                         "(or write_file) now using the exact text from the file, then call run_tests to check.")
                         messages = self.memory.get()
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
                         continue
                     self.unresolved_errors = list(unresolved.values())
-                    if (not wrote_ok and not self.unresolved_errors and _wants_edit(user_input)
-                            and any(getattr(t, "name", None) in _WRITE_TOOLS for t in offered_tools)):
-                        final_text += ("\n\nWarning: no file was changed. No successful patch_file or write_file call "
-                                       "happened in this run, so do not assume the edit was applied.")
+                    if not wrote_ok and wants_edit and not _NO_CHANGE_OK.search(final_text or ""):
+                        final_text += ("\n\nWarning: no file was changed. No file tool actually changed file contents "
+                                       "in this run, so do not assume the edit was applied.")
                         if not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
                             self.edit_not_applied = True
                         if _CHANGE_CLAIM.search(final_text.split("\n\nWarning: no file was changed")[0]) and not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
@@ -511,16 +599,35 @@ class Agent:
                     if self.event_callback:
                         self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
                     
-                    if stream and not self.event_callback:
+                    if stream:
                         if streamed_text:
-                            print()  # newline after streamed chunks
-                        else:
+                            baseline = response.text.rstrip()
+                            if final_text.startswith(baseline):
+                                correction = final_text[len(baseline):]
+                            else:
+                                correction = "\n\nCorrected outcome:\n" + final_text
+                            self._stream_correction(correction + "\n")
+                        elif not self.event_callback:
                             display.print_response(final_text)
 
                     self.memory.add("assistant", final_text)
                     return final_text
         finally:
             display.stop_status(status)
+            if managed_fallback:
+                self.provider.before_request = previous_before_request
             self.unresolved_errors = list(unresolved.values())
 
-        return "Max tool iterations reached. Please try a more specific question."
+        final_text = "Stopped: maximum tool iterations reached before the task completed."
+        self.unresolved_errors.append("Maximum tool iterations reached before task completed.")
+        if wants_edit and not self.changed_files:
+            self.edit_not_applied = True
+            final_text += " No file was changed."
+        if self.unresolved_errors:
+            final_text += "\nUnresolved tool errors:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
+        self.memory.add("assistant", final_text)
+        if self.event_callback:
+            self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
+        if stream and not self.event_callback:
+            display.print_response(final_text)
+        return final_text

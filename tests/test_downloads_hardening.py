@@ -46,7 +46,6 @@ def test_interrupted_engine_download_leaves_nothing_and_next_run_recovers(tmp_pa
 
 
 def test_legacy_hf_cache_found_without_huggingface_hub(tmp_path, monkeypatch):
-    import importlib.util
     monkeypatch.setenv("NEXUS_AGENT_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
     snap = tmp_path / "hub" / "models--Org--Repo" / "snapshots" / "abc123"
@@ -58,9 +57,9 @@ def test_legacy_hf_cache_found_without_huggingface_hub(tmp_path, monkeypatch):
         os.symlink(blob, snap / "m.gguf")
     except OSError:
         (snap / "m.gguf").write_bytes(b"gguf-bytes")
-    assert importlib.util.find_spec("huggingface_hub") is None or True  # works either way; no import is used
     found = md.find_cached("Org/Repo", "m.gguf")
     assert found and open(found, "rb").read() == b"gguf-bytes"
+    assert not md.local_path("Org/Repo", "m.gguf").exists()  # legacy discovery does not copy the model
     assert md.find_cached("Org/Other", "m.gguf") is None
 
 
@@ -68,6 +67,8 @@ class _Rec(http.server.BaseHTTPRequestHandler):
     seen = {}
     redirect_to = None
     body = b"secret-model-bytes" * 100
+    require_auth = False
+    seen_ranges = {}
 
     def log_message(self, *a):
         pass
@@ -78,6 +79,12 @@ class _Rec(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         _Rec.seen[self.server.server_port] = self.headers.get("Authorization")
+        _Rec.seen_ranges[self.server.server_port] = self.headers.get("Range")
+        if (_Rec.require_auth and self.server.server_port == _Rec.first
+                and self.headers.get("Authorization") != "Bearer hf_testtoken"):
+            self.send_response(401)
+            self.end_headers()
+            return
         if self.server.server_port == _Rec.first and _Rec.redirect_to:
             self.send_response(302)
             self.send_header("Location", _Rec.redirect_to)
@@ -125,3 +132,31 @@ def test_token_not_sent_to_unrelated_host(tmp_path, monkeypatch):
         assert _Rec.seen[a.server_port] is None
     finally:
         a.shutdown()
+
+
+@pytest.mark.parametrize("redirect", [False, True])
+def test_speed_probe_authenticates_and_isolates_redirect_token(monkeypatch, redirect):
+    from nexus_agent_ai.utils import model_select
+    monkeypatch.setenv("HF_TOKEN", "hf_testtoken")
+    a, b = _serve(), _serve()
+    try:
+        _Rec.seen.clear()
+        _Rec.seen_ranges.clear()
+        _Rec.first = a.server_port
+        _Rec.require_auth = True
+        _Rec.redirect_to = f"http://127.0.0.1:{b.server_port}/file" if redirect else None
+        monkeypatch.setattr(md, "HF_BASE", f"http://127.0.0.1:{a.server_port}")
+        speed = model_select.probe_speed_mbps("private/model", "nested/m.gguf", probe_bytes=100)
+        assert speed is not None and speed > 0
+        assert _Rec.seen[a.server_port] == "Bearer hf_testtoken"
+        assert _Rec.seen_ranges[a.server_port] == "bytes=0-99"
+        if redirect:
+            assert _Rec.seen[b.server_port] is None
+            assert _Rec.seen_ranges[b.server_port] == "bytes=0-99"
+        else:
+            assert b.server_port not in _Rec.seen
+    finally:
+        _Rec.require_auth = False
+        _Rec.redirect_to = None
+        a.shutdown()
+        b.shutdown()

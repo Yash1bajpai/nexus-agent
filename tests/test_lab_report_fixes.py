@@ -126,7 +126,7 @@ def test_reasoning_only_stream_returns_last_line(monkeypatch):
     monkeypatch.setattr(
         "urllib.request.urlopen", lambda req, timeout=None: _FakeSSE(lines)
     )
-    prov = lp.LocalProvider.__new__(lp.LocalProvider)
+    prov = lp.LocalProvider()
     prov._model_instance = "llama_server"
     prov._server_port = 8099
     res = prov.complete([{"role": "user", "content": "capital of France?"}], [], "sys")

@@ -2,7 +2,6 @@ import atexit
 import json
 import os
 import platform
-import re
 import subprocess
 import sys
 import uuid
@@ -10,6 +9,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from .base import BaseProvider, ProviderResponse, Tool, ToolCall
+from .messages import assistant_message, extract_json_tool_calls, openai_messages, tool_result
 
 # llama-server binary URLs per platform (llama.cpp b7075 release)
 _LLAMA_RELEASE = "b7075"
@@ -46,7 +46,6 @@ def _get_llama_server_info() -> tuple:
 
 _NEXUS_HOME = Path.home() / ".nexus-agent"
 _SERVER_DIR = _NEXUS_HOME / "llama-server"
-_DEFAULT_PORT = 8099  # avoid collision with 8080
 _DEFAULT_REPO = "LiquidAI/LFM2.5-2.6B-GGUF"
 _DEFAULT_FILENAME = "LFM2.5-2.6B-Q6_K.gguf"
 
@@ -78,12 +77,6 @@ def _cleanup_all_servers():
     for proc in list(_ACTIVE_SERVER_PROCS):
         _terminate_proc(proc)
     _ACTIVE_SERVER_PROCS.clear()
-    pid_file = _SERVER_DIR / "llama_server.pid"
-    if pid_file.exists():
-        try:
-            pid_file.unlink()
-        except Exception:
-            pass
 
 atexit.register(_cleanup_all_servers)
 
@@ -161,6 +154,8 @@ class LocalProvider(BaseProvider):
       3. llama-server subprocess (auto-downloaded binary, works on CPU — best for Windows)
       4. Ollama (external HTTP API, must be pre-installed)
     """
+    is_local = True
+
 
     def __init__(self, model_id: str = None, filename: str = None, context_size: Optional[int] = None):
         """Create a local provider for any HuggingFace GGUF repo.
@@ -184,7 +179,11 @@ class LocalProvider(BaseProvider):
         self._llama = None  # llama-cpp-python instance
         self._model_path = None
         self._server_proc = None  # llama-server subprocess
-        self._server_port = _DEFAULT_PORT
+        self._server_port = None
+        self._server_alias = f"nexus-{uuid.uuid4().hex}"
+        self._server_log_path = None
+        self._server_model_path = None
+        self._server_context_size = None
 
     def setup_model(self, verify_download: bool = False) -> str:
         if self._model_path is not None and not verify_download:
@@ -196,7 +195,7 @@ class LocalProvider(BaseProvider):
             from ..utils import model_download
             print(f"⚡ Downloading/Verifying Local Liquid LFM engine ({self.filename})...")
             model_path = model_download.find_cached(self.model_id, self.filename)
-            if not model_path:
+            if verify_download or not model_path:
                 model_path = model_download.download(
                     self.model_id, self.filename, progress=model_download.console_progress())
                 sys.stderr.write("\n")
@@ -252,15 +251,7 @@ class LocalProvider(BaseProvider):
 
         # Path 3: llama-server subprocess (auto-downloads pre-built binary — best for Windows CPU)
         if isinstance(model_path, str) and os.path.isfile(model_path):
-            # A server may already be running (e.g. started manually) — use it
-            # before attempting any binary download.
-            if self._is_server_alive():
-                if self._explicit_context_size:
-                    raise RuntimeError("A llama-server is already running; its context size is unverified. Stop it before using --context-size.")
-                print(f"✅ llama-server already running on port {self._server_port}")
-                self._model_instance = "llama_server"
-                return
-            machine = platform.machine().lower()
+            # Only this instance's process can serve its selected model/context.
             if system_machine_is_arm_linux() and not _find_llama_server_exe():
                 print("⚠️ No native llama-server found for ARM Linux (aarch64).")
                 print("   The auto-downloader only ships x86_64 binaries.")
@@ -275,7 +266,7 @@ class LocalProvider(BaseProvider):
                 return
             except Exception as e:
                 print(f"⚠️ llama-server failed: {e}")
-                print(f"   Log: {_SERVER_DIR / 'server.log'}")
+                print(f"   Log: {self._server_log_path}")
 
         # Path 4: Ollama (external HTTP API)
         if self._explicit_context_size:
@@ -363,22 +354,27 @@ class LocalProvider(BaseProvider):
 
     def _start_llama_server(self, model_path: str):
         """Download llama-server if needed and start it with the GGUF model."""
-        # Check if already running on our port (avoids a needless binary download)
-        if self._is_server_alive():
-            if self._explicit_context_size:
-                raise RuntimeError("A llama-server is already running; its context size is unverified. Stop it before using --context-size.")
-            print(f"✅ llama-server already running on port {self._server_port}")
+        model_path = str(Path(model_path).resolve())
+        if (self._server_model_path == model_path
+                and self._server_context_size == self.context_size
+                and self._is_server_alive()):
             self._model_instance = "llama_server"
             return
-
+        self.stop()
         exe_path = self._download_llama_server()
-
+        import socket
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            self._server_port = reservation.getsockname()[1]
         port = self._server_port
-        log_path = _SERVER_DIR / "server.log"
+        _SERVER_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = _SERVER_DIR / f"server-{self._server_alias}.log"
+        self._server_log_path = log_path
         log_file = open(str(log_path), "w", encoding="utf-8")
         cmd = [
             exe_path,
             "-m", model_path,
+            "--alias", self._server_alias,
             "-c", str(self.context_size),
             "--parallel", "1",
             "--port", str(port),
@@ -390,18 +386,20 @@ class LocalProvider(BaseProvider):
             "--repeat-penalty", "1.1",  # recommended by model card
         ]
         print(f"🔧 Starting llama-server on port {port}...")
-        self._server_proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        self._server_log = log_file
-        _ACTIVE_SERVER_PROCS.add(self._server_proc)
         try:
-            (_SERVER_DIR / "llama_server.pid").write_text(str(self._server_proc.pid), encoding="utf-8")
-        except Exception:
-            pass
+            self._server_proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except BaseException:
+            log_file.close()
+            raise
+        self._server_log = log_file
+        self._server_model_path = model_path
+        self._server_context_size = self.context_size
+        _ACTIVE_SERVER_PROCS.add(self._server_proc)
 
         # Wait for server to be ready. Model loading is CPU/IO bound and can
         # take well over a minute for ~2 GB quant files on slow laptop CPUs,
@@ -414,64 +412,67 @@ class LocalProvider(BaseProvider):
         print(f"   Loading model ({model_gb:.1f} GB) — waiting up to {timeout_s}s...")
         import time
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            time.sleep(1.0)
-            if self._is_server_alive():
-                print(f"✅ llama-server ready on http://127.0.0.1:{port}")
-                self._model_instance = "llama_server"
-                return
-            if self._server_proc.poll() is not None:
-                # Process exited — read log file for error details
-                log_path = _SERVER_DIR / "server.log"
-                log_tail = ""
-                try:
-                    if log_path.is_file():
-                        log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-800:]
-                except Exception:
-                    pass
-                exit_code = self._server_proc.returncode
-                self.stop()
-                raise RuntimeError(
-                    f"llama-server exited immediately (exit code {exit_code}).\n"
-                    f"Server log:\n{log_tail.strip()}"
-                )
-
-        self.stop()
-        raise RuntimeError(
-            f"llama-server did not become ready within {timeout_s} seconds.\n"
-            f"Check the log at: {_SERVER_DIR / 'server.log'}\n"
-            f"This can happen if:\n"
-            f"  - Another program is using port {self._server_port}\n"
-            f"  - Antivirus blocked the binary\n"
-            f"  - The model file is corrupted\n"
-            f"Try: Install Ollama instead (https://ollama.com) and use -p ollama"
-        )
+        try:
+            while time.monotonic() < deadline:
+                time.sleep(1.0)
+                if self._is_server_alive():
+                    print(f"✅ llama-server ready on http://127.0.0.1:{port}")
+                    self._model_instance = "llama_server"
+                    return
+                if self._server_proc.poll() is not None:
+                    log_tail = ""
+                    try:
+                        if log_path.is_file():
+                            log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-800:]
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"llama-server exited immediately (exit code {self._server_proc.returncode}).\n"
+                        f"Server log:\n{log_tail.strip()}"
+                    )
+            raise RuntimeError(
+                f"llama-server did not become ready within {timeout_s} seconds.\n"
+                f"Check the log at: {log_path}\n"
+                f"Another program may have taken port {port}, antivirus may have blocked "
+                "the binary, or the model file may be corrupted."
+            )
+        except BaseException:
+            self.stop()
+            raise
 
     def _is_server_alive(self) -> bool:
-        """Check if llama-server is responding."""
+        """Check health and identity only for the process owned by this instance."""
+        if self._server_proc is None or self._server_proc.poll() is not None:
+            return False
         import urllib.request
         try:
-            req = urllib.request.Request(f"http://127.0.0.1:{self._server_port}/health", method="GET")
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
-                return resp.status == 200
+            base = f"http://127.0.0.1:{self._server_port}"
+            with urllib.request.urlopen(base + "/health", timeout=2.0) as resp:
+                if resp.status != 200:
+                    return False
+            with urllib.request.urlopen(base + "/v1/models", timeout=2.0) as resp:
+                models = json.loads(resp.read()).get("data", [])
+            return any(model.get("id") == self._server_alias for model in models)
         except Exception:
             return False
 
     def _run_via_server(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
-        """Send a request to the local llama-server via OpenAI-compatible API.
+        for chunk in self._stream_via_server(messages, tools, system):
+            if isinstance(chunk, ProviderResponse):
+                return chunk
+        raise RuntimeError("Local server ended without a final response")
 
-        Uses streaming (SSE) so that tokens flow continuously — this avoids
-        client-side socket timeouts during slow CPU-bound local generation.
-        """
+    def _stream_via_server(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str):
+        """Yield SSE text immediately, then the assembled tool calls and usage."""
         import urllib.request
 
         formatted_messages = []
         if system:
             formatted_messages.append({"role": "system", "content": system})
-        formatted_messages.extend(messages)
+        formatted_messages.extend(openai_messages(messages))
 
         payload = {
-            "model": getattr(self, "model_id", _DEFAULT_REPO),
+            "model": self._server_alias,
             "messages": formatted_messages,
             "temperature": 0.2,
             "top_p": 0.95,
@@ -511,7 +512,9 @@ class LocalProvider(BaseProvider):
                 if not line.startswith("data:"):
                     continue
                 chunk_str = line[len("data:"):].strip()
-                if not chunk_str or chunk_str == "[DONE]":
+                if chunk_str == "[DONE]":
+                    break
+                if not chunk_str:
                     continue
                 try:
                     chunk = json.loads(chunk_str)
@@ -529,6 +532,7 @@ class LocalProvider(BaseProvider):
                 content_delta = delta.get("content")
                 if content_delta:
                     text_parts.append(content_delta)
+                    yield content_delta
 
                 reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
                 if reasoning_delta:
@@ -540,7 +544,7 @@ class LocalProvider(BaseProvider):
                     idx = rtc.get("index", 0)
                     key = f"idx_{idx}"
                     if key not in raw_tool_calls_by_id:
-                        raw_tool_calls_by_id[key] = {"id": "", "name": "", "arguments": ""}
+                        raw_tool_calls_by_id[key] = {"id": f"call_{uuid.uuid4().hex}", "name": "", "arguments": ""}
                         raw_tool_call_order.append(key)
                     entry = raw_tool_calls_by_id[key]
                     if rtc.get("id"):
@@ -572,14 +576,11 @@ class LocalProvider(BaseProvider):
             tc_id = entry["id"] or f"call_{uuid.uuid4().hex[:8]}"
             tool_calls.append(ToolCall(id=tc_id, name=func_name, args=func_args))
 
-        raw_msg = {"role": "assistant", "content": text}
-        if tool_calls:
-            raw_msg["tool_calls"] = [
-                {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.args)}}
-                for tc in tool_calls
-            ]
+        if not tool_calls:
+            text, tool_calls = extract_json_tool_calls(text)
+        raw_msg = assistant_message(text, tool_calls)
 
-        return ProviderResponse(
+        yield ProviderResponse(
             text=text,
             tool_calls=tool_calls,
             raw_assistant_message=raw_msg,
@@ -628,14 +629,14 @@ class LocalProvider(BaseProvider):
                 "Options: (A) install Ollama from https://ollama.com then retry with: "
                 "nexus-agent -p ollama \"your question\"; "
                 "(B) use a free cloud key from https://openrouter.ai (set OPENROUTER_API_KEY, then -p openrouter); "
-                "(C) check the llama-server log at ~/.nexus-agent/llama-server/server.log"
+                "(C) check the per-instance logs at ~/.nexus-agent/llama-server/server-nexus-*.log"
             )
 
         # GPU Engine processing logic (torch + transformers)
         formatted_messages = []
         if system:
             formatted_messages.append({"role": "system", "content": system})
-        formatted_messages.extend(messages)
+        formatted_messages.extend(openai_messages(messages))
 
         prompt = self._tokenizer.apply_chat_template(
             formatted_messages, tools=self._convert_tools(tools) if tools else None, tokenize=False, add_generation_prompt=True
@@ -646,25 +647,8 @@ class LocalProvider(BaseProvider):
         generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, outputs)]
         
         response_text = self._tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        tool_calls = []
-        raw_tool_calls = []
-        
-        # Parse JSON blocks reliably via regex
-        matches = re.findall(r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', response_text, flags=re.DOTALL)
-        for match in matches:
-            try:
-                func_name, args_str = match[0].strip(), match[1].strip()
-                parsed_args = json.loads(args_str)
-                tc_id = f"call_{uuid.uuid4().hex[:8]}"
-                tool_calls.append(ToolCall(id=tc_id, name=func_name, args=parsed_args))
-                raw_tool_calls.append({"id": tc_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(parsed_args)}})
-            except Exception:
-                continue
-
-        clean_text = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}', "", response_text, flags=re.DOTALL).strip()
-        raw_msg = {"role": "assistant", "content": clean_text}
-        if raw_tool_calls:
-            raw_msg["tool_calls"] = raw_tool_calls
+        clean_text, tool_calls = extract_json_tool_calls(response_text)
+        raw_msg = assistant_message(clean_text, tool_calls)
 
         return ProviderResponse(text=clean_text, tool_calls=tool_calls, raw_assistant_message=raw_msg, input_tokens=input_tokens, output_tokens=len(generated_ids[0]))
 
@@ -673,7 +657,7 @@ class LocalProvider(BaseProvider):
         formatted_messages = []
         if system:
             formatted_messages.append({"role": "system", "content": system})
-        formatted_messages.extend(messages)
+        formatted_messages.extend(openai_messages(messages))
 
         kwargs = {
             "messages": formatted_messages,
@@ -701,16 +685,12 @@ class LocalProvider(BaseProvider):
                 func_args = json.loads(func.get("arguments", "{}")) if isinstance(func.get("arguments"), str) else func.get("arguments", {})
             except json.JSONDecodeError:
                 func_args = {}
-            tc_id = rtc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+            tc_id = rtc.get("id") or f"call_{uuid.uuid4().hex}"
             tool_calls.append(ToolCall(id=tc_id, name=func_name, args=func_args))
 
-        # Build raw_assistant_message
-        raw_msg = {"role": "assistant", "content": text}
-        if raw_tool_calls:
-            raw_msg["tool_calls"] = [
-                {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.args)}}
-                for tc in tool_calls
-            ]
+        if not tool_calls:
+            text, tool_calls = extract_json_tool_calls(text)
+        raw_msg = assistant_message(text, tool_calls)
 
         usage = response.get("usage", {})
         return ProviderResponse(
@@ -722,15 +702,16 @@ class LocalProvider(BaseProvider):
         )
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
-        res = self.complete(messages, tools, system)
-        if res.text:
-            chunk_size = max(1, len(res.text) // 15)
-            for i in range(0, len(res.text), chunk_size):
-                yield res.text[i:i + chunk_size]
-        yield res
+        self._ensure_loaded()
+        if self._model_instance == "llama_server":
+            yield from self._stream_via_server(messages, tools, system)
+        else:
+            # Optional engines without a streaming implementation return only
+            # the final response; never simulate token delivery with slices.
+            yield self.complete(messages, tools, system)
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
-        return {"role": "tool", "tool_call_id": tool_call_id, "content": str(result)}
+        return tool_result(tool_call_id, result)
 
     def stop(self):
         """Explicitly shut down the llama-server subprocess and release resources."""
@@ -749,12 +730,10 @@ class LocalProvider(BaseProvider):
                 pass
             self._server_log = None
 
-        pid_file = _SERVER_DIR / "llama_server.pid"
-        if pid_file.exists():
-            try:
-                pid_file.unlink()
-            except Exception:
-                pass
+        if getattr(self, "_model_instance", None) == "llama_server":
+            self._model_instance = None
+        self._server_model_path = None
+        self._server_context_size = None
 
     def __del__(self):
         """Clean up llama-server subprocess on garbage collection."""

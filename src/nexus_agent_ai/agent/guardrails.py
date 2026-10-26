@@ -15,13 +15,30 @@ from typing import Dict, List, Optional, Tuple
 MAX_TEST_RETRIES = 2
 
 _SUCCESS_CLAIM = re.compile(
-    r"\b(tests?\s+(?:all\s+)?(?:pass(?:es|ed|ing)?|succeed(?:s|ed)?|are\s+(?:green|passing))|"
-    r"all\s+(?:tests\s+)?(?:pass(?:es|ed)?|green)|passes?\s+now|now\s+passes?|"
-    r"(?:fixed|resolved)\s+(?:the\s+)?(?:bug|issue|problem|test))",
+    r"\b(?:tests?|test\s+suite|pytest)\s+(?:(?:all|now)\s+)?"
+    r"(?:(?:has|have)\s+)?(?:pass(?:es|ed|ing)?|succeed(?:s|ed)?|"
+    r"(?:is|are)\s+(?:green|passing)|(?:is|are)\s+now\s+passing)\b|"
+    r"\ball\s+(?:tests?\s+)?(?:pass(?:es|ed)?|green)\b",
     re.IGNORECASE,
 )
-_FAIL_ADMISSION = re.compile(r"\b(fail(?:s|ed|ing|ure)?|not\s+pass|did\s+not\s+pass|still\s+broken)\b", re.IGNORECASE)
+_NEGATED_CLAIM = re.compile(
+    r"\b(?:no|none|neither|not|never|cannot|can't|couldn't|didn't|haven't|hasn't|don't|doesn't|"
+    r"aren't|isn't|wasn't|weren't|unable|unverified|unconfirmed|unrun|without|whether|if|may|might|should|would)\b",
+    re.IGNORECASE,
+)
 _PATH_ARG_TOOLS = ("read_file", "patch_file", "write_file")
+
+
+def claims_tests_pass(text: str) -> bool:
+    """Recognize assertions, not quoted examples, plans, or negative admissions."""
+    text = re.sub(r"```.*?```|`[^`]*`", "", text or "", flags=re.DOTALL)
+    text = re.sub(r"\"[^\"\n]*\"|“[^”\n]*”|(?<!\w)'[^'\n]*'(?!\w)", "", text)
+    for clause in re.split(r"[\n.!?;]+", text):
+        if clause.lstrip().startswith(">"):
+            continue
+        if _SUCCESS_CLAIM.search(clause) and not _NEGATED_CLAIM.search(clause):
+            return True
+    return False
 
 
 def guardrails_enabled(explicit: Optional[bool] = None) -> bool:
@@ -68,7 +85,7 @@ class LoopGuard:
                 self.last_tests, self.last_tests_output = "unavailable", text  # could not run: not a test failure
             else:
                 self.last_tests, self.last_tests_output = "failed", text
-        elif name in ("patch_file", "write_file") and not text.startswith("ERROR:"):
+        elif name in ("patch_file", "write_file") and not text.startswith(("ERROR:", "No changes:")):
             self.edited_since_tests = True
         elif name in ("git_status", "git_diff") and not text.startswith("ERROR:"):
             self.git_outputs.append(text)
@@ -96,8 +113,10 @@ class LoopGuard:
     # -- before the final answer is accepted -----------------------------------
     def review_final(self, text: str) -> Tuple[str, str]:
         """Return (verdict, text). verdict: 'ok' | 'retry' (text is the nudge to send) ."""
-        claims_success = bool(_SUCCESS_CLAIM.search(text or ""))
-        if claims_success and self.last_tests == "failed" and not _FAIL_ADMISSION.search(text or ""):
+        self.claim_unverified = False
+        claims_success = claims_tests_pass(text)
+        if claims_success and self.last_tests == "failed":
+            self.claim_unverified = True
             if self.test_retries < MAX_TEST_RETRIES:
                 self.test_retries += 1
                 self.notes.append("false success claim blocked")
@@ -115,6 +134,7 @@ class LoopGuard:
                      if self.last_tests is None else
                      "\n\nNote: the tests could not be run (permission not given), so the claim that they pass is unverified.")
         elif claims_success and self.edited_since_tests and self.last_tests == "passed":
+            self.claim_unverified = True
             extra = "\n\nNote: files changed after the last run_tests, so rerun it to confirm."
         if self.git_outputs and not self._mentions_git_facts(text):
             self.notes.append("git answer grounded")

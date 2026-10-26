@@ -43,7 +43,9 @@ def test_run_code_success():
     assert "STDOUT:" in res
     assert "42" in res
 
-def test_git_status_tool():
+def test_git_status_tool(tmp_path):
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
     res = execute_tool("git_status", {})
     assert "git status" in res or "Working tree clean" in res or "Changed Files" in res
 

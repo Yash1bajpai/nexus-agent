@@ -41,13 +41,13 @@ while time.time() - t0 < TMO:
     reply("ant", "Enter Anthropic Claude API key", "")
     reply("oai", "Enter OpenAI GPT API key", "")
     reply("prov", "Enter number (or Enter to keep current)", "")
-    if "model" not in sent and "Enter number (or Enter for the suggested model)" in txt[-1500:]:
+    if "model" not in sent and "Enter number (or Enter to keep the first model)" in txt[-1500:]:
         lines = strip(out).split("Choose a model")[-1]
         n = [m.group(1) for m in re.finditer(r"^\s*(\d+)\. qwen2\.5-coder", lines, re.M)]
         sent.add("model"); os.write(fd, (n[0] if n else "").encode() + b"\n")
     reply("anyway", "Use it anyway?", "y")
     reply("pathfix", "Add it now? (y/N)", "y")  # must never appear: this runs inside a venv
-    reply("dl", "Download model weights now?", "y")
+    reply("dl", "and install its inference engine", "y")
     if not asked_q and "Type /help" in txt:
         time.sleep(3); os.write(fd, b"say hi in five words\n"); asked_q = True
     if asked_q and "Tokens:" in txt and not done:

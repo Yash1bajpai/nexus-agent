@@ -123,7 +123,7 @@ def test_memory_replace_in_memory_and_sqlite(tmp_path):
 
 
 class RecordingProvider(BaseProvider):
-    context_size = 1024
+    context_size = 4096
     model = "stub"
 
     def __init__(self, fail_first=False):
@@ -150,7 +150,7 @@ def test_agent_trims_request_but_keeps_stored_history():
     agent = Agent(provider=prov, memory=mem, verbose=False, tools=[])
     agent.run("final question")
     sent = prov.calls[0]
-    assert ctx.history_tokens(sent) < 1024
+    assert ctx.history_tokens(sent) < 4096
     assert sent[-1]["content"] == "final question"
     assert len(mem.get()) == 40 * 2 + 2  # nothing was deleted from storage
 
@@ -186,3 +186,71 @@ def test_agent_compact_and_usage():
     before, after, info = agent.compact()
     assert info["removed_messages"] > 0 and after < before
     assert agent.context_used() < used
+
+
+def test_internal_nudges_do_not_replace_real_request_or_split_tool_pairs(tmp_path):
+    request = {"role": "user", "content": "Fix the original requested calculation"}
+    pair = [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "edit", "type": "function",
+            "function": {"name": "patch_file", "arguments": json.dumps({"path": "a.py"})},
+        }]},
+        {"role": "tool", "tool_call_id": "edit", "content": "result"},
+    ]
+    nudge = {"role": "user", "content": "[SYSTEM] Try again", "metadata": {"internal": True}}
+    active = [request, *pair, {"role": "assistant", "content": "retry"}, nudge]
+    for memory in (ConversationMemory(max_messages=3),
+                   SQLiteMemory(tmp_path / "private" / "history.db", session_id="nudges", max_messages=3)):
+        memory.replace(turn(0) + active[:1])
+        for message in active[1:]:
+            memory.add_raw(message)
+        assert memory.get() == active
+    fitted, _ = ctx.fit_messages(turn(0, size=4000) + active, ctx.history_tokens(active) + 1)
+    assert fitted == active
+    compacted, _ = ctx.compact_messages(turn(0) + active, keep_turns=1)
+    assert compacted[2:] == active
+    assert "Try again" not in compacted[0]["content"]
+
+
+def test_large_tool_arguments_fit_intact_or_fail_explicitly():
+    arguments = json.dumps({"path": "huge.py", "content": "x" * 20_000})
+    messages = [
+        {"role": "user", "content": "Create huge.py"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "large", "type": "function",
+            "function": {"name": "write_file", "arguments": arguments},
+        }]},
+        {"role": "tool", "tool_call_id": "large", "content": "Successfully wrote huge.py"},
+    ]
+    fitted, _ = ctx.fit_messages(messages, 10_000)
+    assert fitted[1]["tool_calls"][0]["function"]["arguments"] == arguments
+    assert json.loads(fitted[1]["tool_calls"][0]["function"]["arguments"])["content"] == "x" * 20_000
+    assert fitted[2]["tool_call_id"] == "large"
+    with pytest.raises(ctx.ContextBudgetError, match="no over-budget request was sent"):
+        ctx.fit_messages(messages, 1000)
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
+
+
+def test_context_error_does_not_send_overbudget_request():
+    provider = RecordingProvider()
+    provider.context_size = 128
+    agent = Agent(provider, tools=[], verbose=False)
+    with pytest.raises(ctx.ContextBudgetError, match="cannot fit instructions"):
+        agent.run("hello")
+    assert provider.calls == []
+
+
+def test_compact_decodes_full_windows_paths_from_structured_arguments():
+    path = r"C:\Users\Yash\my project\source.py"
+    messages = [
+        {"role": "user", "content": "Edit source.py"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "windows", "type": "function",
+            "function": {"name": "patch_file", "arguments": json.dumps({"path": path})},
+        }]},
+        {"role": "tool", "tool_call_id": "windows", "content": "patched"},
+        {"role": "user", "content": "next request"},
+    ]
+    compacted, _ = ctx.compact_messages(messages, keep_turns=1)
+    assert "Files touched: " + path in compacted[0]["content"]
+    assert "Tools used: patch_file" in compacted[0]["content"]

@@ -55,7 +55,7 @@ def test_gemini_provider_schema():
 def test_provider_tool_result_format():
     anthropic = AnthropicProvider()
     res_a = anthropic.format_tool_result_message("call_1", "ok result")
-    assert res_a["role"] == "user"
+    assert res_a == {"role": "tool", "tool_call_id": "call_1", "content": "ok result"}
 
     openai_p = OpenAIProvider()
     res_o = openai_p.format_tool_result_message("call_2", "ok result")
@@ -64,7 +64,7 @@ def test_provider_tool_result_format():
 
     gemini = GeminiProvider()
     res_g = gemini.format_tool_result_message("call_3", "ok result")
-    assert res_g["role"] == "user"
+    assert res_g == {"role": "tool", "tool_call_id": "call_3", "content": "ok result"}
 
 def test_fallback_provider_general_exception():
     from nexus_agent_ai.providers.fallback_provider import FallbackProvider

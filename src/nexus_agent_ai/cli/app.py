@@ -1,6 +1,7 @@
 import sys
 import time
 import re
+from contextvars import ContextVar
 from pathlib import Path
 import typer
 from typing import Optional, Any, Tuple
@@ -28,7 +29,6 @@ from ..agent.core import Agent
 from . import display
 
 from typer.core import TyperGroup
-import click
 
 class NaturalAgentGroup(TyperGroup):
     def get_command(self, ctx, cmd_name):
@@ -52,6 +52,26 @@ app = typer.Typer(
     invoke_without_command=True,
     cls=NaturalAgentGroup,
 )
+_local_downloads_declined = ContextVar("local_downloads_declined", default=False)
+
+
+def _check_run_outcome(agent: Agent, *, exit_on_failure: bool = True) -> bool:
+    """Report the same completion failures for every command and REPL turn."""
+    error = None
+    if getattr(agent, "claimed_unapplied_edit", False):
+        error = "The model said it changed code but no file was modified."
+    elif getattr(agent, "edit_not_applied", False):
+        error = "An edit was requested but no file was changed."
+    elif getattr(agent, "claim_unverified", False):
+        error = "The model claimed the tests pass, but no passing test run backs that up."
+    elif getattr(agent, "unresolved_errors", None):
+        error = "Did not finish cleanly (unresolved tool errors or iteration limit)."
+    if error is None:
+        return True
+    display.print_error(error)
+    if exit_on_failure:
+        raise typer.Exit(code=1)
+    return False
 
 
 def _resolve_session(persist: bool, session: Optional[str], continue_last: bool):
@@ -81,14 +101,18 @@ def _fit_local_model(prov, context_size, kwargs):
     from .onboarding import _is_android
     ctx = context_size or getattr(prov, "context_size", 4096)
     free = model_select.available_ram_gb()
-    choice = model_select.pick_model(free, ctx, android=_is_android())
+    android = _is_android()
+    choice = model_select.pick_model(free, ctx, android=android)
     if model_select.is_cached(choice["repo"], choice["filename"]):
         if (choice["repo"], choice["filename"]) == (prov.model_id, prov.filename):
             return prov
         return LocalProvider(model_id=choice["repo"], filename=choice["filename"], **kwargs)
-    if model_select.is_cached(prov.model_id, prov.filename):
-        display.print_warn(f"Using the downloaded model {prov.filename}. {choice['reason']}")
-        return prov
+    candidates = model_select.BIG_MODELS[1:] if android else model_select.BIG_MODELS
+    for cached in [*candidates, model_select.SMALL_MODEL]:
+        if (free is not None and model_select.required_ram_gb(cached, ctx) <= free
+                and model_select.is_cached(cached["repo"], cached["filename"])):
+            display.print_info(f"Using downloaded model {cached['filename']}, which fits the available RAM.")
+            return LocalProvider(model_id=cached["repo"], filename=cached["filename"], **kwargs)
     chosen = model_select.confirm_download(choice, ctx, out=display.print_info)
     if chosen is None:
         display.print_error("Download cancelled. Run again when ready, or set NEXUS_AGENT_MODEL_REPO and NEXUS_AGENT_MODEL_FILENAME to choose a model.")
@@ -103,6 +127,8 @@ def _make_local_provider(context_size: Optional[int] = None) -> Tuple[Any, str]:
     missing engine never fails the LFM model mid-query — the failure the
     pre-flight prevents is only discoverable after the agent loop starts.
     """
+    if _local_downloads_declined.get():
+        raise ConfigError("Local downloads were declined during setup. Run again when ready, or choose a cloud provider.")
     from ..providers.local_provider import LocalProvider, ensure_llama_server_binary
     kwargs = {"context_size": context_size} if context_size is not None else {}
     prov = _fit_local_model(LocalProvider(**kwargs), context_size, kwargs)
@@ -122,9 +148,8 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
     """
     if hasattr(provider_name, "default"):
         provider_name = provider_name.default
-    if not isinstance(provider_name, str):
-        provider_name = str(provider_name or DEFAULT_PROVIDER)
-    name_clean = provider_name.lower().strip()
+    provider_name = provider_name or os.getenv("DEFAULT_PROVIDER", DEFAULT_PROVIDER)
+    name_clean = str(provider_name).lower().strip()
     if context_size is not None:
         if name_clean not in {"local", "liquid", "lfm", "default", "demo"}:
             raise ConfigError("--context-size requires --provider local (not cloud, ollama, or auto).")
@@ -145,13 +170,11 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
     elif name_clean in ["local", "liquid", "lfm", "default", "demo"]:
         return _make_local_provider(context_size=context_size)
     elif name_clean in ["ollama"]:
-        import os
         from ..providers.openai_provider import OpenAIProvider
         base_url = os.getenv("OLLAMA_HOST", "http://localhost:11434/v1")
         local_model = os.getenv("LOCAL_MODEL", "llama3.2:3b")
         return OpenAIProvider(model=local_model, base_url=base_url), f"ollama ({local_model})"
     elif name_clean in ["openrouter", "laguna", "free"]:
-        import os
         from ..providers.openai_provider import OpenAIProvider
         or_key = os.getenv("OPENROUTER_API_KEY", "")
         if not or_key:
@@ -164,7 +187,7 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
         ), f"OpenRouter ({model.split('/')[-1]})"
     elif name_clean == "auto":
         from ..providers.fallback_provider import FallbackProvider
-        fb = FallbackProvider(start_provider=DEFAULT_PROVIDER)
+        fb = FallbackProvider(start_provider=os.getenv("DEFAULT_PROVIDER", DEFAULT_PROVIDER))
         fb._warn_fn = display.print_fallback_switch
         return fb, f"auto ({fb._current_name})"
     else:
@@ -175,7 +198,7 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
 @app.command()
 def chat(
     query: Optional[str] = typer.Argument(None, help="The coding question or instruction. Leave it out to open the interactive REPL."),
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (local/gemini/anthropic/openai/auto)."),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="LLM backend; defaults to your saved provider, or local."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
@@ -228,18 +251,7 @@ def chat(
         if no_stream:
             display.print_response(response_text)
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
-        if getattr(agent, "claimed_unapplied_edit", False):
-            display.print_error("The model said it changed code but no file was modified. Exiting with code 1.")
-            raise typer.Exit(code=1)
-        if getattr(agent, "edit_not_applied", False):
-            display.print_error("An edit was requested but no file was changed. Exiting with code 1.")
-            raise typer.Exit(code=1)
-        if getattr(agent, "claim_unverified", False):
-            display.print_error("The model claimed the tests pass, but no passing test run backs that up. Exiting with code 1.")
-            raise typer.Exit(code=1)
-        if getattr(agent, "unresolved_errors", None) or str(response_text).startswith("Max tool iterations reached"):
-            display.print_error("Did not finish cleanly (unresolved tool errors or iteration limit). Exiting with code 1.")
-            raise typer.Exit(code=1)
+        _check_run_outcome(agent)
 
     except ConfigError as e:
         display.print_error(str(e))
@@ -313,7 +325,7 @@ def _build_repl_completer():
 
 @app.command()
 def repl(
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend (local/gemini/anthropic/openai/auto)."),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="LLM backend; defaults to your saved provider, or local."),
     verbose: bool = typer.Option(True, "--verbose/--no-verbose", "-v", help="Show verbose ReAct tool trace (default: ON)."),
     no_stream: bool = typer.Option(True, "--no-stream/--stream", help="Disable output streaming (by default OFF in REPL mode for clean multi-turn prompts)."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
@@ -469,6 +481,7 @@ def repl(
                     continue
 
                 request_tools = None
+                require_edit = False
                 if user_input.startswith("/"):
                     user_input = user_input[1:].strip()
                     lower_input = user_input.lower()
@@ -539,6 +552,7 @@ def repl(
                         display.print_error(f"File not found: {file_to_rev}")
                         continue
                 elif lower_input.startswith("debug "):
+                    require_edit = True
                     parts = re.split(r'--error\s+|-e\s+', user_input[6:].strip(), maxsplit=1)
                     file_to_dbg = parts[0].strip().strip('"').strip("'")
                     err_msg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else "Error reported by user"
@@ -551,7 +565,7 @@ def repl(
                         user_input = (
                             f"Here is the content of '{file_to_dbg}':\n\n```\n{file_contents}\n```\n\n"
                             f"The user reports this error:\n{err_msg}\n\n"
-                            f"Identify the root cause and provide the fixed version of the code."
+                            f"Identify the root cause and, if a fix is needed, apply it to '{file_to_dbg}' using the file tools."
                         )
                     except FileNotFoundError:
                         display.print_error(f"File not found: {file_to_dbg}")
@@ -562,7 +576,7 @@ def repl(
                 if request_tools is not None:
                     agent.tools = request_tools
                 try:
-                    response_text = agent.run(user_input, stream=not no_stream)
+                    response_text = agent.run(user_input, stream=not no_stream, require_edit=require_edit)
                 finally:
                     agent.tools = original_tools
                 duration = time.time() - start_time
@@ -570,6 +584,7 @@ def repl(
                 if no_stream:
                     display.print_response(response_text)
                 display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+                _check_run_outcome(agent, exit_on_failure=False)
                 if getattr(agent, "context_window", None):
                     from ..agent import context as _ctx
                     typer.echo(_ctx.meter(agent.context_used(), agent.context_window))
@@ -593,7 +608,7 @@ def repl(
 @app.command()
 def review(
     file_path: str = typer.Argument(..., help="Path to code file to review."),
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend."),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="LLM backend; defaults to your saved provider, or local."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
@@ -627,6 +642,7 @@ def review(
         if no_stream:
             display.print_response(response_text)
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+        _check_run_outcome(agent)
     except typer.Exit:
         raise
     except Exception as e:
@@ -637,7 +653,7 @@ def review(
 def debug(
     file_path: str = typer.Argument(..., help="Path to problematic code file."),
     error: str = typer.Option(..., "--error", "-e", help="Error message or traceback."),
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend."),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="LLM backend; defaults to your saved provider, or local."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
@@ -664,13 +680,14 @@ def debug(
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
-        query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it carefully, explain the root cause, and if appropriate provide the fixed code."
+        query = f"Debug '{file_path}' given this error traceback:\n{error}\nUse read_file to inspect it carefully, explain the root cause, and, if a fix is needed, apply it to '{file_path}' using the file tools."
         start_time = time.time()
-        response_text = agent.run(query, stream=not no_stream)
+        response_text = agent.run(query, stream=not no_stream, require_edit=True)
         duration = time.time() - start_time
         if no_stream:
             display.print_response(response_text)
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+        _check_run_outcome(agent)
     except typer.Exit:
         raise
     except Exception as e:
@@ -681,7 +698,7 @@ def debug(
 def generate(
     prompt: str = typer.Argument(..., help="Instruction of what code to generate."),
     output: str = typer.Option(..., "--output", "-o", help="Target file path to write generated code."),
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend."),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="LLM backend; defaults to your saved provider, or local."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
@@ -699,6 +716,9 @@ def generate(
         if isinstance(validated, str) and validated.startswith("ERROR:"):
             display.print_error(validated)
             raise typer.Exit(code=1)
+        target = Path(validated)
+        existed = target.is_file()
+        before = target.read_bytes() if existed else None
 
         prov, resolved_name = get_provider_instance(provider)
         memory = ConversationMemory()
@@ -707,16 +727,18 @@ def generate(
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
         query = f"Generate code based on this instruction: '{prompt}'. Write the final production code to '{output}' using write_file."
         start_time = time.time()
-        response_text = agent.run(query, stream=not no_stream)
+        response_text = agent.run(query, stream=not no_stream, require_edit=True)
         duration = time.time() - start_time
         if no_stream:
             display.print_response(response_text)
-        if not Path(output).exists():
-            display.print_error(f"Error: Target file '{output}' was not generated on disk.")
-            raise typer.Exit(code=1)
-        else:
-            typer.echo(f"\n✅ Verified generated file created: {output}\n")
         display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
+        _check_run_outcome(agent)
+        if (not target.is_file() or str(target.resolve()) not in agent.changed_files
+                or (existed and target.read_bytes() == before)):
+            display.print_error(f"Target file '{output}' was not created or changed by this run.")
+            raise typer.Exit(code=1)
+        action = "updated" if existed else "created"
+        typer.echo(f"\nVerified generated file {action}: {output}\n")
     except typer.Exit:
         raise
     except Exception as e:
@@ -725,7 +747,7 @@ def generate(
 
 @app.command()
 def commit(
-    provider: str = typer.Option(DEFAULT_PROVIDER, "--provider", "-p", help="LLM provider backend."),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="LLM backend; defaults to your saved provider, or local."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Auto-confirm without prompting."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
@@ -743,6 +765,9 @@ def commit(
     try:
         from ..agent.tools import execute_git_diff
         diff_text = execute_git_diff()
+        if diff_text.startswith("ERROR:"):
+            display.print_error(diff_text)
+            raise typer.Exit(code=1)
         if not diff_text or "No changes" in diff_text:
             display.print_error("No staged or unstaged changes found to commit.")
             raise typer.Exit(code=1)
@@ -764,6 +789,7 @@ def commit(
         start_time = time.time()
         commit_message = agent.run(query, stream=not no_stream)
         duration = time.time() - start_time
+        _check_run_outcome(agent)
 
         lines = [line.strip().strip('"').strip("'") for line in commit_message.splitlines() if line.strip()]
         clean_lines = [
@@ -961,6 +987,8 @@ def main(
     ctx: typer.Context,
     version: bool = typer.Option(False, "--version", help="Show version information.")
 ):
+    decline_token = _local_downloads_declined.set(False)
+    ctx.call_on_close(lambda: _local_downloads_declined.reset(decline_token))
     if version:
         from ..utils.config import get_package_version
         typer.echo(f"Nexus-Agent CLI v{get_package_version()}")
@@ -977,9 +1005,11 @@ def main(
 
     try:
         from .onboarding import run_if_first_time
-        run_if_first_time()
-    except Exception:
-        pass
+        if run_if_first_time() is False:
+            _local_downloads_declined.set(True)
+    except Exception as error:
+        display.print_error(f"Setup did not finish: {error}")
+        raise typer.Exit(code=1) from error
 
     if ctx.invoked_subcommand is None:
         ctx.invoke(repl)

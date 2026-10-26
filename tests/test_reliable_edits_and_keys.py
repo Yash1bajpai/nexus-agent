@@ -10,6 +10,7 @@ from nexus_agent_ai.agent.core import Agent, parse_at_mentions
 from nexus_agent_ai.cli import app as appmod
 from nexus_agent_ai.cli import onboarding
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, ToolCall
+from nexus_agent_ai.providers.messages import assistant_message
 
 
 @pytest.fixture(autouse=True)
@@ -114,8 +115,8 @@ class Scripted(BaseProvider):
         if step is None:
             return ProviderResponse(text="All done")
         name, args = step
-        return ProviderResponse(tool_calls=[ToolCall(f"c{self.i}", name, args)],
-                                raw_assistant_message={"role": "assistant", "content": "x"})
+        calls = [ToolCall(f"c{self.i}", name, args)]
+        return ProviderResponse(tool_calls=calls, raw_assistant_message=assistant_message("", calls))
 
     def stream(self, **kw):
         yield self.complete(**kw)
@@ -313,8 +314,8 @@ class _Local(Scripted):
         if step is None:
             return ProviderResponse(text="Done, patched.")
         name, args = step
-        return ProviderResponse(tool_calls=[ToolCall(f"c{self.i}", name, args)],
-                                raw_assistant_message={"role": "assistant", "content": "x"})
+        calls = [ToolCall(f"c{self.i}", name, args)]
+        return ProviderResponse(tool_calls=calls, raw_assistant_message=assistant_message("", calls))
 
 
 def test_local_model_that_only_talks_gets_nudged_to_edit(tmp_path, monkeypatch):

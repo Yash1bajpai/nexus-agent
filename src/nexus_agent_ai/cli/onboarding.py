@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from ..utils.private_files import restrict_permissions
 
 # Ensure safe output encoding on Windows terminals to prevent UnicodeEncodeError
 for stream in (sys.stdout, sys.stderr):
@@ -49,27 +50,9 @@ USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 ENV_FILE = USER_CONFIG_DIR / ".env"
 
 
-def _restrict_permissions(path: Path, mode: int) -> None:
-    """Best-effort owner-only access. POSIX: chmod. Windows: icacls, drop inherited ACEs
-    and grant only the current user (chmod bits do nothing there)."""
-    if os.name == "nt":
-        try:
-            import getpass
-            import subprocess
-            user = os.environ.get("USERNAME") or getpass.getuser()
-            perm = "(OI)(CI)F" if Path(path).is_dir() else "F"
-            subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:{perm}"],
-                           capture_output=True, check=False, timeout=20)
-        except Exception:
-            pass
-        return
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
 
 
-_restrict_permissions(USER_CONFIG_DIR, 0o700)
+restrict_permissions(USER_CONFIG_DIR, 0o700)
 
 def _ensure_gitignore_protection():
     """Ensure .env is listed in local workspace .gitignore if present."""
@@ -417,6 +400,7 @@ def _write_env_key(key: str, value: str):
         lines.append(f"{key}={value}\n")
 
     env_path.parent.mkdir(parents=True, exist_ok=True)
+    restrict_permissions(env_path.parent, 0o700)
     tmp = env_path.with_name(env_path.name + ".tmp")
     # Create with 0600 from the start so the key is never world-readable, even briefly.
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -430,7 +414,7 @@ def _write_env_key(key: str, value: str):
             pass
         raise
     os.replace(tmp, env_path)
-    _restrict_permissions(env_path, 0o600)
+    restrict_permissions(env_path, 0o600)
 
 def _secret_input(prompt: str) -> str:
     """Read a secret without echoing it to the terminal."""
@@ -507,7 +491,7 @@ def _step_default_provider() -> str:
     for i, opt in enumerate(options, 1):
         note = "" if opt == "local" else (" (auto-fallback chain)" if opt == "auto" else "")
         if opt == "local":
-            note = " (requires GPU + Ollama, or Liquid LFM 2.6B GGUF on CPU)"
+            note = " (local GGUF inference; no cloud API key needed)"
         _print(f"    {i}. {opt}{note}")
 
     current = os.getenv("DEFAULT_PROVIDER", "local")
@@ -530,7 +514,7 @@ def _step_default_provider() -> str:
 def _model_options(suggested: dict) -> list:
     """Models the wizard can offer: the suggestion first, then the app's own other options."""
     from ..utils import model_select
-    opts = [dict(suggested, label="Suggested for this machine")]
+    opts = [dict(suggested, label=suggested.get("label", "Suggested for this machine"))]
     extra = [
         ("LiquidAI/LFM2.5-2.6B-GGUF", "LFM2.5-2.6B-Q6_K.gguf", 2.2, "LFM 2.6B, better quality, needs more free RAM"),
         (*_ALTERNATIVE_MODELS["gpu_or_16gb"], 2.1, "Qwen2.5-Coder 3B, tuned for code"),
@@ -544,89 +528,105 @@ def _model_options(suggested: dict) -> list:
 
 
 def _step_model_choice(cfg: dict) -> dict:
-    """Let the user pick a different model than the suggested one. Enter keeps the suggestion.
-
-    The suggestion is not saved (the final pick still uses free RAM at first launch). A model the user
-    picks here is saved as their explicit choice and then used as is, so warn when it may not fit.
-    """
-    if os.getenv("NEXUS_AGENT_MODEL_REPO") or os.getenv("NEXUS_AGENT_MODEL_FILENAME"):
-        return cfg
+    """Choose a model without persisting an implicit download authorization."""
     from ..utils import model_select
     opts = _model_options(cfg)
+    repo = os.getenv("NEXUS_AGENT_MODEL_REPO")
+    filename = os.getenv("NEXUS_AGENT_MODEL_FILENAME")
+    configured = bool(repo or filename)
+    if configured:
+        repo, filename = repo or cfg["repo"], filename or cfg["filename"]
+        known = [*opts, *model_select.BIG_MODELS, model_select.SMALL_MODEL]
+        current = next((dict(o) for o in known if (o["repo"], o["filename"]) == (repo, filename)),
+                       {"repo": repo, "filename": filename, "size": "unknown"})
+        if "size" not in current:
+            current["size"] = f"~{current['size_gb']} GB"
+        current["label"] = "Current configured model"
+        opts = [current] + [o for o in opts if (o["repo"], o["filename"]) != (repo, filename)]
+    current = opts[0]
     avail = detect_system_specs().get("available_ram_gb")
-    _print("  Choose a model (small local models are weak at editing code; bigger ones need more RAM and are slower):")
-    for i, o in enumerate(opts, 1):
-        need = model_select.required_ram_gb({"size_gb": float(o.get("size_gb") or str(o["size"]).replace("~", "").replace(" GB", ""))})
-        _print(f"    {i}. {o['filename']} ({_size_txt(o['size'])}, about {need} GB free RAM) - {o['label']}")
+    _print("  Choose a model (small models are weak at edits; larger models need more RAM):")
+    for i, option in enumerate(opts, 1):
+        size = _model_size_gb(option)
+        need = f", about {model_select.required_ram_gb({'size_gb': size})} GB free RAM" if size is not None else ""
+        _print(f"    {i}. {option['filename']} ({_size_txt(option['size'])}{need}) - {option['label']}")
     if avail is not None:
         _print(f"  Free RAM now: {avail:.1f} GB")
     try:
-        choice = _input("  Enter number (or Enter for the suggested model): ").strip()
+        choice = _input("  Enter number (or Enter to keep the first model): ").strip()
     except (EOFError, KeyboardInterrupt):
-        return cfg
-    if not (choice.isdigit() and 2 <= int(choice) <= len(opts)):
-        return cfg
+        return current
+    if not choice.isdigit() or not 1 <= int(choice) <= len(opts):
+        return current
     picked = opts[int(choice) - 1]
-    need = model_select.required_ram_gb({"size_gb": float(str(picked["size"]).replace("~", "").replace(" GB", ""))})
-    if avail is not None and avail < need:
+    if picked is current:
+        return current
+    size = _model_size_gb(picked)
+    need = model_select.required_ram_gb({"size_gb": size}) if size is not None else None
+    if avail is not None and need is not None and avail < need:
         try:
             ok = _input(f"  Only {avail:.1f} GB free; this model needs about {need} GB and may fail or swap. Use it anyway? (y/N): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            return cfg
+            return current
         if ok != "y":
-            return cfg
-    _write_env_key("NEXUS_AGENT_MODEL_REPO", picked["repo"])
-    _write_env_key("NEXUS_AGENT_MODEL_FILENAME", picked["filename"])
-    os.environ["NEXUS_AGENT_MODEL_REPO"] = picked["repo"]
-    os.environ["NEXUS_AGENT_MODEL_FILENAME"] = picked["filename"]
-    _print(f"  Model set to {picked['filename']}. Change it later with `nexus-agent-ai setup`.")
+            return current
+    _print(f"  Selected {picked['filename']}; it will be saved if you approve the download.")
     return picked
+
+
+def _model_size_gb(model: dict):
+    if model.get("size_gb") is not None:
+        return float(model["size_gb"])
+    try:
+        return float(str(model["size"]).replace("~", "").replace(" GB", ""))
+    except (KeyError, ValueError):
+        return None
 
 
 def _size_txt(size) -> str:
     """Size label with exactly one leading ~ (recommended sizes already carry one)."""
+    if size == "unknown":
+        return "unknown size"
     return "~" + str(size).lstrip("~").strip()
 
 
 def _step_local_model_setup():
-    """[4/4] - Pre-install the llama-server engine, then offer the model weights download."""
+    """Ask before downloading either weights or the local inference engine."""
     _print("\n[bold][[4/4]][/bold] [cyan]Local Model Setup[/cyan]" if console else "\n[4/4] Local Model Setup")
-    cfg = recommended_model_config(detect_system_specs())
-    _print(f"  Suggested model: {cfg['filename']} ({_size_txt(cfg['size'])})")
-
-    # The inference engine is mandatory for local mode: without llama-server
-    # the LFM model cannot run at all. Install it unconditionally (not
-    # consent-gated) so the very first `-p local` query never fails mid-flight.
-    _print("  Checking local inference engine (llama-server)...")
+    suggested = recommended_model_config(detect_system_specs())
+    previous = (os.getenv("NEXUS_AGENT_MODEL_REPO") or suggested["repo"],
+                os.getenv("NEXUS_AGENT_MODEL_FILENAME") or suggested["filename"])
+    cfg = _step_model_choice(suggested)
     try:
-        from ..providers.local_provider import ensure_llama_server_binary
-        engine_path = ensure_llama_server_binary(verbose=False)
-        if engine_path:
-            _print(f"  [green]✓ Inference engine ready: {engine_path}[/green]" if console else
-                   f"  ✓ Inference engine ready: {engine_path}")
-        else:
-            _print("  [yellow]Engine not installed yet — it will download automatically before your first local query (Ollama works as a fallback).[/yellow]" if console else
-                   "  Engine not installed yet — it will download automatically before your first local query (Ollama works as a fallback).")
-    except Exception:
-        pass
-
-    cfg = _step_model_choice(cfg)
-    try:
-        consent = _input(f"  Download model weights now? Requires {_size_txt(cfg['size'])} disk space. (y/N): ").strip().lower()
-        if consent != "y":
-            _print("  [dim]Skipped. You will be asked again, with size and speed, before anything downloads.[/dim]" if console else
-                   "  Skipped. You will be asked again, with size and speed, before anything downloads.")
-            return
+        consent = _input(
+            f"  Download {cfg['filename']} ({_size_txt(cfg['size'])}) and install its inference engine "
+            "(~50 MB if missing)? (y/N): "
+        ).strip().lower()
+        if consent not in ("y", "yes"):
+            _print("  Skipped. Local startup is postponed; run again when you are ready to download.")
+            return False
     except (EOFError, KeyboardInterrupt):
-        return
+        return False
 
+    if (cfg["repo"], cfg["filename"]) != previous:
+        for key, value in (("NEXUS_AGENT_MODEL_REPO", cfg["repo"]),
+                           ("NEXUS_AGENT_MODEL_FILENAME", cfg["filename"])):
+            _write_env_key(key, value)
+            os.environ[key] = value
+
+    _print("  Checking local inference engine (llama-server)...")
+    from ..providers.local_provider import LocalProvider, ensure_llama_server_binary
+    engine_path = ensure_llama_server_binary(verbose=False)
+    if engine_path:
+        _print(f"  Inference engine ready: {engine_path}")
+    else:
+        _print("  Engine unavailable; local startup will retry it or use an installed alternative engine.")
     _print("  Checking & downloading local model weights...")
     try:
-        from ..providers.local_provider import LocalProvider
-        prov = LocalProvider(model_id=cfg["repo"], filename=cfg["filename"])
-        prov.setup_model()
+        LocalProvider(model_id=cfg["repo"], filename=cfg["filename"]).setup_model()
     except Exception as e:
-        _print(f"  [yellow]Note: Model can be downloaded later when running offline mode ({e})[/yellow]" if console else f"  Note: Model can be downloaded later when running offline mode ({e})")
+        _print(f"  Model download did not finish ({e}). Run `nexus-agent-ai pull-model` later to resume.")
+    return True
 
 
 # --- Main Entry ---
@@ -647,11 +647,12 @@ def run_if_first_time():
 
     # Full first-run setup: optional cloud keys (Enter skips each), system detection, default provider
     # (local stays the default), local model choice and download consent.
-    run_full_setup()
+    local_downloads_approved = run_full_setup()
     _mark_initialized()
     _print()
     _print("[bold green][OK] Setup complete! Starting Nexus-Agent...[/bold green]\n" if console else
            "\n[OK] Setup complete! Starting Nexus-Agent...\n")
+    return local_downloads_approved
 
 
 def _mark_initialized():
@@ -683,5 +684,6 @@ def run_full_setup(show_welcome: bool = True):
     _step_api_keys()
     _step_system_specs()
     _step_default_provider()
-    _step_local_model_setup()
+    local_downloads_approved = _step_local_model_setup()
     _step_command_path()
+    return local_downloads_approved

@@ -2,6 +2,7 @@ import time
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
 from ..utils.config import ConfigError
+from .messages import normalize_messages, tool_result
 
 # Lazy imports — only load a provider SDK if we actually try to use it
 def _make_gemini():
@@ -56,6 +57,7 @@ class FallbackProvider(BaseProvider):
         self._warn_fn = None  # injected by app.py for rich output
         self._fallback_time: Optional[float] = None
         self._recovery_cooldown: float = 60.0
+        self.before_request = None
 
         # Re-order chain so the preferred provider is first
         names = [n for n, _ in FALLBACK_CHAIN]
@@ -84,6 +86,42 @@ class FallbackProvider(BaseProvider):
             + "; ".join(failures)
         )
 
+    def _activate(self, name, provider):
+        old_provider = self._current_provider
+        self._current_name = name
+        self._current_provider = provider
+        if old_provider is not None and old_provider is not provider:
+            stop = getattr(old_provider, "stop", None)
+            if callable(stop):
+                stop()
+
+    @property
+    def active_provider(self):
+        return self._current_provider
+
+    @property
+    def is_local(self):
+        return bool(getattr(self._current_provider, "is_local", False))
+
+    @property
+    def context_size(self):
+        return getattr(self._current_provider, "context_size", None)
+
+    @property
+    def model_id(self):
+        return getattr(self._current_provider, "model_id", self.model)
+
+    @property
+    def filename(self):
+        return getattr(self._current_provider, "filename", None)
+
+    def _prepare_request(self, messages, tools, system):
+        if self.before_request is not None:
+            prepared = self.before_request(self._current_provider, messages, tools, system)
+            if prepared is not None:
+                return prepared
+        return messages, system
+
     def _maybe_recover_primary(self):
         """Attempt to restore the primary preferred provider once cooldown has elapsed."""
         if self._current_name == self._start or self._fallback_time is None:
@@ -94,12 +132,11 @@ class FallbackProvider(BaseProvider):
                     try:
                         primary_prov = factory()
                         old_name = self._current_name
-                        self._current_name = name
-                        self._current_provider = primary_prov
+                        self._activate(name, primary_prov)
                         self._fallback_time = None
                         if self._warn_fn:
                             try:
-                                self._warn_fn(old_name, name, "Rate-limit window elapsed. Recovering to primary provider.")
+                                self._warn_fn(old_name, name, "Recovery cooldown elapsed. Recovering to primary provider.")
                             except TypeError:
                                 self._warn_fn(old_name, name)
                         return
@@ -119,8 +156,7 @@ class FallbackProvider(BaseProvider):
         for name, factory in self._chain[current_idx + 1:]:
             try:
                 provider = factory()
-                self._current_name = name
-                self._current_provider = provider
+                self._activate(name, provider)
                 if self._warn_fn:
                     try:
                         self._warn_fn(failed_name, name, reason)
@@ -141,9 +177,11 @@ class FallbackProvider(BaseProvider):
 
     def complete(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
         self._maybe_recover_primary()
+        messages = normalize_messages(messages)
         while True:
+            request_messages, request_system = self._prepare_request(messages, tools, system)
             try:
-                return self._current_provider.complete(messages, tools, system)  # type: ignore
+                return self._current_provider.complete(request_messages, tools, request_system)  # type: ignore
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
@@ -156,10 +194,12 @@ class FallbackProvider(BaseProvider):
         from the failed provider will already be on screen — acceptable tradeoff
         for live streaming UX)."""
         self._maybe_recover_primary()
+        messages = normalize_messages(messages)
         while True:
+            request_messages, request_system = self._prepare_request(messages, tools, system)
             try:
                 if hasattr(self._current_provider, "stream") and self._current_provider is not None:
-                    for chunk in self._current_provider.stream(messages, tools, system):
+                    for chunk in self._current_provider.stream(request_messages, tools, request_system):
                         yield chunk
                     return  # stream completed successfully
                 else:
@@ -180,4 +220,9 @@ class FallbackProvider(BaseProvider):
         yield res
 
     def format_tool_result_message(self, tool_call_id: str, result: str) -> Dict[str, Any]:
-        return self._current_provider.format_tool_result_message(tool_call_id, result)  # type: ignore
+        return tool_result(tool_call_id, result)
+
+    def stop(self):
+        stop = getattr(self._current_provider, "stop", None)
+        if callable(stop):
+            stop()

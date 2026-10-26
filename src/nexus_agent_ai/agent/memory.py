@@ -1,8 +1,11 @@
 from typing import Any, Dict, List
 from ..utils.config import MAX_CONVERSATION_MESSAGES
+from ..providers.messages import normalize_messages
 
 def is_genuine_user_message(msg: Dict[str, Any]) -> bool:
     if msg.get("role") != "user":
+        return False
+    if msg.get("metadata", {}).get("internal"):
         return False
     # OpenAI tool results use role='tool', not 'user' — already excluded above.
     # Check for tool_call_id / tool_use_id / name at top level (OpenAI-style)
@@ -37,7 +40,7 @@ class ConversationMemory:
 
     def add_raw(self, message: Dict[str, Any]):
         """Add a raw structured message (e.g. tool call or tool result)."""
-        self.messages.append(message)
+        self.messages = normalize_messages([*self.messages, message])
         self._prune()
 
     def _prune(self):
@@ -84,7 +87,7 @@ class ConversationMemory:
 
     def replace(self, messages: List[Dict[str, Any]]):
         """Replace the whole history (used by /compact)."""
-        self.messages = list(messages)
+        self.messages = normalize_messages(messages)
 
     def clear(self):
         """Clear all messages from memory."""
