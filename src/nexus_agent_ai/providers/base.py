@@ -31,6 +31,7 @@ class ProviderResponse:
     raw_assistant_message: Optional[Dict[str, Any]] = None
     input_tokens: int = 0
     output_tokens: int = 0
+    finish_reason: Optional[str] = None
 
     @property
     def has_tool_calls(self) -> bool:

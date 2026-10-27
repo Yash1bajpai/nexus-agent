@@ -10,6 +10,16 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `
 
 **2.10.3 fixes:** atomic file edits and backups preserve access permissions and reject linked backup destinations; workspace tools protect agent state; Git inspection filters protected paths and disables execution helpers. Provider histories are JSON-safe across persistence and fallback, local llama-server streams real tokens on a private per-instance port, and command outcomes distinguish actual edits from unsupported success claims. Download refusal no longer persists a replacement model or allows same-run local startup downloads; automatic cached-model selection respects free RAM.
 
+**Unreleased fixes (not in the published 2.10.3 package):**
+
+- Local routing recognizes explicit tool names and arithmetic requests. Bare retries such as “try again” inherit the last real request's routing and edit intent, not internal steering messages or an older topic.
+- An English action announcement such as “I'll verify” or “run_code initiated” without any tool execution is reported as incomplete/unverified; one-shot commands exit unsuccessfully and streaming output includes the correction. Quoted examples and “run through an example” are not execution promises. This is a conservative language heuristic, not proof that every unsupported claim can be detected.
+- Search keeps successful numbered results and URLs. Failures are errors with categories `empty`, `irrelevant`, `backend_error` (imports unavailable or only one backend executed and failed), or `both_failed` (both executed and failed). Diagnostics distinguish import/execution exceptions; empty results do not establish rate limiting or network blocking. Modern-backend exceptions can fall back to the legacy backend; empty/irrelevant responses do not trigger fallback.
+- Native calls with malformed JSON, non-object arguments, or missing names are rejected before dispatch, rather than converted into guessed arguments. Omitted arguments remain supported for parameterless calls.
+- llama-server, llama-cpp and OpenAI stop reasons are retained. A reported `length` stop marks the response incomplete and executes none of its attached calls, including partially generated calls. Transformers stopping status remains unobserved.
+
+Context still defaults to **4096**. The llama-server, llama-cpp and Transformers output cap is still **2048** per generation; neither value is increased here. Follow-up proposal, not implemented: align request fitting's answer reservation with the generation allowance before making output limits configurable. Increasing either limit alone is not evidence of better model reliability and can increase memory use or reduce available history.
+
 What changed since 2.8.1:
 
 - 2.10.0: loop guardrails for small local models (see Loop guardrails below).

@@ -1,8 +1,7 @@
 from typing import Any, Dict, List, Optional
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
+from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
 from ..utils.config import get_env_or_raise
-from .messages import anthropic_messages, assistant_message, tool_result
-import uuid
+from .messages import anthropic_messages, assistant_message, decode_native_tool_call, tool_result
 
 class AnthropicProvider(BaseProvider):
     """LLM Provider implementation for Anthropic Claude models."""
@@ -56,11 +55,7 @@ class AnthropicProvider(BaseProvider):
                 text += content_block.text
             elif content_block.type == "tool_use":
                 tool_calls.append(
-                    ToolCall(
-                        id=content_block.id or f"call_{uuid.uuid4().hex}",
-                        name=content_block.name,
-                        args=content_block.input,
-                    )
+                    decode_native_tool_call(content_block.name, content_block.input, content_block.id)
                 )
 
         raw_msg = assistant_message(text, tool_calls)
@@ -97,11 +92,7 @@ class AnthropicProvider(BaseProvider):
             for content_block in final_msg.content:
                 if content_block.type == "tool_use":
                     tool_calls.append(
-                        ToolCall(
-                            id=content_block.id or f"call_{uuid.uuid4().hex}",
-                            name=content_block.name,
-                            args=content_block.input,
-                        )
+                        decode_native_tool_call(content_block.name, content_block.input, content_block.id)
                     )
 
             raw_msg = assistant_message(text, tool_calls)

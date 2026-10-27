@@ -26,6 +26,22 @@ def _text(value):
     return value if isinstance(value, str) else json.dumps(_plain(value), ensure_ascii=False)
 
 
+def decode_native_tool_call(name, arguments="", call_id=None):
+    """Validate a native call without guessing arguments or exposing its payload."""
+    from .base import ToolCall
+
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Native tool call is missing a non-empty function name")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            raise ValueError("Native tool call arguments contain malformed JSON; expected a JSON object") from None
+    if not isinstance(arguments, Mapping):
+        raise ValueError("Native tool call arguments must be a JSON object")
+    return ToolCall(id=call_id or f"call_{uuid.uuid4().hex}", name=name, args=_plain(arguments))
+
+
 def _call(name, args, call_id=None):
     if isinstance(args, str):
         args = json.loads(args) if args.strip() else {}

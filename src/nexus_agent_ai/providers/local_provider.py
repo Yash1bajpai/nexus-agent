@@ -8,8 +8,8 @@ import uuid
 import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall
-from .messages import assistant_message, extract_json_tool_calls, openai_messages, tool_result
+from .base import BaseProvider, ProviderResponse, Tool
+from .messages import assistant_message, decode_native_tool_call, extract_json_tool_calls, openai_messages, tool_result
 
 # llama-server binary URLs per platform (llama.cpp b7075 release)
 _LLAMA_RELEASE = "b7075"
@@ -498,6 +498,8 @@ class LocalProvider(BaseProvider):
         raw_tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
         raw_tool_call_order: List[str] = []
         usage: Dict[str, Any] = {}
+        finish_reason = None
+        native_error = None
 
         import urllib.error
         try:
@@ -528,6 +530,9 @@ class LocalProvider(BaseProvider):
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {}) or {}
+                reason = choices[0].get("finish_reason")
+                if isinstance(reason, str):
+                    finish_reason = reason
 
                 content_delta = delta.get("content")
                 if content_delta:
@@ -550,10 +555,18 @@ class LocalProvider(BaseProvider):
                     if rtc.get("id"):
                         entry["id"] = rtc["id"]
                     func = rtc.get("function", {}) or {}
-                    if func.get("name"):
-                        entry["name"] += func["name"]
-                    if func.get("arguments"):
-                        entry["arguments"] += func["arguments"]
+                    name = func.get("name")
+                    arguments = func.get("arguments")
+                    if name is not None:
+                        if not isinstance(name, str):
+                            native_error = "Native tool call function name must be a string"
+                        else:
+                            entry["name"] += name
+                    if arguments is not None:
+                        if not isinstance(arguments, str):
+                            native_error = "Native tool call argument fragments must be JSON text"
+                        else:
+                            entry["arguments"] += arguments
 
         text = "".join(text_parts)
         # Reasoning models (LFM2.5 etc.) may emit only thinking tokens when the
@@ -564,20 +577,15 @@ class LocalProvider(BaseProvider):
             text = lines[-1] if lines else ""
 
         tool_calls = []
-        for key in raw_tool_call_order:
-            entry = raw_tool_calls_by_id[key]
-            func_name = entry["name"]
-            if not func_name:
-                continue  # skip empty fragments
-            try:
-                func_args = json.loads(entry["arguments"]) if entry["arguments"] else {}
-            except json.JSONDecodeError:
-                func_args = {}
-            tc_id = entry["id"] or f"call_{uuid.uuid4().hex[:8]}"
-            tool_calls.append(ToolCall(id=tc_id, name=func_name, args=func_args))
+        if finish_reason != "length":
+            if native_error:
+                raise ValueError(native_error)
+            for key in raw_tool_call_order:
+                entry = raw_tool_calls_by_id[key]
+                tool_calls.append(decode_native_tool_call(entry["name"], entry["arguments"], entry["id"]))
 
-        if not tool_calls:
-            text, tool_calls = extract_json_tool_calls(text)
+            if not tool_calls:
+                text, tool_calls = extract_json_tool_calls(text)
         raw_msg = assistant_message(text, tool_calls)
 
         yield ProviderResponse(
@@ -586,6 +594,7 @@ class LocalProvider(BaseProvider):
             raw_assistant_message=raw_msg,
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
+            finish_reason=finish_reason,
         )
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -649,6 +658,7 @@ class LocalProvider(BaseProvider):
         response_text = self._tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
         clean_text, tool_calls = extract_json_tool_calls(response_text)
         raw_msg = assistant_message(clean_text, tool_calls)
+        # generate() returns token IDs, not a reliable stopping reason; leave it unobserved.
 
         return ProviderResponse(text=clean_text, tool_calls=tool_calls, raw_assistant_message=raw_msg, input_tokens=input_tokens, output_tokens=len(generated_ids[0]))
 
@@ -676,20 +686,18 @@ class LocalProvider(BaseProvider):
         msg = choice.get("message", {})
         text = msg.get("content", "") or ""
         raw_tool_calls = msg.get("tool_calls", []) or []
+        finish_reason = choice.get("finish_reason") if isinstance(choice.get("finish_reason"), str) else None
 
         tool_calls = []
-        for rtc in raw_tool_calls:
-            func = rtc.get("function", {})
-            func_name = func.get("name", "")
-            try:
-                func_args = json.loads(func.get("arguments", "{}")) if isinstance(func.get("arguments"), str) else func.get("arguments", {})
-            except json.JSONDecodeError:
-                func_args = {}
-            tc_id = rtc.get("id") or f"call_{uuid.uuid4().hex}"
-            tool_calls.append(ToolCall(id=tc_id, name=func_name, args=func_args))
+        if finish_reason != "length":
+            for rtc in raw_tool_calls:
+                func = rtc.get("function", {})
+                tool_calls.append(decode_native_tool_call(
+                    func.get("name"), func.get("arguments", ""), rtc.get("id"),
+                ))
 
-        if not tool_calls:
-            text, tool_calls = extract_json_tool_calls(text)
+            if not tool_calls:
+                text, tool_calls = extract_json_tool_calls(text)
         raw_msg = assistant_message(text, tool_calls)
 
         usage = response.get("usage", {})
@@ -699,6 +707,7 @@ class LocalProvider(BaseProvider):
             raw_assistant_message=raw_msg,
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
+            finish_reason=finish_reason,
         )
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:

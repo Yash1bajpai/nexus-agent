@@ -64,6 +64,10 @@ def _check_run_outcome(agent: Agent, *, exit_on_failure: bool = True) -> bool:
         error = "An edit was requested but no file was changed."
     elif getattr(agent, "claim_unverified", False):
         error = "The model claimed the tests pass, but no passing test run backs that up."
+    elif getattr(agent, "unfulfilled_action", False):
+        error = "The model announced an action, but no tool was executed."
+    elif getattr(agent, "response_incomplete", False):
+        error = "The model reached its output limit; the response is incomplete."
     elif getattr(agent, "unresolved_errors", None):
         error = "Did not finish cleanly (unresolved tool errors or iteration limit)."
     if error is None:

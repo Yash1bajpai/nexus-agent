@@ -1,10 +1,9 @@
-import uuid
 from typing import Any, Dict, List
 # pyrefly: ignore [missing-import]
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
+from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
 # pyrefly: ignore [missing-import]
 from ..utils.config import get_env_or_raise
-from .messages import assistant_message, gemini_messages, tool_result
+from .messages import assistant_message, decode_native_tool_call, gemini_messages, tool_result
 
 class GeminiProvider(BaseProvider):
     """LLM Provider implementation for Google Gemini models via google-genai SDK."""
@@ -77,11 +76,12 @@ class GeminiProvider(BaseProvider):
                     text += part.text
                 if hasattr(part, "function_call") and part.function_call:
                     fc = part.function_call
+                    # The SDK represents an omitted parameterless args field as None.
+                    arguments = getattr(fc, "args", None)
                     tool_calls.append(
-                        ToolCall(
-                            id=fc.id if isinstance(getattr(fc, "id", None), str) and fc.id else f"call_{uuid.uuid4().hex}",
-                            name=fc.name,
-                            args=dict(fc.args) if fc.args else {},
+                        decode_native_tool_call(
+                            fc.name, {} if arguments is None else arguments,
+                            fc.id if isinstance(getattr(fc, "id", None), str) else None,
                         )
                     )
 
@@ -136,11 +136,11 @@ class GeminiProvider(BaseProvider):
                             for part in candidate.content.parts:
                                 if hasattr(part, "function_call") and part.function_call:
                                     fc = part.function_call
+                                    arguments = getattr(fc, "args", None)
                                     tool_calls.append(
-                                        ToolCall(
-                                            id=fc.id if isinstance(getattr(fc, "id", None), str) and fc.id else f"call_{uuid.uuid4().hex}",
-                                            name=fc.name,
-                                            args=dict(fc.args) if fc.args else {},
+                                        decode_native_tool_call(
+                                            fc.name, {} if arguments is None else arguments,
+                                            fc.id if isinstance(getattr(fc, "id", None), str) else None,
                                         )
                                     )
 

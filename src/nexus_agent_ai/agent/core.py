@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List
 from ..providers.base import BaseProvider, RateLimitError, ProviderResponse
 from . import context
-from .memory import ConversationMemory
+from .memory import ConversationMemory, is_genuine_user_message
 from .tools import get_all_tools, execute_tool, execute_list_directory
-from .guardrails import LoopGuard, guardrails_enabled
+from .guardrails import LoopGuard, guardrails_enabled, promises_tool_use
 from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
@@ -35,7 +35,7 @@ RULES_PROMPT = """RULES:
 11. Be direct. Skip unnecessary preamble.
 12. STOP using tools once you have enough information to answer. Give your final
     answer as plain text. Do NOT keep calling the same tool repeatedly.
-13. For simple math or factual questions, answer directly WITHOUT using tools.
+13. Use run_code for arithmetic. Answer conceptual questions directly when no tools are needed.
 14. If a duplicate tool call warning appears, immediately synthesize your final
     answer from the results you already have. Do NOT call any more tools.
 
@@ -51,6 +51,10 @@ This applies to every single tool call in every iteration."""
 
 # Keywords/patterns that indicate a query NEEDS tool access
 _TOOL_PATTERNS = [
+    # Explicit capability requests must not depend on underscores being word boundaries.
+    r'\b(?:read_file|write_file|patch_file|list_directory|run_code|run_tests|search_web|git_status|git_diff|git_commit)\b',
+    r'\b(?:calculate|compute|calculation|arithmetic)\b',
+    r'\b\d[\d,]*(?:\.\d+)?\s*(?:[+*/%−-]|plus\b|minus\b|times\b|divided by\b|multiplied by\b)\s*[-+]?\d',
     # File operations
     r'\b(read|open|show|view|display|print)\b.*\b(file|\.py|\.js|\.ts|\.java|\.cpp|\.c\b|\.h\b|\.go|\.rs|\.rb|\.html|\.css|\.json|\.yaml|\.yml|\.toml|\.md|\.txt|\.csv|\.xml|\.sql)',
     r'\b(write|create|generate|make|build)\b.*\b(file|class|function|script|module|program)',
@@ -140,6 +144,24 @@ def _query_needs_tools(user_input: str) -> bool:
         if re.search(pattern, q, re.IGNORECASE):
             return True
     return False
+
+
+_RETRY_REQUEST = re.compile(
+    r"(?:please\s+)?(?:try again|retry|try once more|do it again)(?:\s+please)?[.!?]*",
+    re.IGNORECASE,
+)
+
+
+def _routing_request(user_input: str, history: list) -> str:
+    """Resolve bare retries against the last real request, never internal nudges."""
+    if not _RETRY_REQUEST.fullmatch(user_input.strip()):
+        return user_input
+    for message in reversed(history):
+        if is_genuine_user_message(message):
+            previous = message.get("content", "")
+            if isinstance(previous, str) and not _RETRY_REQUEST.fullmatch(previous.strip()):
+                return previous
+    return user_input
 
 
 def parse_at_mentions(user_input: str) -> str:
@@ -237,6 +259,8 @@ class Agent:
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
         self.edit_not_applied = False  # an edit was requested, nothing was written, and the model did not say nothing needs changing
         self.claim_unverified = False  # model said tests pass but they were not run / last run failed
+        self.unfulfilled_action = False
+        self.response_incomplete = False
         self.changed_files: set[str] = set()
 
         # Smart Startup: Global vs. Project Context check
@@ -318,8 +342,9 @@ class Agent:
 
     def run(self, user_input: str, stream: bool = False, require_edit: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
+        routing_input = _routing_request(user_input, self.memory.get())
         wants_edit = require_edit or (
-            any(tool.name in _WRITE_TOOLS for tool in self.tools) and _wants_edit(user_input)
+            any(tool.name in _WRITE_TOOLS for tool in self.tools) and _wants_edit(routing_input)
         )
         processed_input = parse_at_mentions(attach_named_files(user_input))
         self.memory.add("user", processed_input)
@@ -331,7 +356,7 @@ class Agent:
         # model from looping on tools for simple questions.
         use_tools = self.tools
         local_mode = _is_local_provider(self.provider)
-        if local_mode and not wants_edit and not _query_needs_tools(processed_input):
+        if local_mode and not wants_edit and not _query_needs_tools(routing_input) and not _query_needs_tools(processed_input):
             use_tools = []  # no tools → model answers directly
             effective_max_iter = 1
         else:
@@ -349,12 +374,15 @@ class Agent:
         unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
         window_scale = 1.0
         wrote_ok = False
+        tool_executed = False
         offered_tools = list(use_tools)  # use_tools is emptied by the anti-loop stop; keep what was offered
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
         self.claimed_unapplied_edit = False
         self.edit_not_applied = False
         self.claim_unverified = False
+        self.unfulfilled_action = False
+        self.response_incomplete = False
         self.changed_files = set()
         previous_before_request = getattr(self.provider, "before_request", None)
         managed_fallback = hasattr(self.provider, "before_request")
@@ -417,6 +445,11 @@ class Agent:
                 self._sync_context_window()
                 local_mode = _is_local_provider(self.provider)
 
+                if response.finish_reason == "length":
+                    # Even complete-looking arguments may belong to an unfinished plan.
+                    self.response_incomplete = True
+                    response.tool_calls = []
+
                 if response.has_tool_calls:
                     self.memory.add_raw(assistant_message(response.text, response.tool_calls))
 
@@ -477,6 +510,7 @@ class Agent:
                             executed_tools.add(tool_sig)
                             edit_path = _edit_path(tool_call.args) if tool_call.name in _WRITE_TOOLS else None
                             before_edit = _file_state(edit_path) if edit_path is not None else None
+                            tool_executed = True
                             result = execute_tool(tool_call.name, tool_call.args)
                             changed = (edit_path is not None and before_edit is not None
                                        and (after_edit := _file_state(edit_path)) is not None
@@ -544,7 +578,14 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     final_text = response.text
-                    if guard:
+                    if self.response_incomplete:
+                        final_text += ("\n\nNot completed: the model reached its output limit. "
+                                       "This response is incomplete; no tool calls from the cut-off response were executed.")
+                    self.unfulfilled_action = not tool_executed and promises_tool_use(response.text)
+                    if self.unfulfilled_action:
+                        final_text += ("\n\nNot completed: the model announced an action, but no tool was executed "
+                                       "in this turn. Any calculation or verification above is unverified.")
+                    if guard and not self.response_incomplete:
                         verdict, reviewed = guard.review_final(final_text)
                         if verdict == "retry":
                             self.memory.add("assistant", final_text)
@@ -561,7 +602,7 @@ class Agent:
                             continue
                         final_text = reviewed
                         self.claim_unverified = guard.claim_unverified
-                    if (local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
+                    if (not self.response_incomplete and local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
                         # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
                         error_nudges += 1
                         self.memory.add("assistant", final_text or "(no answer)")
@@ -571,7 +612,7 @@ class Agent:
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
                         continue
-                    if (local_mode and use_tools and not wrote_ok and not unresolved and error_nudges < 2
+                    if (not self.response_incomplete and local_mode and use_tools and not wrote_ok and not unresolved and error_nudges < 2
                             and iteration < effective_max_iter and wants_edit
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in use_tools)
                             and not _NO_CHANGE_OK.search(final_text or "")):

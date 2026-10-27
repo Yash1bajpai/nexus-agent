@@ -615,10 +615,12 @@ def execute_run_code(code: str, language: str = "python") -> str:
         return f"ERROR: Code execution failed: {str(e)}"
 
 def execute_search_web(query: str) -> str:
-    """Search the web using DuckDuckGo with relevance validation and resilient fallback."""
-    def _get_curated_fallback(query: str) -> str:
-        """Return a curated fallback when DuckDuckGo is unavailable or returns off-topic results."""
-        return f"Live web search is currently unavailable or rate-limited for query: '{query}'."
+    """Return formatted results (ok), or an ERROR with a stable search category.
+
+    Empty and irrelevant responses are final outcomes, not backend exceptions.
+    backend_error means imports failed or only one backend could execute and failed;
+    both_failed means both backends raised during execution.
+    """
 
     def _is_relevant(results: list, query: str) -> bool:
         """Check if DuckDuckGo results are actually relevant to the query."""
@@ -634,38 +636,47 @@ def execute_search_web(query: str) -> str:
                 hits += 1
         return hits >= 1
 
-    try:
-        import warnings
-        orig_warn = warnings.warn
-        results = []
+    from importlib import import_module
+
+    failures = []
+    execution_failures = []
+    for backend in ("ddgs", "duckduckgo_search"):
         try:
-            warnings.warn = lambda msg, *a, **kw: None if "duckduckgo_search" in str(msg) or "ddgs" in str(msg) else orig_warn(msg, *a, **kw)
-            try:
-                from ddgs import DDGS
-                results = DDGS().text(query, max_results=5)
-            except Exception:
-                try:
-                    from duckduckgo_search import DDGS
-                    results = DDGS().text(query, max_results=5)
-                except Exception:
-                    results = []
-        except Exception:
-            results = []
-        finally:
-            warnings.warn = orig_warn
+            DDGS = import_module(backend).DDGS
+        except Exception as exc:
+            failures.append(f"{backend}: import failed ({type(exc).__name__}: {exc})")
+            continue
 
-        if not results or not _is_relevant(results, query):
-            return f"[Live Search Warning]: {_get_curated_fallback(query)}"
+        try:
+            results = DDGS().text(query, max_results=5)
+            if not results:
+                return (
+                    f"ERROR: search_web [empty]: The {backend} backend returned no results "
+                    f"for query: '{query}'. The underlying cause is unknown."
+                )
+            if not _is_relevant(results, query):
+                return (
+                    f"ERROR: search_web [irrelevant]: Results from {backend} did not pass "
+                    f"the relevance check for query: '{query}'."
+                )
 
-        formatted = [f"Search results for: '{query}'\n"]
-        for idx, r in enumerate(results, 1):
-            title = r.get("title", "No Title")
-            href = r.get("href", "")
-            body = r.get("body", "")
-            formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
-        return "\n".join(formatted)
-    except Exception:
-        return f"[Live Search Warning]: {_get_curated_fallback(query)}"
+            formatted = [f"Search results for: '{query}'\n"]
+            for idx, r in enumerate(results, 1):
+                title = r.get("title", "No Title")
+                href = r.get("href", "")
+                body = r.get("body", "")
+                formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
+            return "\n".join(formatted)
+        except Exception as exc:
+            execution_failures.append(backend)
+            failures.append(f"{backend}: execution failed ({type(exc).__name__}: {exc})")
+
+    category = "both_failed" if len(execution_failures) == 2 else "backend_error"
+    return (
+        f"ERROR: search_web [{category}]: No live search results could be retrieved "
+        f"for query: '{query}'. " + "; ".join(failures)
+        + ". The underlying cause is unknown."
+    )
 
 def _git_root() -> Path:
     result = _safe_git_run(["git", "rev-parse", "--show-toplevel"])

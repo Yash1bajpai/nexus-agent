@@ -41,6 +41,29 @@ def claims_tests_pass(text: str) -> bool:
     return False
 
 
+_TOOL_ACTION = r"(?:run_code|search_web|read_file|run_tests|patch_file|write_file|list_directory|git_status|git_diff)"
+_ACTION_PROMISE = re.compile(
+    r"\bi(?:'ll|\s+will|\s+am\s+going\s+to)\s+(?:now\s+)?"
+    r"(?:verify|run(?!\s+through\b)|execute|search|check|read|patch|edit|test|"
+    r"use\s+(?:the\s+)?" + _TOOL_ACTION + r"|" + _TOOL_ACTION + r")\b|"
+    r"\b" + _TOOL_ACTION + r"\s+"
+    r"(?:initiated|started|running)\b",
+    re.IGNORECASE,
+)
+
+
+def promises_tool_use(text: str) -> bool:
+    """Recognize unfulfilled action announcements, not examples or admissions."""
+    text = re.sub(r"```.*?```|`[^`]*`", "", text or "", flags=re.DOTALL)
+    text = re.sub(r"\"[^\"\n]*\"|“[^”\n]*”|(?<!\w)'[^'\n]*'(?!\w)", "", text)
+    for clause in re.split(r"[\n.!?;]+", text):
+        # Negation must apply to the action itself, not an unrelated constraint
+        # such as "I'll verify without changing files".
+        if not clause.lstrip().startswith(">") and _ACTION_PROMISE.search(clause):
+            return True
+    return False
+
+
 def guardrails_enabled(explicit: Optional[bool] = None) -> bool:
     if explicit is not None:
         return bool(explicit)
