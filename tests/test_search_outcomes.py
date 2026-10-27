@@ -100,37 +100,37 @@ def test_empty_and_irrelevant_are_distinct_errors(backends, modern, legacy, cate
 
 
 @pytest.mark.parametrize(
-    "modern,legacy,category,diagnostics,expected_calls",
+    "modern,legacy,category,exception_classes,expected_calls",
     [
         pytest.param(
             None, None, "backend_error",
-            ["ddgs: import failed (ModuleNotFoundError:", "duckduckgo_search: import failed (ModuleNotFoundError:"],
+            ["ModuleNotFoundError"],
             [], id="both-imports-unavailable",
         ),
         pytest.param(
             None, ValueError("No results found."), "backend_error",
-            ["ddgs: import failed (ModuleNotFoundError:", "duckduckgo_search: execution failed (ValueError: No results found.)"],
+            ["ModuleNotFoundError", "ValueError"],
             ["duckduckgo_search"], id="legacy-execution-error",
         ),
         pytest.param(
             ValueError("No results found."), None, "backend_error",
-            ["ddgs: execution failed (ValueError: No results found.)", "duckduckgo_search: import failed (ModuleNotFoundError:"],
+            ["ValueError", "ModuleNotFoundError"],
             ["ddgs"], id="modern-execution-error",
         ),
         pytest.param(
             ValueError("No results found."), RuntimeError("backend failed"), "both_failed",
-            ["ddgs: execution failed (ValueError: No results found.)", "duckduckgo_search: execution failed (RuntimeError: backend failed)"],
+            ["ValueError", "RuntimeError"],
             ["ddgs", "duckduckgo_search"], id="both-executions-failed",
         ),
     ],
 )
-def test_backend_errors_preserve_observed_diagnostics(backends, modern, legacy, category, diagnostics, expected_calls):
+def test_backend_errors_report_categories_and_exception_classes(backends, modern, legacy, category, exception_classes, expected_calls):
     calls = backends(modern, legacy)
     result = execute_tool("search_web", {"query": QUERY})
     assert result.startswith(f"ERROR: search_web [{category}]:")
     assert QUERY in result
-    for diagnostic in diagnostics:
-        assert diagnostic in result
+    for exception_class in exception_classes:
+        assert exception_class in result
     assert calls == expected_calls
     assert "underlying cause is unknown" in result
     assert "rate-limit" not in result
@@ -138,3 +138,44 @@ def test_backend_errors_preserve_observed_diagnostics(backends, modern, legacy, 
     assert "Offline/Cached" not in result
 
 
+
+
+@pytest.mark.parametrize("phase", ["import", "execution"])
+def test_search_errors_never_expose_exception_messages(monkeypatch, backends, capsys, phase):
+    from nexus_agent_ai.agent.core import Agent
+    from tests.test_real_user_failures import Transcript
+
+    # Synthetic credentials, never real ones. Either library may put these in
+    # exception messages, which become both tool observations and final errors.
+    credentials = ("leak-user", "leak-password", "leak-token")
+    message = "request https://leak-user:leak-password@example.invalid/?token=leak-token failed"
+    if phase == "import":
+        class BrokenModule(ModuleType):
+            def __getattr__(self, name):
+                if name == "DDGS":
+                    raise ImportError(message)
+                raise AttributeError(name)
+
+        for backend in ("ddgs", "duckduckgo_search"):
+            monkeypatch.setitem(sys.modules, backend, BrokenModule(backend))
+        category, exception_class = "backend_error", "ImportError"
+    else:
+        backends(RuntimeError(message), ValueError(message))
+        category, exception_class = "both_failed", "RuntimeError"
+
+    result = execute_tool("search_web", {"query": QUERY})
+    events = []
+    agent = Agent(Transcript([
+        ("search_web", {"query": QUERY}), "I could not retrieve live results.",
+    ]), max_iterations=2, verbose=False, event_callback=events.append)
+    final = agent.run("Search the web for Python downloads")
+    visible = "\n".join((result, final, str(agent.memory.get()), str(events)))
+    captured = capsys.readouterr()
+    visible += captured.out + captured.err
+
+    assert result.startswith(f"ERROR: search_web [{category}]:")
+    assert exception_class in result
+    assert agent.unresolved_errors
+    assert message not in visible
+    for credential in credentials:
+        assert credential not in visible

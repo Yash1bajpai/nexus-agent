@@ -14,7 +14,7 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `
 
 - Local routing recognizes explicit tool names and arithmetic requests. Bare retries such as “try again” inherit the last real request's routing and edit intent, not internal steering messages or an older topic.
 - An English action announcement such as “I'll verify” or “run_code initiated” without any tool execution is reported as incomplete/unverified; one-shot commands exit unsuccessfully and streaming output includes the correction. Quoted examples and “run through an example” are not execution promises. This is a conservative language heuristic, not proof that every unsupported claim can be detected.
-- Search keeps successful numbered results and URLs. Failures are errors with categories `empty`, `irrelevant`, `backend_error` (imports unavailable or only one backend executed and failed), or `both_failed` (both executed and failed). Diagnostics distinguish import/execution exceptions; empty results do not establish rate limiting or network blocking. Modern-backend exceptions can fall back to the legacy backend; empty/irrelevant responses do not trigger fallback.
+- Search keeps successful numbered results and URLs. Failures are errors with categories `empty`, `irrelevant`, `backend_error` (imports unavailable or only one backend executed and failed), or `both_failed` (both executed and failed). Diagnostics expose the backend, import/execution phase and exception class, never raw exception messages that may contain credentials or tokens. Empty results do not establish rate limiting or network blocking. Modern-backend exceptions can fall back to the legacy backend; empty/irrelevant responses do not trigger fallback.
 - Native calls with malformed JSON, non-object arguments, or missing names are rejected before dispatch, rather than converted into guessed arguments. Omitted arguments remain supported for parameterless calls.
 - llama-server, llama-cpp and OpenAI stop reasons are retained. A reported `length` stop marks the response incomplete and executes none of its attached calls, including partially generated calls. Transformers stopping status remains unobserved.
 
@@ -228,6 +228,9 @@ python -m pytest -q
 python -m pip install build
 python -m build
 ```
+
+The module-entry subprocess test keeps its temporary working directory and home, but explicitly inherits the test runner's resolved import paths. Pytest's `pythonpath` setting does not configure child interpreters, and replacing `HOME` can hide user-site dependencies even after an editable project install. This is test-environment setup, not application import fallback.
+
 
 CI covers Python 3.11–3.13 and additional Windows/macOS jobs. Regression coverage includes real workspace confinement, linked backup destinations, atomic edit failures, protected state, Git helper suppression and secret filtering, download integrity/resumption, provider-native history migration, multi-turn fallback, streamed corrections and truthful command exits. The current checkout was verified on Windows/Python 3.13; POSIX permission tests require a POSIX runner. Passing tests are not proof of model accuracy or a hostile-code sandbox.
 

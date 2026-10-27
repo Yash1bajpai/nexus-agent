@@ -644,7 +644,7 @@ def execute_search_web(query: str) -> str:
         try:
             DDGS = import_module(backend).DDGS
         except Exception as exc:
-            failures.append(f"{backend}: import failed ({type(exc).__name__}: {exc})")
+            failures.append(f"{backend}: import failed ({type(exc).__name__})")
             continue
 
         try:
@@ -669,7 +669,8 @@ def execute_search_web(query: str) -> str:
             return "\n".join(formatted)
         except Exception as exc:
             execution_failures.append(backend)
-            failures.append(f"{backend}: execution failed ({type(exc).__name__}: {exc})")
+            # Exception messages may contain credential-bearing URLs or tokens.
+            failures.append(f"{backend}: execution failed ({type(exc).__name__})")
 
     category = "both_failed" if len(execution_failures) == 2 else "backend_error"
     return (
