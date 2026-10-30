@@ -36,17 +36,25 @@ class SQLiteMemory:
         restrict_permissions(self.db_path, 0o600)
         self._init_db()
 
+    _SCHEMA_SQL = """
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            message_json TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """
+
     def _init_db(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS conversation_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    message_json TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            conn.execute(self._SCHEMA_SQL)
+
+    @classmethod
+    def _ensure_schema(cls, conn):
+        # Classmethods open their own handle; an interrupted run can leave an
+        # existing db file without the table, so never assume it is there.
+        conn.execute(cls._SCHEMA_SQL)
 
     def add(self, role: str, content: str):
         self.add_raw({"role": role, "content": content})
@@ -99,7 +107,8 @@ class SQLiteMemory:
             return []
         restrict_permissions(db_path.parent, 0o700)
         restrict_permissions(db_path, 0o600)
-        with closing(sqlite3.connect(db_path)) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
+            cls._ensure_schema(conn)
             rows = conn.execute("""
                 SELECT session_id, COUNT(*) as msg_count, MAX(timestamp) as last_active
                 FROM conversation_history GROUP BY session_id ORDER BY last_active DESC
@@ -114,4 +123,5 @@ class SQLiteMemory:
         restrict_permissions(db_path.parent, 0o700)
         restrict_permissions(db_path, 0o600)
         with closing(sqlite3.connect(db_path)) as conn, conn:
+            cls._ensure_schema(conn)
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (session_id,))
