@@ -182,6 +182,22 @@ def test_sqlite_sessions_list_and_delete(tmp_path):
     assert len(remaining) == 1
     assert remaining[0]["session_id"] == "session_beta"
 
+def test_sessions_list_tolerates_uninitialized_db_file(tmp_path):
+    # An interrupted first run can leave an existing history.db without the
+    # table (touch() ran, _init_db did not). Listing must not crash.
+    from nexus_agent_ai.agent.persistence import SQLiteMemory
+    db_file = tmp_path / "history.db"
+    db_file.touch()
+    assert SQLiteMemory.list_sessions(db_path=db_file) == []
+
+
+def test_sessions_delete_tolerates_uninitialized_db_file(tmp_path):
+    from nexus_agent_ai.agent.persistence import SQLiteMemory
+    db_file = tmp_path / "history.db"
+    db_file.touch()
+    SQLiteMemory.delete_session("nonexistent", db_path=db_file)
+
+
 def test_sessions_cli_command(tmp_path, monkeypatch):
     from typer.testing import CliRunner
     from nexus_agent_ai.cli.app import app as cli_app
