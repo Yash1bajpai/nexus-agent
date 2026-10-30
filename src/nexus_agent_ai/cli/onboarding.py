@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from ..utils.interactive import stdin_is_interactive
 from ..utils.private_files import restrict_permissions
 
 # Ensure safe output encoding on Windows terminals to prevent UnicodeEncodeError
@@ -638,7 +639,7 @@ def run_if_first_time():
     # Piped / CI / scripted runs have nobody to answer the prompts: skip the wizard (without marking it
     # done, so the next interactive launch still shows it) instead of blocking forever on input().
     try:
-        interactive = sys.stdin is not None and sys.stdin.isatty()
+        interactive = stdin_is_interactive()
     except Exception:
         interactive = False
     if not interactive:

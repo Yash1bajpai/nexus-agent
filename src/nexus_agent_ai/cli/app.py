@@ -24,6 +24,7 @@ if sys.platform == "win32":
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 from ..utils.config import DEFAULT_PROVIDER, ConfigError
+from ..utils.interactive import stdin_is_interactive
 from ..agent.memory import ConversationMemory
 from ..agent.core import Agent
 from . import display
@@ -382,7 +383,7 @@ def repl(
         typer.echo("Type /help for available commands, or /exit to quit.\n")
 
         session = None
-        if sys.stdin.isatty():
+        if stdin_is_interactive():
             try:
                 from prompt_toolkit import PromptSession
                 from prompt_toolkit.history import FileHistory
@@ -399,7 +400,7 @@ def repl(
 
         while True:
             try:
-                if session is not None and sys.stdin.isatty():
+                if session is not None and stdin_is_interactive():
                     try:
                         user_input = session.prompt(">> You: ").strip()
                     except KeyboardInterrupt:

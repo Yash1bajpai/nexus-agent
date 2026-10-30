@@ -3,6 +3,13 @@ from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
 from ..utils.config import get_env_or_raise
 from .messages import anthropic_messages, assistant_message, decode_native_tool_call, tool_result
 
+def _finish_reason(stop_reason: Any) -> Optional[str]:
+    """Report Claude's token-limit stops with the same "length" value other providers use."""
+    if stop_reason == "max_tokens":
+        return "length"
+    return stop_reason if isinstance(stop_reason, str) else None
+
+
 class AnthropicProvider(BaseProvider):
     """LLM Provider implementation for Anthropic Claude models."""
 
@@ -50,10 +57,11 @@ class AnthropicProvider(BaseProvider):
 
         text = ""
         tool_calls = []
+        finish_reason = _finish_reason(getattr(response, "stop_reason", None))
         for content_block in response.content:
             if content_block.type == "text":
                 text += content_block.text
-            elif content_block.type == "tool_use":
+            elif content_block.type == "tool_use" and finish_reason != "length":
                 tool_calls.append(
                     decode_native_tool_call(content_block.name, content_block.input, content_block.id)
                 )
@@ -66,6 +74,7 @@ class AnthropicProvider(BaseProvider):
             raw_assistant_message=raw_msg,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            finish_reason=finish_reason,
         )
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
@@ -89,8 +98,9 @@ class AnthropicProvider(BaseProvider):
 
             text = "".join(full_text)
             tool_calls = []
+            finish_reason = _finish_reason(getattr(final_msg, "stop_reason", None))
             for content_block in final_msg.content:
-                if content_block.type == "tool_use":
+                if content_block.type == "tool_use" and finish_reason != "length":
                     tool_calls.append(
                         decode_native_tool_call(content_block.name, content_block.input, content_block.id)
                     )
@@ -105,6 +115,7 @@ class AnthropicProvider(BaseProvider):
                 raw_assistant_message=raw_msg,
                 input_tokens=in_tokens,
                 output_tokens=out_tokens,
+                finish_reason=finish_reason,
             )
         except self._anthropic.RateLimitError as e:
             raise RateLimitError("Anthropic", str(e))

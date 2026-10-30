@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Callable, List, Tuple
+
+from ..utils.interactive import stdin_is_interactive
 
 _session_allowed: set = set()
 _session_denied: set = set()
@@ -65,7 +66,7 @@ def revoke(path: "str | Path | None" = None, all_folders: bool = False) -> int:
 
 def _interactive() -> bool:
     try:
-        return bool(sys.stdin and sys.stdin.isatty())
+        return stdin_is_interactive()
     except Exception:
         return False
 
