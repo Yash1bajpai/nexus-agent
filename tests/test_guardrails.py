@@ -150,6 +150,14 @@ def test_clean_tree_claim_checked(repo):
     "> Tests pass.\nThat was the model's unsupported quotation.",
     "Tests should pass after this change.",
     "If all tests pass, the fix is verified.",
+    "I can run tests to confirm the fix.",
+    "I can verify the changes if you want.",
+    "tests did not pass",
+    "haven't run yet",
+    "I have not run tests yet.",
+    'The model said "I ran the test suite - everything passes."',
+    "`I verified the changes and ran a test to confirm the fix.`",
+    "```\nI checked the file and the fix works now.\n```",
 ])
 def test_negative_quoted_and_fix_only_answers_are_not_test_success_claims(answer):
     guard = LoopGuard(lambda path: "")
@@ -172,3 +180,65 @@ def test_failure_admission_does_not_hide_separate_false_success_claim():
     guard.after_tool("run_tests", {}, "Pytest Results: FAILED")
     verdict, _ = guard.review_final("Some tests failed. All tests pass now.")
     assert verdict == "retry" and guard.claim_unverified
+
+
+@pytest.mark.parametrize("answer", [
+    "I verified the changes and ran a test to confirm the fix.",
+    "I ran the test suite - everything passes.",
+    "I checked the file and the fix works now.",
+])
+def test_unbacked_affirmative_verification_claims_are_flagged(answer):
+    guard = LoopGuard(lambda path: "")
+    guard.after_tool("patch_file", {"path": "buggy.py"}, "Successfully patched buggy.py")
+    verdict, reviewed = guard.review_final(answer)
+    assert verdict == "ok"
+    assert guard.claim_unverified
+    assert "unverified" in reviewed.lower()
+
+
+def test_file_verification_claim_requires_post_edit_read_of_exact_path():
+    guard = LoopGuard(lambda path: "")
+    guard.after_tool("read_file", {"path": "buggy.py"}, "def divide(a, b): return a / b")
+    guard.after_tool("patch_file", {"path": "buggy.py"}, "Successfully patched buggy.py")
+    # Unrelated tool call: list_directory
+    guard.after_tool("list_directory", {"path": "."}, "[FILE] buggy.py")
+    verdict, reviewed = guard.review_final("I checked the file and the fix works now.")
+    assert guard.claim_unverified
+    assert "modified file was not inspected after being edited" in reviewed
+
+    # Reading an unrelated path does not satisfy post-edit verification of buggy.py
+    guard2 = LoopGuard(lambda path: "")
+    guard2.after_tool("patch_file", {"path": "buggy.py"}, "Successfully patched buggy.py")
+    guard2.after_tool("read_file", {"path": "other.py"}, "print('other')")
+    verdict, reviewed = guard2.review_final("I checked the file and the fix works now.")
+    assert guard2.claim_unverified
+
+    # Post-edit read of buggy.py backs the file-verification claim
+    guard3 = LoopGuard(lambda path: "")
+    guard3.after_tool("patch_file", {"path": "buggy.py"}, "Successfully patched buggy.py")
+    guard3.after_tool("read_file", {"path": "buggy.py"}, "def divide(a, b): return a / b if b else 0")
+    verdict, reviewed = guard3.review_final("I checked the file and the fix works now.")
+    assert not guard3.claim_unverified
+    assert "unverified" not in reviewed.lower()
+
+
+def test_test_claims_backed_by_run_tests_or_run_code():
+    # Backed by run_tests
+    guard = LoopGuard(lambda path: "")
+    guard.after_tool("run_tests", {}, "Pytest Results: PASSED\n1 passed")
+    verdict, reviewed = guard.review_final("I ran the test suite - everything passes.")
+    assert not guard.claim_unverified
+
+    # Backed by successful run_code (test claim)
+    guard2 = LoopGuard(lambda path: "")
+    guard2.after_tool("run_code", {"code": "assert 1 == 1"}, "STDOUT:\nok")
+    verdict, reviewed = guard2.review_final("I ran a test to confirm the fix.")
+    assert not guard2.claim_unverified
+
+    # Backed when both file edit + post-edit read and test execution occur
+    guard3 = LoopGuard(lambda path: "")
+    guard3.after_tool("patch_file", {"path": "buggy.py"}, "Successfully patched buggy.py")
+    guard3.after_tool("read_file", {"path": "buggy.py"}, "def divide(a, b): return a / b if b else 0")
+    guard3.after_tool("run_tests", {}, "Pytest Results: PASSED\n1 passed")
+    verdict, reviewed = guard3.review_final("I verified the changes and ran a test to confirm the fix.")
+    assert not guard3.claim_unverified

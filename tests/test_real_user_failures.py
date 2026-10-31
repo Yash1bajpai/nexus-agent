@@ -646,3 +646,83 @@ def test_unnamed_function_requests_do_not_invent_artifact_names(tmp_path, prompt
     }
     assert not agent.requirements_incomplete
     assert cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+def test_debug_unbacked_self_verification_claim_fails_cli_and_reports_unverified(tmp_path, monkeypatch):
+    path = tmp_path / "buggy.py"
+    path.write_text("def divide(a, b):\n    return a / b\n", encoding="utf-8")
+    replacement = "def divide(a, b):\n    return a / b if b != 0 else 0\n"
+    provider = Transcript([
+        ("read_file", {"path": "buggy.py"}),
+        ("patch_file", {"path": "buggy.py", "target": "return a / b\n", "replacement": "return a / b if b != 0 else 0\n"}),
+        "The file has been updated safely. I verified the changes and ran a test to confirm the fix.",
+    ])
+    agent = Agent(provider, max_iterations=3, verbose=False)
+
+    final = agent.run("Debug 'buggy.py' given ZeroDivisionError", require_edit=True)
+
+    assert agent.claim_unverified
+    assert "unverified" in final.lower()
+    assert not cli._check_run_outcome(agent, exit_on_failure=False)
+
+    # Reset file before CLI invocation
+    path.write_text("def divide(a, b):\n    return a / b\n", encoding="utf-8")
+    cli_provider = Transcript([
+        ("read_file", {"path": "buggy.py"}),
+        ("patch_file", {"path": "buggy.py", "target": "return a / b\n", "replacement": "return a / b if b != 0 else 0\n"}),
+        "The file has been updated safely. I verified the changes and ran a test to confirm the fix.",
+    ])
+    monkeypatch.setattr(cli, "get_provider_instance", lambda *a, **k: (cli_provider, "offline-transcript"))
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["debug", "buggy.py", "-e", "ZeroDivisionError: division by zero", "--no-stream"])
+    assert result.exit_code == 1
+    assert "unverified" in result.output.lower()
+
+
+@pytest.mark.parametrize("scenario,final_reply,post_read,should_pass", [
+    ("proposal", "The file has been updated safely. You can run tests to verify the fix.", False, True),
+    ("admission", "The file has been updated safely. Tests have not run yet.", False, True),
+    ("post-read-checked", "I checked the file and the fix works now.", True, True),
+    ("no-post-read-checked", "I checked the file and the fix works now.", False, False),
+])
+def test_debug_verification_proposals_and_evidence_boundaries(tmp_path, scenario, final_reply, post_read, should_pass):
+    path = tmp_path / "buggy.py"
+    path.write_text("def divide(a, b):\n    return a / b\n", encoding="utf-8")
+    turns = [
+        ("read_file", {"path": "buggy.py"}),
+        ("patch_file", {"path": "buggy.py", "target": "return a / b\n", "replacement": "return a / b if b != 0 else 0\n"}),
+    ]
+    if post_read:
+        turns.append(("read_file", {"path": "buggy.py"}))
+    turns.append(final_reply)
+    agent = Agent(Transcript(turns), max_iterations=4, verbose=False)
+
+    final = agent.run("Debug 'buggy.py' given ZeroDivisionError", require_edit=True)
+
+    if should_pass:
+        assert not agent.claim_unverified
+        assert cli._check_run_outcome(agent, exit_on_failure=False)
+    else:
+        assert agent.claim_unverified
+        assert not cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+def test_search_web_surfaces_actual_supporting_url_in_final_answer(monkeypatch):
+    search_results = [{
+        "title": "Python Downloads",
+        "href": "https://www.python.org/downloads/latest/",
+        "body": "Download the latest stable Python release.",
+    }]
+    search_backend(monkeypatch, [search_results])
+    provider = Transcript([
+        ("search_web", {"query": "latest stable Python version"}),
+        "The latest stable Python version is 3.12.3.",
+    ])
+    agent = Agent(provider, max_iterations=2, verbose=False)
+
+    final = agent.run("What is the latest stable Python version? Search the web.")
+
+    assert "https://www.python.org/downloads/latest/" in final
+    assert "Source: https://www.python.org/downloads/latest/" in final
+    assert not agent.claim_unverified
+    assert cli._check_run_outcome(agent, exit_on_failure=False)

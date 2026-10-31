@@ -69,7 +69,11 @@ def _check_run_outcome(agent: Agent, *, exit_on_failure: bool = True) -> bool:
             + " Any partial edits remain in place; requested function names are not all confirmed."
         )
     elif getattr(agent, "claim_unverified", False):
-        error = "The model claimed the tests pass, but no passing test run backs that up."
+        error = getattr(
+            agent,
+            "claim_unverified_error",
+            "",
+        ) or "The model claimed the tests pass or changes were verified, but no tool execution backs that up."
     elif getattr(agent, "unfulfilled_action", False):
         error = "The model announced an action, but no tool was executed."
     elif getattr(agent, "response_incomplete", False):

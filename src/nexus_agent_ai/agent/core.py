@@ -293,6 +293,7 @@ class Agent:
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
         self.edit_not_applied = False  # an edit was requested, nothing was written, and the model did not say nothing needs changing
         self.claim_unverified = False  # model said tests pass but they were not run / last run failed
+        self.claim_unverified_error = ""
         self.unfulfilled_action = False
         self.response_incomplete = False
         self.changed_files: set[str] = set()
@@ -447,6 +448,8 @@ class Agent:
         self.claimed_unapplied_edit = False
         self.edit_not_applied = False
         self.claim_unverified = False
+        self.claim_unverified_error = ""
+        retrieved_search_urls: List[str] = []
         self.unfulfilled_action = False
         self.response_incomplete = False
         self.changed_files = set()
@@ -585,6 +588,10 @@ class Agent:
                             result = execute_tool(tool_call.name, tool_call.args)
                             if tool_call.name == "search_web" and str(result).startswith("Search results for:"):
                                 search_succeeded = True
+                                for u in re.findall(r"^\s*URL:\s*(https?://\S+)", str(result), re.MULTILINE):
+                                    clean_u = u.strip().rstrip(".,;)]}>\"'")
+                                    if clean_u.startswith(("http://", "https://")) and clean_u not in retrieved_search_urls:
+                                        retrieved_search_urls.append(clean_u)
                             changed = (edit_path is not None and before_edit is not None
                                        and (after_edit := _file_state(edit_path)) is not None
                                        and after_edit != before_edit
@@ -675,6 +682,8 @@ class Agent:
                             continue
                         final_text = reviewed
                         self.claim_unverified = guard.claim_unverified
+                        if getattr(guard, "claim_unverified_error", ""):
+                            self.claim_unverified_error = guard.claim_unverified_error
                     if (not self.response_incomplete and local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
                         # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
                         error_nudges += 1
@@ -703,6 +712,8 @@ class Agent:
                             "Unverified web grounding: no successful search_web result was retrieved in this turn. "
                             "The live-search request is not complete; any current-source claims above are unverified."
                         )
+                    if retrieved_search_urls and not any(u in final_text for u in retrieved_search_urls):
+                        final_text += f"\n\nSource: {retrieved_search_urls[0]}"
                     self.unresolved_errors = list(unresolved.values())
                     if not wrote_ok and wants_edit and not _NO_CHANGE_OK.search(final_text or ""):
                         final_text += ("\n\nWarning: no file was changed. No file tool actually changed file contents "
