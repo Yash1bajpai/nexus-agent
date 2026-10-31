@@ -148,8 +148,9 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
     if total > budget_tokens:
         raise ContextBudgetError(
             f"Current conversation needs at least {total} estimated tokens but only "
-            f"{budget_tokens} are available. Tool arguments and call/result bindings "
-            "were preserved; no over-budget request was sent. Start a new turn or use a larger context window."
+            f"{budget_tokens} are available in the configured request budget. Tool arguments and call/result bindings "
+            "were preserved; no over-budget request was sent. Start a new turn or adjust configured budgets "
+            "within the endpoint's documented capacity."
         )
     stats["tokens"] = total
     return msgs, stats

@@ -2,10 +2,12 @@
 
 Small models hallucinate file names, claim tests pass when they failed, and
 describe git output they never read. These checks run inside the agent loop,
-use only data the tools already returned, and never change files.
+check tool evidence and explicitly requested Python function names, and never change files.
 
 Turn off with NEXUS_GUARDRAILS=0 (for measuring the model alone).
 """
+import ast
+import keyword
 import difflib
 import os
 import re
@@ -62,6 +64,78 @@ def promises_tool_use(text: str) -> bool:
         if not clause.lstrip().startswith(">") and _ACTION_PROMISE.search(clause):
             return True
     return False
+
+
+def function_request_prose(request: str) -> str:
+    """Exclude examples/quotations before extracting bounded edit requirements."""
+    # Bare retries may route through a stored prompt that already has attachments.
+    # Only its request prefix is eligible; attached source is never an instruction.
+    request = (request or "").split("\n\n[Context attached from @", 1)[0]
+    text = re.sub(r"```.*?```|~~~.*?~~~|`[^`]*`", "", request, flags=re.DOTALL)
+    text = re.sub(r"\"[^\"\n]*\"|“[^”\n]*”|(?<!\w)'[^'\n]*'(?!\w)", "", text)
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(">"))
+
+
+_PYTHON_NAME = r"[A-Za-z_][A-Za-z_0-9]*"
+_FUNCTION_ACTION = re.compile(
+    r"(?:^|[,;.!]\s*|\b(?:then|and)\s+)(?:please\s+)?(?:"
+    r"rename\s+(?:the\s+)?(?:" + _PYTHON_NAME + r"\s+function|function\s+" + _PYTHON_NAME
+    + r")\s+to\s+(?P<rename>" + _PYTHON_NAME + r")\b|"
+    r"(?:add|create|define)\s+(?:(?:a|the)\s+)?(?:"
+    r"(?P<add>" + _PYTHON_NAME + r")\s*\([^()\n]*\)\s+function\b|"
+    r"function\s+(?P<define>" + _PYTHON_NAME + r")\b"
+    r"(?=\s*(?:\(|[,;.!?]|\b(?:that|which|and|then|with)\b|$))))",
+    re.IGNORECASE,
+)
+
+
+def requested_function_names(prose: str) -> List[str]:
+    """Recognize explicit imperative rename/add/create/define forms, not semantics."""
+    intent = re.sub(r"^\s*(?:in|for)\s+[^,;\n]+,\s*", "", prose, flags=re.IGNORECASE)
+    if re.match(
+        r"^\s*(?:please\s+)?(?:how\b|what\b|why\b|when\b|where\b|explain\b|describe\b|"
+        r"(?:can|could|would)\s+you\s+(?:please\s+)?(?:explain|describe)\b)",
+        intent, re.IGNORECASE,
+    ):
+        return []
+    names = []
+    for match in _FUNCTION_ACTION.finditer(prose):
+        name = match.group("rename") or match.group("add") or match.group("define")
+        if name.isidentifier() and not keyword.iskeyword(name) and name not in names:
+            names.append(name)
+    return names
+
+
+def check_function_requirements(requirements: Dict[str, List[str]]) -> List[str]:
+    """Check actual workspace source without executing it or trusting tool claims."""
+    from .tools import execute_read_file
+
+    incomplete = []
+    for path, names in requirements.items():
+        source = execute_read_file(path)
+        if source.startswith("ERROR:"):
+            incomplete.append(
+                f"{path}: could not check requested top-level Python functions "
+                f"({', '.join(names)}): {source}"
+            )
+            continue
+        try:
+            module = ast.parse(source, filename=path)
+        except (SyntaxError, ValueError, RecursionError) as exc:
+            incomplete.append(
+                f"{path}: could not check requested top-level Python functions "
+                f"({', '.join(names)}): source could not be parsed ({type(exc).__name__})."
+            )
+            continue
+        present = {
+            node.name for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        missing = [name for name in names if name not in present]
+        if missing:
+            incomplete.append(f"{path}: missing top-level Python function(s): {', '.join(missing)}.")
+    return incomplete
+
 
 
 def guardrails_enabled(explicit: Optional[bool] = None) -> bool:

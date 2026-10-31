@@ -9,7 +9,10 @@ from ..providers.base import BaseProvider, RateLimitError, ProviderResponse
 from . import context
 from .memory import ConversationMemory, is_genuine_user_message
 from .tools import get_all_tools, execute_tool, execute_list_directory
-from .guardrails import LoopGuard, guardrails_enabled, promises_tool_use
+from .guardrails import (
+    LoopGuard, guardrails_enabled, promises_tool_use, function_request_prose,
+    requested_function_names, check_function_requirements,
+)
 from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
@@ -216,6 +219,26 @@ def parse_at_mentions(user_input: str) -> str:
 
 _FILE_TOKEN = re.compile(r'(?<![\w@/\\.-])([\w][\w.\-]*(?:[/\\][\w.\-]+)*\.[A-Za-z0-9]{1,6})(?=[\s.,;:!?)\'"]|$)')
 
+def _named_function_requirements(request: str) -> tuple[Dict[str, List[str]], List[str]]:
+    """Bind recognized Python requests, or explicitly report an unverified scope."""
+    prose = function_request_prose(request)
+    names = requested_function_names(prose)
+    if not names:
+        return {}, []
+    paths = {match.group(1) for match in _FILE_TOKEN.finditer(prose.replace("@", " "))}
+    if paths and not any(Path(path).suffix == ".py" for path in paths):
+        return {}, []  # This guard does not impose Python rules on other languages.
+    if len(paths) == 1:
+        path = next(iter(paths))
+        if Path(path).suffix == ".py":
+            return {path: names}, []
+    return {}, [
+        f"Could not verify requested Python function names ({', '.join(names)}): "
+        "this bounded check requires one explicit unquoted relative .py target. "
+        "No file was inferred for verification."
+    ]
+
+
 
 def attach_named_files(user_input: str) -> str:
     if os.environ.get("NEXUS_AGENT_AUTO_ATTACH", "1") == "0":
@@ -273,6 +296,7 @@ class Agent:
         self.unfulfilled_action = False
         self.response_incomplete = False
         self.changed_files: set[str] = set()
+        self.requirements_incomplete: List[str] = []
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -337,8 +361,9 @@ class Agent:
             try:
                 if budget <= 0:
                     raise context.ContextBudgetError(
-                        f"Context window ({window} tokens) cannot fit instructions, tools and answer reserve "
-                        f"({overhead + reserve} tokens). Use a larger context window, a smaller output cap, or fewer tools."
+                        f"Configured context budget ({window} tokens) cannot fit instructions, tools and answer reserve "
+                        f"({overhead + reserve} tokens). Adjust the configured context/output budgets within "
+                        "the endpoint's documented capacity, or use fewer tools."
                     )
                 fitted, stats = context.fit_messages(messages, budget)
                 break
@@ -383,6 +408,9 @@ class Agent:
         wants_edit = require_edit or (
             any(tool.name in _WRITE_TOOLS for tool in self.tools) and _wants_edit(routing_input)
         )
+        function_requirements, requirement_scope_errors = (
+            _named_function_requirements(routing_input) if self.guardrails else ({}, [])
+        )
         processed_input = parse_at_mentions(attach_named_files(user_input))
         self.memory.add("user", processed_input)
         error_nudges = 0
@@ -422,6 +450,7 @@ class Agent:
         self.unfulfilled_action = False
         self.response_incomplete = False
         self.changed_files = set()
+        self.requirements_incomplete = []
         previous_before_request = getattr(self.provider, "before_request", None)
         managed_fallback = hasattr(self.provider, "before_request")
         if managed_fallback:
@@ -684,6 +713,20 @@ class Agent:
                             # Not just "nothing to change": the model claimed an edit that never happened.
                             self.claimed_unapplied_edit = True
                             final_text += "\nThe claim above that the code was changed is false: the files were not modified."
+                    self.requirements_incomplete = requirement_scope_errors + check_function_requirements(function_requirements)
+                    if self.requirements_incomplete:
+                        final_text += (
+                            "\n\nRequest incomplete: "
+                            + " ".join(self.requirements_incomplete)
+                            + " Any partial edits remain in place; no automatic repair was attempted. "
+                            "This check verifies function names only, not behavior or all request requirements."
+                        )
+                    elif function_requirements:
+                        final_text += (
+                            "\n\nCompletion check: requested top-level Python function names exist. "
+                            "This guard checks names only; it has not verified function behavior or every instruction. "
+                            "Review the diff and run trusted tests."
+                        )
                     if self.unresolved_errors:
                         final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
                     if self.event_callback:
@@ -713,6 +756,10 @@ class Agent:
         if wants_edit and not self.changed_files:
             self.edit_not_applied = True
             final_text += " No file was changed."
+        self.requirements_incomplete = requirement_scope_errors + check_function_requirements(function_requirements)
+        if self.requirements_incomplete:
+            final_text += "\nRequest incomplete: " + " ".join(self.requirements_incomplete)
+            final_text += " Any partial edits remain in place; no automatic repair was attempted."
         if self.unresolved_errors:
             final_text += "\nUnresolved tool errors:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
         self.memory.add("assistant", final_text)

@@ -63,6 +63,11 @@ def _check_run_outcome(agent: Agent, *, exit_on_failure: bool = True) -> bool:
         error = "The model said it changed code but no file was modified."
     elif getattr(agent, "edit_not_applied", False):
         error = "An edit was requested but no file was changed."
+    elif getattr(agent, "requirements_incomplete", None):
+        error = (
+            "Request incomplete: " + " ".join(agent.requirements_incomplete)
+            + " Any partial edits remain in place; requested function names are not all confirmed."
+        )
     elif getattr(agent, "claim_unverified", False):
         error = "The model claimed the tests pass, but no passing test run backs that up."
     elif getattr(agent, "unfulfilled_action", False):
@@ -444,7 +449,7 @@ def repl(
                         display.print_info("This provider does not expose a context budget.")
                     else:
                         display.print_info(
-                            f"Context window: {window} tokens; configured output ceiling: {agent.output_reserve} tokens. "
+                            f"Configured context budget: {window} tokens; configured output ceiling: {agent.output_reserve} tokens. "
                             "Restart with --context-size / --max-output-tokens to change the budgets. Larger local windows use more RAM. "
                             "Old turns are dropped and big items cut automatically when a request would not fit; "
                             "/compact shrinks stored history, /clear clears it (including a persistent session)."
