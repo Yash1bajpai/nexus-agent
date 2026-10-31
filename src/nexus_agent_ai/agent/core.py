@@ -12,6 +12,7 @@ from .tools import get_all_tools, execute_tool, execute_list_directory
 from .guardrails import (
     LoopGuard, guardrails_enabled, promises_tool_use, function_request_prose,
     requested_function_names, check_function_requirements,
+    requested_literal_assignment, check_literal_assignment_requirement,
 )
 from ..cli import display
 from ..utils.config import estimate_cost
@@ -412,6 +413,7 @@ class Agent:
         function_requirements, requirement_scope_errors = (
             _named_function_requirements(routing_input) if self.guardrails else ({}, [])
         )
+        literal_assignment_requirement = requested_literal_assignment(routing_input) if self.guardrails else None
         processed_input = parse_at_mentions(attach_named_files(user_input))
         self.memory.add("user", processed_input)
         error_nudges = 0
@@ -724,19 +726,28 @@ class Agent:
                             # Not just "nothing to change": the model claimed an edit that never happened.
                             self.claimed_unapplied_edit = True
                             final_text += "\nThe claim above that the code was changed is false: the files were not modified."
-                    self.requirements_incomplete = requirement_scope_errors + check_function_requirements(function_requirements)
+                    self.requirements_incomplete = (
+                        requirement_scope_errors + check_function_requirements(function_requirements)
+                        + check_literal_assignment_requirement(literal_assignment_requirement)
+                    )
                     if self.requirements_incomplete:
                         final_text += (
                             "\n\nRequest incomplete: "
                             + " ".join(self.requirements_incomplete)
                             + " Any partial edits remain in place; no automatic repair was attempted. "
-                            "This check verifies function names only, not behavior or all request requirements."
+                            "This is a presence check on a recognized grammar, not verification of arbitrary program behavior or every instruction."
                         )
                     elif function_requirements:
                         final_text += (
                             "\n\nCompletion check: requested top-level Python function names exist. "
                             "This guard checks names only; it has not verified function behavior or every instruction. "
                             "Review the diff and run trusted tests."
+                        )
+                    elif literal_assignment_requirement is not None:
+                        final_text += (
+                            "\n\nCompletion presence check: the recognized literal assignment is present "
+                            "as the final supported module-level binding. This does not verify arbitrary "
+                            "program behavior or every instruction."
                         )
                     if self.unresolved_errors:
                         final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
@@ -767,7 +778,10 @@ class Agent:
         if wants_edit and not self.changed_files:
             self.edit_not_applied = True
             final_text += " No file was changed."
-        self.requirements_incomplete = requirement_scope_errors + check_function_requirements(function_requirements)
+        self.requirements_incomplete = (
+            requirement_scope_errors + check_function_requirements(function_requirements)
+            + check_literal_assignment_requirement(literal_assignment_requirement)
+        )
         if self.requirements_incomplete:
             final_text += "\nRequest incomplete: " + " ".join(self.requirements_incomplete)
             final_text += " Any partial edits remain in place; no automatic repair was attempted."
