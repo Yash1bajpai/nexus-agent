@@ -156,6 +156,7 @@ class LocalProvider(BaseProvider):
       4. Ollama (external HTTP API, must be pre-installed)
     """
     is_local = True
+    _supports_output_budget = True
 
 
     def __init__(self, model_id: str = None, filename: str = None, context_size: Optional[int] = None, max_output_tokens: Optional[int] = None):
@@ -473,7 +474,7 @@ class LocalProvider(BaseProvider):
             "messages": formatted_messages,
             "temperature": 0.2,
             "top_p": 0.95,
-            "max_tokens": self.max_output_tokens,
+            "max_tokens": self.request_output_cap,
             "stream": True,
             # Ask the server to include real token counts in the final chunk
             "stream_options": {"include_usage": True},
@@ -628,7 +629,7 @@ class LocalProvider(BaseProvider):
                         from .openai_provider import OpenAIProvider
                         ollama_prov = OpenAIProvider(
                             model=target_model, base_url="http://localhost:11434/v1",
-                            context_size=self.context_size, max_output_tokens=self.max_output_tokens,
+                            context_size=self.context_size, max_output_tokens=self.request_output_cap,
                         )
                         return ollama_prov.complete(messages, tools, system)
             except Exception:
@@ -652,7 +653,7 @@ class LocalProvider(BaseProvider):
         )
         inputs = self._tokenizer([prompt], return_tensors="pt").to(self._model_instance.device)
         input_tokens = inputs.input_ids.shape[1]
-        outputs = self._model_instance.generate(**inputs, max_new_tokens=self.max_output_tokens, temperature=0.2, top_p=0.95, do_sample=True)
+        outputs = self._model_instance.generate(**inputs, max_new_tokens=self.request_output_cap, temperature=0.2, top_p=0.95, do_sample=True)
         generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, outputs)]
         
         response_text = self._tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -671,7 +672,7 @@ class LocalProvider(BaseProvider):
 
         kwargs = {
             "messages": formatted_messages,
-            "max_tokens": self.max_output_tokens,
+            "max_tokens": self.request_output_cap,
             "temperature": 0.2,
             "top_p": 0.95,
         }

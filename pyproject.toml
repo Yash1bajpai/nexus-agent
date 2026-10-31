@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cloud = ["anthropic>=0.30.0", "openai>=1.35.0", "google-genai>=0.1.0"]
-openai = ["openai>=1.35.0"]
+cloud = ["anthropic>=0.30.0", "openai>=1.55.3", "google-genai>=0.1.0"]
+openai = ["openai>=1.55.3"]
 anthropic = ["anthropic>=0.30.0"]
 gemini = ["google-genai>=0.1.0"]
 dev = [
@@ -30,7 +30,7 @@ dev = [
 ]
 all = [
     "anthropic>=0.30.0",
-    "openai>=1.35.0",
+    "openai>=1.55.3",
     "google-genai>=0.1.0",
     "duckduckgo-search>=6.0.0",
 ]

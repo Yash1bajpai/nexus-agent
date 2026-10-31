@@ -9,6 +9,7 @@ import uuid
 
 class OpenAIProvider(BaseProvider):
     """LLM Provider implementation for OpenAI GPT models and local OpenAI-compatible servers (Ollama/LM Studio)."""
+    _supports_output_budget = True
 
     def __init__(
         self, model: str = "gpt-4o-mini", base_url: Optional[str] = None,
@@ -72,7 +73,7 @@ class OpenAIProvider(BaseProvider):
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": formatted_msgs,
-            self._max_tokens_field: self.max_output_tokens,
+            self._max_tokens_field: self.request_output_cap,
         }
         if converted_tools:
             kwargs["tools"] = converted_tools
@@ -124,7 +125,7 @@ class OpenAIProvider(BaseProvider):
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": formatted_msgs,
-            self._max_tokens_field: self.max_output_tokens,
+            self._max_tokens_field: self.request_output_cap,
             "stream": True,
             "stream_options": {"include_usage": True},
         }

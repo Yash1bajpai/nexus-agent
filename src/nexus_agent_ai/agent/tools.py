@@ -325,9 +325,17 @@ def _find_loose_match(content: str, target: str, *, python: bool = False):
 def _target_not_found_message(path: str, content: str, target: str) -> str:
     """Explain the miss and show the closest real lines so the model can retry accurately."""
     import difflib
+    import json
     msg = (f"ERROR: Target content not found in '{path}'. "
            "Ensure the target matches existing file content exactly, including whitespace and line breaks.")
     lines = content.splitlines()
+    if len(lines) <= 12 and len(content) <= 1200:
+        return (
+            msg + "\nNothing was changed. target must be OLD text already in the file, "
+            "not the requested new text. Copy this exact target (JSON):\n"
+            + json.dumps({"path": path, "target": content}, ensure_ascii=False)
+            + "\nRetry patch_file with this OLD target and put the requested NEW text in replacement."
+        )
     t_lines = target.splitlines() or [target]
     n = max(1, len(t_lines))
     flat_target = "\n".join(t_lines)
@@ -943,11 +951,11 @@ PATCH_FILE_TOOL = Tool(
             },
             "target": {
                 "type": "string",
-                "description": "The exact string or block of code to find and replace. Must match the existing file content exactly.",
+                "description": "OLD text copied from the current file before the change. Never put the desired new text here. On a mismatch, copy the exact target JSON from the error.",
             },
             "replacement": {
                 "type": "string",
-                "description": "The new replacement code or text.",
+                "description": "NEW text to insert in place of the OLD target. Preserve the intended indentation and line breaks.",
             },
             "allow_multiple": {
                 "type": "boolean",

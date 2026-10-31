@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import sys
@@ -227,21 +228,23 @@ def test_python_patch_trailing_whitespace_preserves_literal_and_comment_content(
     assert not p.with_name("buggy.py.bak").exists()
 
 
-def test_not_found_shows_closest_real_text(tmp_path):
-    p = tmp_path / "c.py"
-    p.write_text("def compute_total(items):\n    return sum(items)\n")
-    T.execute_read_file("c.py")
-    res = T.execute_patch_file("c.py", "def compute_totals(items):\n    return sum(items)", "x")
-    assert res.startswith("ERROR: Target content not found")
-    assert "Closest text in the file" in res and "1: def compute_total(items):" in res
-
-
-def test_not_found_without_similar_text_has_no_hint(tmp_path):
-    (tmp_path / "c.txt").write_text("alpha beta gamma")
-    T.execute_read_file("c.txt")
-    res = T.execute_patch_file("c.txt", "zzzzzzzzzzzz qqqqqqqq", "x")
-    assert res.startswith("ERROR: Target content not found")
-    assert "Closest" not in res
+@pytest.mark.parametrize("original,target,replacement", [
+    ("def add(a,b):\n    return a-b\n", "def add(a,b): return a-b", "def add(a,b):\n    return a+b\n"),
+    ("x = 1\n", "x = 2", "x = 2\n"),
+])
+def test_missing_target_can_recover_with_copyable_old_text(tmp_path, original, target, replacement):
+    path = tmp_path / "example.py"
+    path.write_text(original)
+    T.execute_read_file("example.py")
+    failure = T.execute_patch_file("example.py", target, replacement)
+    assert failure.startswith("ERROR:")
+    assert path.read_text() == original
+    candidates = [json.loads(line) for line in failure.splitlines() if line.startswith("{")]
+    recovery = next(item for item in candidates if item.get("path") == "example.py")
+    result = T.execute_patch_file(recovery["path"], recovery["target"], replacement)
+    assert not result.startswith("ERROR:"), result
+    assert path.read_text() == replacement
+    assert path.with_name("example.py.bak").read_text() == original
 
 
 # ---- exit code / unresolved errors -----------------------------------------

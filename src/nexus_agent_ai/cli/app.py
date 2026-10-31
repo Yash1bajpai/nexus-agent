@@ -444,7 +444,7 @@ def repl(
                         display.print_info("This provider does not expose a context budget.")
                     else:
                         display.print_info(
-                            f"Context window: {window} tokens; output reserve: {agent.output_reserve} tokens. "
+                            f"Context window: {window} tokens; configured output ceiling: {agent.output_reserve} tokens. "
                             "Restart with --context-size / --max-output-tokens to change the budgets. Larger local windows use more RAM. "
                             "Old turns are dropped and big items cut automatically when a request would not fit; "
                             "/compact shrinks stored history, /clear clears it (including a persistent session)."

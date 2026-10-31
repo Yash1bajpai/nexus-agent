@@ -90,7 +90,8 @@ def test_environment_over_maximum_is_also_clamped(monkeypatch, field, env_name, 
 ])
 def test_unknown_capacity_is_not_inferred_from_model_prefix(provider, model):
     assert model_capabilities(provider, model) is None
-    assert resolve_limits(provider, model) == ModelLimits(200_000, 16_384)
+    with pytest.warns(UserWarning, match="unverified"):
+        assert resolve_limits(provider, model) == ModelLimits(32_768, 16_384)
     assert resolve_limits(provider, model, 400_000, 80_000) == ModelLimits(400_000, 80_000)
 
 

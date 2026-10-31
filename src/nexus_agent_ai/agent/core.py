@@ -20,8 +20,8 @@ RULES_PROMPT = """RULES:
 2. When creating new files, use write_file. When modifying existing files, always use patch_file
    to replace only the specific targeted code blocks and preserve file integrity.
    Read the file with read_file first; edits to unread or changed files are refused.
-   If patch_file says the target was not found, copy the target exactly from the
-   closest text it shows and retry once.
+   patch_file.target is OLD text already in the file; replacement is the desired NEW text.
+   If the target was not found, copy the exact target JSON from the error and retry once.
 3. When testing calculations or standalone algorithms, use run_code tool.
    When verifying bug fixes, test passes, or regressions, use run_tests tool to execute pytest.
 4. Use list_directory to understand project structure before project-level questions.
@@ -324,15 +324,36 @@ class Agent:
         if not self.context_window:
             return messages
         window = int(self.context_window * scale)
-        reserve = self.output_reserve
+        configured = self.output_reserve
+        reserve = configured
+        active = getattr(self.provider, "active_provider", self.provider)
+        adaptive = _is_local_provider(active) and getattr(active, "_supports_output_budget", False)
+        # Keep a usable reply allowance rather than shrinking all the way to a
+        # single token. Explicit smaller caps remain exact.
+        minimum_output = min(configured, 256)
         overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
-        budget = window - reserve - overhead
-        if budget <= 0:
-            raise context.ContextBudgetError(
-                f"Context window ({window} tokens) cannot fit instructions, tools and answer reserve "
-                f"({overhead + reserve} tokens). Use a larger context window, a smaller output cap, or fewer tools."
-            )
-        fitted, stats = context.fit_messages(messages, budget)
+        while True:
+            budget = window - reserve - overhead
+            try:
+                if budget <= 0:
+                    raise context.ContextBudgetError(
+                        f"Context window ({window} tokens) cannot fit instructions, tools and answer reserve "
+                        f"({overhead + reserve} tokens). Use a larger context window, a smaller output cap, or fewer tools."
+                    )
+                fitted, stats = context.fit_messages(messages, budget)
+                break
+            except context.ContextBudgetError:
+                if not adaptive or reserve <= minimum_output:
+                    raise
+                reserve = max(minimum_output, reserve // 2)
+        if adaptive:
+            active._request_output_cap = reserve
+            self.output_reserve = reserve
+            if reserve < configured:
+                display.print_warn(
+                    f"Local output cap reduced for this request: {configured} -> {reserve} tokens "
+                    "so input plus reserved output fits the context window."
+                )
         self.last_trim = stats
         if stats["dropped_messages"] or stats["truncated_messages"]:
             display.print_warn(
@@ -456,6 +477,10 @@ class Agent:
                         display.print_warn("The model rejected the request as too large. Retrying once with a smaller history.")
                         continue
                     raise
+                finally:
+                    active = getattr(self.provider, "active_provider", self.provider)
+                    if hasattr(active, "_request_output_cap"):
+                        del active._request_output_cap
 
                 self.total_input_tokens += response.input_tokens
                 self.total_output_tokens += response.output_tokens

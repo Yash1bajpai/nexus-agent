@@ -39,6 +39,13 @@ class ProviderResponse:
 
 class BaseProvider(ABC):
     """Abstract base class for all LLM providers."""
+    _supports_output_budget = False
+
+    @property
+    def request_output_cap(self) -> int:
+        """Actual request allowance; the configured max remains a session ceiling."""
+        return getattr(self, "_request_output_cap", self.max_output_tokens)
+
     
     @abstractmethod
     def complete(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:

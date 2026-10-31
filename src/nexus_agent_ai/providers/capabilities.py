@@ -2,8 +2,8 @@
 
 Known-model overrides above a documented maximum emit ``UserWarning`` through
 ``warnings.warn`` and are clamped. Unknown models have no verified maxima:
-``model_capabilities`` returns ``None`` and cloud resolution uses the unverified
-200,000/16,384 fallback, not a claim that the remote endpoint supports it.
+``model_capabilities`` returns ``None`` and cloud resolution warns when using the
+unverified 32,768/16,384 fallback; this is not a verified endpoint capacity.
 """
 
 from dataclasses import dataclass
@@ -52,7 +52,7 @@ _MODEL_LIMITS: dict[tuple[str, str], ModelLimits] = {
     ("anthropic", "claude-3-sonnet-20240229"): ModelLimits(200_000, 4_096),
 }
 
-_CLOUD_FALLBACK = ModelLimits(200_000, 16_384)
+_CLOUD_FALLBACK = ModelLimits(32_768, 16_384)
 _LOCAL_DEFAULTS = ModelLimits(4_096, 2_048)
 
 
@@ -123,6 +123,15 @@ def resolve_limits(
     local = local or provider_name.strip().lower() == "local"
     maxima = None if local else model_capabilities(provider_name, model)
     defaults = _LOCAL_DEFAULTS if local else (maxima or _CLOUD_FALLBACK)
+    if (not local and maxima is None and provider_name.strip().lower() != "fallback"
+            and context_size is None and "NEXUS_CONTEXT_SIZE" not in os.environ):
+        warnings.warn(
+            f"{provider_name}/{model}: model capacity is unverified; using the conservative "
+            f"{defaults.context_size}-token context fallback. Set NEXUS_CONTEXT_SIZE or "
+            "--context-size to the endpoint's documented limit.",
+            UserWarning,
+            stacklevel=2,
+        )
     return ModelLimits(
         context_size=_configured_limit(
             context_size, "context_size", "NEXUS_CONTEXT_SIZE",
