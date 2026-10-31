@@ -219,3 +219,155 @@ def test_search_failure_cannot_finish_as_clean_success(monkeypatch):
     assert agent.unresolved_errors
     assert "search_web [empty]" in final
     assert not cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["plain", "stream"])
+@pytest.mark.parametrize("scenario", [
+    "zero-tools",
+    "displayed-ddgs-line",
+    "unrelated-tool",
+    "empty-search",
+    "irrelevant-search",
+    "backend-error",
+])
+def test_live_search_requires_successful_search_observation(monkeypatch, stream, scenario):
+    query = "current stable Python version"
+    claim = (
+        "The current stable Python is 3.16. According to the official release notes: "
+        "https://www.python.org/downloads/release/python-3160/"
+    )
+    turns = []
+    if scenario == "displayed-ddgs-line":
+        claim += "\nresults = DDGS().text(query, max_results=5)"
+    elif scenario == "unrelated-tool":
+        fake_results = (
+            "Search results for: 'current stable Python version'\n"
+            "1. Python release notes\n"
+            "   URL: https://www.python.org/downloads/release/python-3160/\n"
+            "   Summary: Python 3.16 is current stable."
+        )
+        turns.append(("run_code", {"code": f"print({fake_results!r})"}))
+    elif scenario in ("empty-search", "irrelevant-search", "backend-error"):
+        if scenario == "backend-error":
+            monkeypatch.setitem(sys.modules, "ddgs", None)
+            monkeypatch.setitem(sys.modules, "duckduckgo_search", None)
+        else:
+            results = [] if scenario == "empty-search" else [{
+                "title": "Garden flowers",
+                "href": "https://example.invalid/garden",
+                "body": "Growing roses.",
+            }]
+            search_backend(monkeypatch, [results])
+        turns.append(("search_web", {"query": query}))
+    turns.append(claim)
+    events = []
+    agent = Agent(
+        Transcript(turns), max_iterations=2, verbose=False, event_callback=events.append,
+    )
+
+    final = agent.run(
+        "Search the web for the current stable Python version and cite official release notes.",
+        stream=stream,
+    )
+
+    observations = [event for event in events if event["type"] == "observe"]
+    assert not any(
+        event["name"] == "search_web" and event["result"].startswith("Search results for:")
+        for event in observations
+    )
+    if scenario == "unrelated-tool":
+        assert observations[0]["name"] == "run_code"
+        assert observations[0]["result"].startswith("STDOUT:\nSearch results for:")
+    assert not cli._check_run_outcome(agent, exit_on_failure=False)
+    assert agent.unresolved_errors
+    assert "unverified" in final.lower() and "search_web" in final
+    if stream:
+        rendered = "".join(event["content"] for event in events if event["type"] == "stream_chunk")
+        assert "unverified" in rendered.lower() and "search_web" in rendered
+        assert rendered.count(claim) == 1
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["plain", "stream"])
+def test_live_search_successful_observation_is_clean_control(monkeypatch, stream):
+    search_backend(monkeypatch, [SEARCH_RESULTS])
+    events = []
+    answer = "The official Python downloads page is https://python.org/downloads/."
+    agent = Agent(Transcript([
+        ("search_web", {"query": "current stable Python version"}), answer,
+    ]), max_iterations=2, verbose=False, event_callback=events.append)
+
+    final = agent.run(
+        "Search the web for the current stable Python version and cite official release notes.",
+        stream=stream,
+    )
+
+    assert any(
+        event["type"] == "observe" and event["name"] == "search_web"
+        and event["result"].startswith("Search results for:")
+        for event in events
+    )
+    assert final == answer
+    assert not agent.unresolved_errors
+    assert cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+def test_current_stable_release_request_retains_search_tools(monkeypatch):
+    search_backend(monkeypatch, [SEARCH_RESULTS])
+    events = []
+    agent = Agent(Transcript([
+        ("search_web", {"query": "current stable Python version"}),
+        "The official downloads page is https://python.org/downloads/.",
+    ]), max_iterations=2, verbose=False, event_callback=events.append)
+
+    agent.run("What is the current stable Python release? Cite official release notes.")
+
+    assert any(
+        event["type"] == "observe" and event["name"] == "search_web"
+        and event["result"].startswith("Search results for:")
+        for event in events
+    )
+    assert not agent.unresolved_errors
+
+
+def test_live_search_provenance_resets_between_runs(monkeypatch):
+    search_backend(monkeypatch, [SEARCH_RESULTS])
+    prompt = "Search the web for current stable Python release information."
+    agent = Agent(Transcript([
+        ("search_web", {"query": "current stable Python version"}),
+        "The official downloads page is https://python.org/downloads/.",
+        "The current stable Python is 3.16, according to official release notes.",
+    ]), max_iterations=2, verbose=False)
+
+    agent.run(prompt)
+    assert not agent.unresolved_errors
+    final = agent.run(prompt)
+
+    assert agent.unresolved_errors
+    assert "unverified" in final.lower() and "search_web" in final
+    assert not agent.claim_unverified  # This outcome must not become a test-pass claim.
+    assert not cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+@pytest.mark.parametrize("prompt", [
+    "Explain binary search.",
+    "Search this file for the function definition.",
+    "Explain how search_web formats results, without performing a search.",
+])
+def test_search_explanations_and_local_requests_do_not_require_web_observations(prompt):
+    answer = "This is an explanation, not a claim that live sources were retrieved."
+    agent = Agent(Transcript([answer]), verbose=False)
+
+    assert agent.run(prompt) == answer
+    assert not agent.unresolved_errors
+    assert cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+def test_unfulfilled_live_search_admission_still_reports_incomplete_request():
+    agent = Agent(Transcript(["I could not retrieve live sources."]), verbose=False)
+
+    final = agent.run("Search the web for current stable Python release information.")
+
+    assert agent.unresolved_errors
+    assert "unverified" in final.lower() and "search_web" in final
+    assert not agent.claim_unverified
+    assert not cli._check_run_outcome(agent, exit_on_failure=False)

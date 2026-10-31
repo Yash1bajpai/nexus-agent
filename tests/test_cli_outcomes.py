@@ -68,6 +68,33 @@ def test_unapplied_edit_claim_fails_every_edit_command(prepare, tmp_path, args):
     assert (tmp_path / "calc.py").read_bytes() == original
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_failed_patch_and_unapplied_claim_exit_nonzero(prepare, tmp_path, stream, monkeypatch):
+    original = (tmp_path / "calc.py").read_bytes()
+    instances = []
+    agent_type = cli.Agent
+
+    def capture_agent(*args, **kwargs):
+        agent = agent_type(*args, **kwargs)
+        instances.append(agent)
+        return agent
+
+    monkeypatch.setattr(cli, "Agent", capture_agent)
+    provider = ScriptedProvider([
+        ("read_file", {"path": "calc.py"}),
+        ("patch_file", {"path": "calc.py", "target": "return a - b", "replacement": "return a * b"}),
+    ], text="I fixed the bug.")
+    provider.is_local = True
+    args = ["chat", "fix calc.py", "-p", "local", "--max-iterations", "3"]
+    if not stream:
+        args.append("--no-stream")
+    result = prepare(provider).invoke(cli.app, args)
+    assert result.exit_code == 1, result.output
+    assert (tmp_path / "calc.py").read_bytes() == original
+    assert instances[0].unresolved_errors
+    assert instances[0].claimed_unapplied_edit
+
+
 def test_existing_output_is_not_proof_of_generation(prepare, tmp_path):
     original = (tmp_path / "calc.py").read_bytes()
     result = prepare(ScriptedProvider(text="The file is already correct; no changes are needed.")).invoke(

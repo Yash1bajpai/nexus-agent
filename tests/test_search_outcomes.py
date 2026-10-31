@@ -61,6 +61,9 @@ def backends(monkeypatch):
     "modern,legacy,expected_calls",
     [
         pytest.param(RESULTS, None, ["ddgs"], id="modern-ok-control"),
+        pytest.param(RESULTS, RESULTS, ["ddgs"], id="modern-success-does-not-call-legacy"),
+        pytest.param(RESULTS, [], ["ddgs"], id="modern-success-ignores-legacy-empty"),
+        pytest.param([], RESULTS, ["ddgs", "duckduckgo_search"], id="modern-empty-falls-back-to-legacy"),
         pytest.param(None, RESULTS, ["duckduckgo_search"], id="legacy-import-fallback-control"),
         pytest.param(ValueError("No results found."), RESULTS, ["ddgs", "duckduckgo_search"], id="execution-fallback-control"),
     ],
@@ -73,22 +76,23 @@ def test_success_formatting_and_fallback(backends, modern, legacy, expected_call
 
 
 @pytest.mark.parametrize(
-    "modern,legacy,category,expected_calls",
+    "modern,legacy,category",
     [
-        pytest.param([], RESULTS, "empty", ["ddgs"], id="modern-empty-no-fallback"),
-        pytest.param(IRRELEVANT, RESULTS, "irrelevant", ["ddgs"], id="modern-irrelevant-no-fallback"),
-        pytest.param(None, [], "empty", ["duckduckgo_search"], id="legacy-empty"),
-        pytest.param(None, IRRELEVANT, "irrelevant", ["duckduckgo_search"], id="legacy-irrelevant"),
-        pytest.param(ValueError("No results found."), [], "empty", ["ddgs", "duckduckgo_search"], id="fallback-empty"),
-        pytest.param(ValueError("No results found."), IRRELEVANT, "irrelevant", ["ddgs", "duckduckgo_search"], id="fallback-irrelevant"),
+        pytest.param([], None, "empty", id="modern-empty-legacy-unavailable"),
+        pytest.param([], [], "empty", id="both-backends-empty"),
+        pytest.param(IRRELEVANT, RESULTS, "irrelevant", id="modern-irrelevant-remains-terminal"),
+        pytest.param([], IRRELEVANT, "irrelevant", id="empty-falls-back-to-irrelevant"),
+        pytest.param(None, [], "empty", id="legacy-empty"),
+        pytest.param(None, IRRELEVANT, "irrelevant", id="legacy-irrelevant"),
+        pytest.param(ValueError("No results found."), [], "empty", id="fallback-empty"),
+        pytest.param(ValueError("No results found."), IRRELEVANT, "irrelevant", id="fallback-irrelevant"),
     ],
 )
-def test_empty_and_irrelevant_are_distinct_errors(backends, modern, legacy, category, expected_calls):
-    calls = backends(modern, legacy)
+def test_empty_and_irrelevant_are_distinct_errors(backends, modern, legacy, category):
+    backends(modern, legacy)
     result = execute_tool("search_web", {"query": QUERY})
     assert result.startswith(f"ERROR: search_web [{category}]:")
     assert QUERY in result
-    assert calls == expected_calls
     assert "Search results for:" not in result
     assert "rate-limit" not in result
     assert "network" not in result.lower()
@@ -97,6 +101,24 @@ def test_empty_and_irrelevant_are_distinct_errors(backends, modern, legacy, cate
         assert "underlying cause is unknown" in result
     else:
         assert "did not pass the relevance check" in result
+
+
+@pytest.mark.parametrize("modern,legacy,empty_backend", [
+    pytest.param([], RuntimeError("backend failed"), "ddgs", id="empty-then-execution-error"),
+    pytest.param(ValueError("backend failed"), [], "duckduckgo_search", id="execution-error-then-empty"),
+])
+def test_empty_and_execution_error_preserve_empty_outcome(backends, modern, legacy, empty_backend):
+    calls = backends(modern, legacy)
+
+    result = execute_tool("search_web", {"query": QUERY})
+
+    assert result.startswith("ERROR: search_web [empty]:")
+    assert f"Backend(s) {empty_backend} returned no results" in result
+    exception = modern if isinstance(modern, Exception) else legacy
+    assert type(exception).__name__ in result
+    assert "underlying cause is unknown" in result
+    assert "backend failed" not in result
+    assert calls == ["ddgs", "duckduckgo_search"]
 
 
 @pytest.mark.parametrize(
@@ -179,3 +201,45 @@ def test_search_errors_never_expose_exception_messages(monkeypatch, backends, ca
     assert message not in visible
     for credential in credentials:
         assert credential not in visible
+
+
+def test_search_relevance_requires_subject_not_current_modifier(backends):
+    # These subjects mirror the reported live failure; fixture URLs are synthetic.
+    titles = [
+        "Electric current Wikipedia",
+        "Current Affairs GKToday",
+        "Electric Current definition",
+        "Current banking",
+        "Current Electricity",
+    ]
+    results = [
+        {"title": title, "href": f"https://example.invalid/{index}", "body": ""}
+        for index, title in enumerate(titles)
+    ]
+    calls = backends(results, None)
+
+    result = execute_tool("search_web", {"query": "current stable Python version"})
+
+    assert result.startswith("ERROR: search_web [irrelevant]:")
+    assert "Search results for:" not in result
+    assert calls == ["ddgs"]
+
+
+@pytest.mark.parametrize("query,title", [
+    ("current stable Python version", "Python downloads"),
+    ("what is the current stable Go version", "Go release notes"),
+    ("current stable C++ version", "C++ standards"),
+    ("current electricity", "Electricity explained"),
+    ("current affairs", "Daily affairs briefing"),
+])
+def test_search_relevance_accepts_query_subject(backends, query, title):
+    backends([{
+        "title": title,
+        "href": "https://example.invalid/subject",
+        "body": "",
+    }], None)
+
+    result = execute_tool("search_web", {"query": query})
+
+    assert result.startswith("Search results for:")
+    assert "URL: https://example.invalid/subject" in result

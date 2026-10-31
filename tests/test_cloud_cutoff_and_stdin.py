@@ -33,8 +33,10 @@ def _anthropic(stop_reason, stream, arguments=None):
 
     provider = AnthropicProvider.__new__(AnthropicProvider)
     provider.model = "offline"
+    provider.context_size = 8192
+    provider.max_output_tokens = 3072
     provider._anthropic = NS(RateLimitError=type("RL", (Exception,), {}))
-    provider.client = NS(messages=NS(create=lambda **kw: message, stream=lambda **kw: Stream()))
+    provider.client = NS(messages=NS(stream=lambda **kw: Stream()))
     return _drain(provider.stream([], [], "")) if stream else provider.complete([], [], "")
 
 
@@ -46,6 +48,8 @@ def _gemini(finish_reason, stream, arguments=None, chunks=None):
     response = NS(candidates=[candidate], usage_metadata=usage, text="Writing the file.", prompt_feedback=None)
     provider = GeminiProvider.__new__(GeminiProvider)
     provider.model = "offline"
+    provider.context_size = 8192
+    provider.max_output_tokens = 3072
     provider._types = NS(GenerateContentConfig=lambda **kw: NS(**kw))
     provider._format_messages = lambda messages: []
     provider._convert_tools = lambda tools: []

@@ -99,7 +99,9 @@ def test_anthropic_complete_and_stream():
     mock_resp.content = [mock_block_text, mock_block_tool]
     mock_resp.usage.input_tokens = 15
     mock_resp.usage.output_tokens = 25
-    prov.client.messages.create.return_value = mock_resp
+    mock_stream = prov.client.messages.stream.return_value.__enter__.return_value
+    mock_stream.text_stream = iter(["Here is the result."])
+    mock_stream.get_final_message.return_value = mock_resp
 
     res = prov.complete([{"role": "user", "content": "hi"}], [sample_tool], "system")
     assert res.text == "Here is the result."

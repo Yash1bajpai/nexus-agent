@@ -1,5 +1,8 @@
 from typing import Any, Dict, List, Optional
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
+from .capabilities import resolve_limits
 from ..utils.config import get_env_or_raise
 from .messages import assistant_message, decode_native_tool_call, extract_json_tool_calls, openai_messages, tool_result
 import uuid
@@ -7,7 +10,11 @@ import uuid
 class OpenAIProvider(BaseProvider):
     """LLM Provider implementation for OpenAI GPT models and local OpenAI-compatible servers (Ollama/LM Studio)."""
 
-    def __init__(self, model: str = "gpt-4o-mini", base_url: Optional[str] = None, api_key: Optional[str] = None):
+    def __init__(
+        self, model: str = "gpt-4o-mini", base_url: Optional[str] = None,
+        api_key: Optional[str] = None, context_size: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+    ):
         try:
             import openai
         except ImportError as e:
@@ -15,6 +22,20 @@ class OpenAIProvider(BaseProvider):
         self._openai = openai
         import os
         base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        hostname = urlsplit(base_url).hostname if base_url else "api.openai.com"
+        self.is_local = hostname == "localhost" or bool(hostname and hostname.endswith(".localhost"))
+        if hostname and not self.is_local:
+            try:
+                self.is_local = ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+        limits = resolve_limits("openai", model, context_size, max_output_tokens, local=self.is_local)
+        self.context_size = limits.context_size
+        self.max_output_tokens = limits.max_output_tokens
+        # OpenAI Chat Completions supports the replacement on gpt-4o-mini too:
+        # https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+        # Other compatible servers may implement only the original max_tokens.
+        self._max_tokens_field = "max_completion_tokens" if hostname == "api.openai.com" else "max_tokens"
         if api_key:
             pass  # use the provided key directly
         elif base_url:
@@ -51,6 +72,7 @@ class OpenAIProvider(BaseProvider):
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": formatted_msgs,
+            self._max_tokens_field: self.max_output_tokens,
         }
         if converted_tools:
             kwargs["tools"] = converted_tools
@@ -102,6 +124,7 @@ class OpenAIProvider(BaseProvider):
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": formatted_msgs,
+            self._max_tokens_field: self.max_output_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }

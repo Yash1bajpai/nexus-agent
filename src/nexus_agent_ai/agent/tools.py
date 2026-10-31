@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import tempfile
 import subprocess
 import ast
@@ -262,15 +263,52 @@ def execute_write_file(path: str, content: str) -> str:
     except Exception as e:
         return f"ERROR: Could not write file: {str(e)}"
 
-def _find_loose_match(content: str, target: str):
-    """Find a unique span equal to target when trailing whitespace is ignored. Returns (start, end) or None."""
-    target_lines = [ln.rstrip() for ln in target.replace("\r\n", "\n").split("\n")]
-    while target_lines and target_lines[-1] == "":
-        target_lines.pop()
-    if not target_lines or not any(target_lines):
+def _python_line_signatures(text: str):
+    """Ignore horizontal token gaps, never indentation or literal/comment content."""
+    import io
+    import tokenize
+
+    lines = io.StringIO(text).readlines()
+    signatures = []
+    for line in lines:
+        indentation = line[:len(line) - len(line.lstrip(" \t\f"))]
+        continuation = line.rstrip("\r\n").rstrip(" \t").endswith("\\")
+        signatures.append((indentation, continuation, []))
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type in (tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
+                continue
+            if token.type == tokenize.ERRORTOKEN:
+                return None
+            spelling = "\n" if token.type in (tokenize.NL, tokenize.NEWLINE) else token.string
+            first, last = token.start[0], token.end[0]
+            # Mark every occupied line, so a fragment inside a multiline string
+            # cannot masquerade as standalone Python code.
+            for row in range(first, last + 1):
+                if row <= len(signatures):
+                    signatures[row - 1][2].append((token.type, spelling, row - first, last - first))
+    except (tokenize.TokenError, SyntaxError):
         return None
-    content_lines = content.splitlines(keepends=True)
-    stripped = [ln.rstrip("\r\n").rstrip() for ln in content_lines]
+    return signatures
+
+
+def _find_loose_match(content: str, target: str, *, python: bool = False):
+    """Find one complete-line span with only safe whitespace differences."""
+    if not target.strip():
+        return None
+    if python:
+        import io
+        content_lines = io.StringIO(content).readlines()
+        target_lines = _python_line_signatures(target)
+        stripped = _python_line_signatures(content)
+        if target_lines is None or stripped is None:
+            return None
+    else:
+        target_lines = [ln.rstrip() for ln in target.replace("\r\n", "\n").split("\n")]
+        while target_lines and target_lines[-1] == "":
+            target_lines.pop()
+        content_lines = content.splitlines(keepends=True)
+        stripped = [ln.rstrip("\r\n").rstrip() for ln in content_lines]
     n = len(target_lines)
     hits = [i for i in range(len(stripped) - n + 1) if stripped[i:i + n] == target_lines]
     if len(hits) != 1:
@@ -344,11 +382,13 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
 
         count = content.count(target)
         if count == 0:
-            loose = _find_loose_match(content, target)
+            is_python = p.suffix.lower() == ".py"
+            loose = _find_loose_match(content, target, python=is_python)
             if loose is not None:
                 start, end = loose
                 new_content = content[:start] + replacement + content[end:]
-                note = " Target matched after ignoring trailing whitespace."
+                note = (" Target matched after ignoring token-equivalent horizontal/trailing whitespace."
+                        if is_python else " Target matched after ignoring trailing whitespace.")
                 count = 1
             else:
                 return _target_not_found_message(path, content, target)
@@ -617,29 +657,38 @@ def execute_run_code(code: str, language: str = "python") -> str:
 def execute_search_web(query: str) -> str:
     """Return formatted results (ok), or an ERROR with a stable search category.
 
-    Empty and irrelevant responses are final outcomes, not backend exceptions.
-    backend_error means imports failed or only one backend could execute and failed;
-    both_failed means both backends raised during execution.
+    Empty responses try the remaining backend; irrelevant responses are final.
+    If retrieval never succeeds, an observed empty response remains an empty
+    outcome even if the other backend failed. both_failed requires two execution
+    exceptions; backend_error covers failures without any empty response.
     """
 
     def _is_relevant(results: list, query: str) -> bool:
-        """Check if DuckDuckGo results are actually relevant to the query."""
+        """Require subject overlap, not just generic freshness/release wording."""
         if not results:
             return False
-        query_keywords = set(w.lower() for w in query.split() if len(w) > 3)
-        if not query_keywords:
+        query_keywords = set(re.findall(r"\w+(?:\+\+|#)?", query.lower()))
+        modifiers = {
+            "a", "an", "and", "about", "current", "documentation", "docs", "download", "downloads",
+            "find", "for", "from", "in", "is", "latest", "notes", "of", "official", "on", "please",
+            "release", "releases", "search", "stable", "that", "the", "this", "to", "version", "versions",
+            "web", "what", "when", "where", "which", "with",
+        }
+        subjects = query_keywords - modifiers
+        keywords = subjects or query_keywords
+        if not keywords:
             return True
-        hits = 0
-        for r in results[:3]:
-            combined = (r.get("title", "") + " " + r.get("body", "") + " " + r.get("href", "")).lower()
-            if any(kw in combined for kw in query_keywords):
-                hits += 1
-        return hits >= 1
+        for result in results[:3]:
+            combined = " ".join(result.get(key, "") for key in ("title", "body", "href"))
+            if keywords.intersection(re.findall(r"\w+(?:\+\+|#)?", combined.lower())):
+                return True
+        return False
 
     from importlib import import_module
 
     failures = []
     execution_failures = []
+    empty_backends = []
     for backend in ("ddgs", "duckduckgo_search"):
         try:
             DDGS = import_module(backend).DDGS
@@ -650,10 +699,8 @@ def execute_search_web(query: str) -> str:
         try:
             results = DDGS().text(query, max_results=5)
             if not results:
-                return (
-                    f"ERROR: search_web [empty]: The {backend} backend returned no results "
-                    f"for query: '{query}'. The underlying cause is unknown."
-                )
+                empty_backends.append(backend)
+                continue
             if not _is_relevant(results, query):
                 return (
                     f"ERROR: search_web [irrelevant]: Results from {backend} did not pass "
@@ -671,6 +718,13 @@ def execute_search_web(query: str) -> str:
             execution_failures.append(backend)
             # Exception messages may contain credential-bearing URLs or tokens.
             failures.append(f"{backend}: execution failed ({type(exc).__name__})")
+
+    if empty_backends:
+        details = (" " + "; ".join(failures) + ".") if failures else ""
+        return (
+            f"ERROR: search_web [empty]: Backend(s) {', '.join(empty_backends)} returned no results "
+            f"for query: '{query}'." + details + " The underlying cause is unknown."
+        )
 
     category = "both_failed" if len(execution_failures) == 2 else "backend_error"
     return (

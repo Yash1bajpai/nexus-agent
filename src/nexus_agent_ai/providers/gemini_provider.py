@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 # pyrefly: ignore [missing-import]
 from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
+from .capabilities import resolve_limits
 # pyrefly: ignore [missing-import]
 from ..utils.config import get_env_or_raise
 from .messages import assistant_message, decode_native_tool_call, gemini_messages, tool_result
@@ -19,7 +20,13 @@ def _finish_reason(raw: Any) -> Optional[str]:
 class GeminiProvider(BaseProvider):
     """LLM Provider implementation for Google Gemini models via google-genai SDK."""
 
-    def __init__(self, model: str = "gemini-2.5-flash-lite"):
+    def __init__(
+        self, model: str = "gemini-2.5-flash-lite", context_size: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+    ):
+        limits = resolve_limits("gemini", model, context_size, max_output_tokens)
+        self.context_size = limits.context_size
+        self.max_output_tokens = limits.max_output_tokens
         try:
             from google import genai
             from google.genai import types
@@ -54,6 +61,7 @@ class GeminiProvider(BaseProvider):
         config = self._types.GenerateContentConfig(
             system_instruction=system if system else None,
             tools=genai_tools if genai_tools else None,
+            max_output_tokens=self.max_output_tokens,
         )
 
         gemini_contents = self._format_messages(messages)
@@ -127,6 +135,7 @@ class GeminiProvider(BaseProvider):
         config = self._types.GenerateContentConfig(
             system_instruction=system if system else None,
             tools=genai_tools if genai_tools else None,
+            max_output_tokens=self.max_output_tokens,
         )
         gemini_contents = self._format_messages(messages)
         try:

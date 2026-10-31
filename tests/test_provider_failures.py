@@ -20,13 +20,14 @@ def wire_call(arguments="", name="write_file", call_id="native_1"):
     return {"id": call_id, "function": {"name": name, "arguments": arguments}}
 
 
-def native_response(monkeypatch, backend, calls, finish_reason="tool_calls", received=None, content=""):
+def native_response(monkeypatch, backend, calls, finish_reason="tool_calls", received=None, content="", max_output_tokens=3072):
     """Use fake libraries/SSE bytes, never a model or network connection."""
     if backend == "llama_cpp":
         response = {"choices": [{"message": {"content": content, "tool_calls": calls},
                                  "finish_reason": finish_reason}],
                     "usage": {"prompt_tokens": 7, "completion_tokens": 5}}
         provider = LocalProvider.__new__(LocalProvider)
+        provider.max_output_tokens = max_output_tokens
         provider._llama = NS(create_chat_completion=lambda **kwargs: response)
         return provider._run_llama_cpp([], [], "")
 
@@ -56,12 +57,16 @@ def native_response(monkeypatch, backend, calls, finish_reason="tool_calls", rec
         transcript += "data: [DONE]\n\n"
         monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: io.BytesIO(transcript.encode()))
         provider = LocalProvider.__new__(LocalProvider)
+        provider.max_output_tokens = max_output_tokens
         provider._server_alias = "offline-test"
         provider._server_port = 1
         stream = provider._stream_via_server([], [], "")
     else:
         provider = OpenAIProvider.__new__(OpenAIProvider)
         provider.model = "offline-test"
+        provider.context_size = 8192
+        provider.max_output_tokens = max_output_tokens
+        provider._max_tokens_field = "max_completion_tokens"
         provider._openai = NS(RateLimitError=type("SDKRateLimit", (Exception,), {}))
         if backend == "openai_complete":
             native_calls = [NS(id=c["id"], function=NS(**c["function"])) for c in calls]
@@ -151,13 +156,15 @@ def test_native_finish_reason_reaches_response(monkeypatch, backend, reason):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("max_output_tokens", [37, 3072])
 @pytest.mark.parametrize("arguments,name", [
     ('{"content":"unfinished', "write_file"), ("{}", ""), ("null", "write_file"),
     ([1], "write_file"), ("{}", 1), (None, None),
 ])
-def test_length_preserves_status_without_decoding_native_calls(monkeypatch, backend, arguments, name):
+def test_length_preserves_status_without_decoding_native_calls(monkeypatch, backend, arguments, name, max_output_tokens):
     response = native_response(
-        monkeypatch, backend, [wire_call(arguments, name=name)], finish_reason="length",
+        monkeypatch, backend, [wire_call('{}', call_id="valid_first"), wire_call(arguments, name=name)],
+        finish_reason="length", max_output_tokens=max_output_tokens,
     )
     assert response.finish_reason == "length"
     assert response.tool_calls == []
@@ -183,15 +190,18 @@ def object_native_response(backend, arguments=None, function_call=None):
     if backend.startswith("anthropic"):
         provider = AnthropicProvider.__new__(AnthropicProvider)
         provider.model = "offline-test"
+        provider.context_size = 8192
+        provider.max_output_tokens = 3072
         provider._anthropic = NS(RateLimitError=type("SDKRateLimit", (Exception,), {}))
         message = NS(content=[NS(type="tool_use", id="native_1", name="write_file", input=arguments)],
                      usage=NS(input_tokens=7, output_tokens=5))
         stream = NS(text_stream=iter(()), get_final_message=lambda: message)
-        provider.client = NS(messages=NS(create=lambda **kwargs: message,
-                                         stream=lambda **kwargs: nullcontext(stream)))
+        provider.client = NS(messages=NS(stream=lambda **kwargs: nullcontext(stream)))
     else:
         provider = GeminiProvider.__new__(GeminiProvider)
         provider.model = "offline-test"
+        provider.context_size = 8192
+        provider.max_output_tokens = 3072
         provider._types = NS(GenerateContentConfig=lambda **kwargs: NS(**kwargs))
         if function_call is None:
             function_call = NS(id="native_1", name="write_file", args=arguments)

@@ -137,9 +137,22 @@ def _wants_edit(user_input: str) -> bool:
     return bool(_EDIT_INTENT.search(text))
 
 
+_LIVE_SEARCH_REQUEST = re.compile(
+    r"\b(?:search|browse)\s+(?:the\s+)?(?:web|internet)\b|"
+    r"\b(?:search|browse|look\s+up|find)\b[^.!?\n]*\b"
+    r"(?:online|official\s+(?:sources?|docs?|documentation|release\s+notes)|"
+    r"live\s+(?:sources?|results?))\b|"
+    r"^\s*(?:please\s+)?(?:use\s+)?search_web\b|"
+    r"\b(?:current|latest)\s+(?:stable\s+)?(?:[\w.+-]+\s+){0,3}(?:version|release)\b",
+    re.IGNORECASE,
+)
+
+
 def _query_needs_tools(user_input: str) -> bool:
     """Determine if a query likely needs tool access (file ops, code, git, etc.)."""
     q = user_input.lower().strip()
+    if _LIVE_SEARCH_REQUEST.search(q):
+        return True
     for pattern in _TOOL_PATTERNS:
         if re.search(pattern, q, re.IGNORECASE):
             return True
@@ -251,9 +264,7 @@ class Agent:
         self.event_callback = event_callback
         self.total_input_tokens = 0
         self.total_output_tokens = 0
-        # Only local llama providers expose a fixed window we can budget against.
-        window = getattr(provider, "context_size", None)
-        self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+        self._sync_context_window()
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
         self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
@@ -294,6 +305,8 @@ class Agent:
         active = provider if provider is not None else getattr(self.provider, "active_provider", self.provider)
         window = getattr(active, "context_size", None)
         self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+        output = getattr(active, "max_output_tokens", None)
+        self.output_reserve = output if isinstance(output, int) and not isinstance(output, bool) and output > 0 else 0
 
     def _nudge(self, text: str):
         self.memory.add_raw({"role": "user", "content": text, "metadata": {"internal": True}})
@@ -311,13 +324,13 @@ class Agent:
         if not self.context_window:
             return messages
         window = int(self.context_window * scale)
-        reserve = min(1024, max(256, window // 4))  # room for the answer
+        reserve = self.output_reserve
         overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
         budget = window - reserve - overhead
         if budget <= 0:
             raise context.ContextBudgetError(
                 f"Context window ({window} tokens) cannot fit instructions, tools and answer reserve "
-                f"({overhead + reserve} tokens). Use a larger context window or fewer tools."
+                f"({overhead + reserve} tokens). Use a larger context window, a smaller output cap, or fewer tools."
             )
         fitted, stats = context.fit_messages(messages, budget)
         self.last_trim = stats
@@ -329,8 +342,10 @@ class Agent:
         return fitted
 
     def context_used(self) -> int:
-        """Estimated tokens the next request would use (history + instructions)."""
-        return context.history_tokens(self.memory.get()) + context.estimate_tokens(self.system) + context.tools_tokens(self.tools)
+        """Estimated context allocation, including the configured generation reserve."""
+        self._sync_context_window()
+        return (context.history_tokens(self.memory.get()) + context.estimate_tokens(self.system)
+                + context.tools_tokens(self.tools) + self.output_reserve)
 
     def compact(self, keep_turns: int = 2):
         """Shrink stored history; returns (before_tokens, after_tokens, info)."""
@@ -343,6 +358,7 @@ class Agent:
     def run(self, user_input: str, stream: bool = False, require_edit: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
         routing_input = _routing_request(user_input, self.memory.get())
+        requires_search = bool(_LIVE_SEARCH_REQUEST.search(routing_input))
         wants_edit = require_edit or (
             any(tool.name in _WRITE_TOOLS for tool in self.tools) and _wants_edit(routing_input)
         )
@@ -375,6 +391,7 @@ class Agent:
         window_scale = 1.0
         wrote_ok = False
         tool_executed = False
+        search_succeeded = False
         offered_tools = list(use_tools)  # use_tools is emptied by the anti-loop stop; keep what was offered
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
@@ -512,6 +529,8 @@ class Agent:
                             before_edit = _file_state(edit_path) if edit_path is not None else None
                             tool_executed = True
                             result = execute_tool(tool_call.name, tool_call.args)
+                            if tool_call.name == "search_web" and str(result).startswith("Search results for:"):
+                                search_succeeded = True
                             changed = (edit_path is not None and before_edit is not None
                                        and (after_edit := _file_state(edit_path)) is not None
                                        and after_edit != before_edit
@@ -625,6 +644,11 @@ class Agent:
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
                         continue
+                    if requires_search and not search_succeeded:
+                        unresolved["live_search"] = (
+                            "Unverified web grounding: no successful search_web result was retrieved in this turn. "
+                            "The live-search request is not complete; any current-source claims above are unverified."
+                        )
                     self.unresolved_errors = list(unresolved.values())
                     if not wrote_ok and wants_edit and not _NO_CHANGE_OK.search(final_text or ""):
                         final_text += ("\n\nWarning: no file was changed. No file tool actually changed file contents "

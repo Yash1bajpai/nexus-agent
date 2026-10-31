@@ -88,6 +88,8 @@ def test_gemini_blocked_response_reports_failure_instead_of_empty_success(stream
     response = NS(candidates=None, prompt_feedback=NS(block_reason="SAFETY"))
     provider = GeminiProvider.__new__(GeminiProvider)
     provider.model, provider._types = "offline-test", types
+    provider.context_size = 8192
+    provider.max_output_tokens = 3072
     provider.client = NS(models=NS(
         generate_content=lambda **kw: response,
         generate_content_stream=lambda **kw: iter([response]),

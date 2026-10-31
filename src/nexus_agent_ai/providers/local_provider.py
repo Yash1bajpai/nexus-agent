@@ -9,6 +9,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from .base import BaseProvider, ProviderResponse, Tool
+from .capabilities import resolve_limits
 from .messages import assistant_message, decode_native_tool_call, extract_json_tool_calls, openai_messages, tool_result
 
 # llama-server binary URLs per platform (llama.cpp b7075 release)
@@ -157,7 +158,7 @@ class LocalProvider(BaseProvider):
     is_local = True
 
 
-    def __init__(self, model_id: str = None, filename: str = None, context_size: Optional[int] = None):
+    def __init__(self, model_id: str = None, filename: str = None, context_size: Optional[int] = None, max_output_tokens: Optional[int] = None):
         """Create a local provider for any HuggingFace GGUF repo.
 
         Priority: explicit args > NEXUS_AGENT_MODEL_REPO / NEXUS_AGENT_MODEL_FILENAME
@@ -165,13 +166,9 @@ class LocalProvider(BaseProvider):
         """
         self.model_id = model_id or os.getenv("NEXUS_AGENT_MODEL_REPO", _DEFAULT_REPO)
         self._explicit_context_size = context_size is not None
-        raw_context = context_size if context_size is not None else os.getenv("NEXUS_CONTEXT_SIZE", "4096")
-        try:
-            self.context_size = int(raw_context)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Context size must be an integer of at least 512 tokens") from exc
-        if isinstance(raw_context, bool) or (isinstance(raw_context, float) and raw_context != self.context_size) or self.context_size < 512:
-            raise ValueError("Context size must be an integer of at least 512 tokens")
+        limits = resolve_limits("local", self.model_id, context_size, max_output_tokens, local=True)
+        self.context_size = limits.context_size
+        self.max_output_tokens = limits.max_output_tokens
         self.model = self.model_id
         self.filename = filename or os.getenv("NEXUS_AGENT_MODEL_FILENAME", _DEFAULT_FILENAME)
         self._tokenizer = None
@@ -476,7 +473,7 @@ class LocalProvider(BaseProvider):
             "messages": formatted_messages,
             "temperature": 0.2,
             "top_p": 0.95,
-            "max_tokens": 2048,
+            "max_tokens": self.max_output_tokens,
             "stream": True,
             # Ask the server to include real token counts in the final chunk
             "stream_options": {"include_usage": True},
@@ -629,7 +626,10 @@ class LocalProvider(BaseProvider):
                                 target_model = m
                                 break
                         from .openai_provider import OpenAIProvider
-                        ollama_prov = OpenAIProvider(model=target_model, base_url="http://localhost:11434/v1")
+                        ollama_prov = OpenAIProvider(
+                            model=target_model, base_url="http://localhost:11434/v1",
+                            context_size=self.context_size, max_output_tokens=self.max_output_tokens,
+                        )
                         return ollama_prov.complete(messages, tools, system)
             except Exception:
                 pass
@@ -652,7 +652,7 @@ class LocalProvider(BaseProvider):
         )
         inputs = self._tokenizer([prompt], return_tensors="pt").to(self._model_instance.device)
         input_tokens = inputs.input_ids.shape[1]
-        outputs = self._model_instance.generate(**inputs, max_new_tokens=2048, temperature=0.2, top_p=0.95, do_sample=True)
+        outputs = self._model_instance.generate(**inputs, max_new_tokens=self.max_output_tokens, temperature=0.2, top_p=0.95, do_sample=True)
         generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, outputs)]
         
         response_text = self._tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -671,7 +671,7 @@ class LocalProvider(BaseProvider):
 
         kwargs = {
             "messages": formatted_messages,
-            "max_tokens": 2048,
+            "max_tokens": self.max_output_tokens,
             "temperature": 0.2,
             "top_p": 0.95,
         }

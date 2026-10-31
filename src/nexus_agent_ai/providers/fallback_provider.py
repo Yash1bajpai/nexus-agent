@@ -1,15 +1,16 @@
 import time
 from typing import Any, Dict, List, Optional
 from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
+from .capabilities import resolve_limits
 from ..utils.config import ConfigError
 from .messages import normalize_messages, tool_result
 
 # Lazy imports — only load a provider SDK if we actually try to use it
-def _make_gemini():
+def _make_gemini(**limits):
     from .gemini_provider import GeminiProvider
-    return GeminiProvider()
+    return GeminiProvider(**limits)
 
-def _make_openrouter():
+def _make_openrouter(**limits):
     """OpenRouter free tier — env-configurable model with sensible default."""
     import os
     from .openai_provider import OpenAIProvider
@@ -21,19 +22,20 @@ def _make_openrouter():
         model=model,
         base_url="https://openrouter.ai/api/v1",
         api_key=or_key,
+        **limits,
     )
 
-def _make_anthropic():
+def _make_anthropic(**limits):
     from .anthropic_provider import AnthropicProvider
-    return AnthropicProvider()
+    return AnthropicProvider(**limits)
 
-def _make_openai():
+def _make_openai(**limits):
     from .openai_provider import OpenAIProvider
-    return OpenAIProvider()
+    return OpenAIProvider(**limits)
 
-def _make_local():
+def _make_local(**limits):
     from .local_provider import LocalProvider
-    return LocalProvider()
+    return LocalProvider(**limits)
 
 FALLBACK_CHAIN = [
     ("gemini",      _make_gemini),
@@ -50,7 +52,18 @@ class FallbackProvider(BaseProvider):
     switches to the next provider and logs a warning.
     """
 
-    def __init__(self, start_provider: str = "gemini"):
+    def __init__(
+        self, start_provider: str = "gemini", context_size: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+    ):
+        # Fail invalid explicit/environment configuration before missing providers
+        # can swallow the error. Resolve actual per-model defaults in each factory.
+        resolve_limits("fallback", "", context_size, max_output_tokens)
+        self._limit_overrides = {}
+        if context_size is not None:
+            self._limit_overrides["context_size"] = context_size
+        if max_output_tokens is not None:
+            self._limit_overrides["max_output_tokens"] = max_output_tokens
         self._start = start_provider.lower()
         self._current_name: Optional[str] = None
         self._current_provider: Optional[BaseProvider] = None
@@ -74,7 +87,7 @@ class FallbackProvider(BaseProvider):
         failures = []
         for name, factory in self._chain:
             try:
-                provider = factory()
+                provider = factory(**self._limit_overrides)
                 self._current_name = name
                 self._current_provider = provider
                 return
@@ -108,6 +121,10 @@ class FallbackProvider(BaseProvider):
         return getattr(self._current_provider, "context_size", None)
 
     @property
+    def max_output_tokens(self):
+        return getattr(self._current_provider, "max_output_tokens", None)
+
+    @property
     def model_id(self):
         return getattr(self._current_provider, "model_id", self.model)
 
@@ -130,7 +147,7 @@ class FallbackProvider(BaseProvider):
             for name, factory in self._chain:
                 if name == self._start:
                     try:
-                        primary_prov = factory()
+                        primary_prov = factory(**self._limit_overrides)
                         old_name = self._current_name
                         self._activate(name, primary_prov)
                         self._fallback_time = None
@@ -155,7 +172,7 @@ class FallbackProvider(BaseProvider):
 
         for name, factory in self._chain[current_idx + 1:]:
             try:
-                provider = factory()
+                provider = factory(**self._limit_overrides)
                 self._activate(name, provider)
                 if self._warn_fn:
                     try:

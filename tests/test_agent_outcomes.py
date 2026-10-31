@@ -196,8 +196,10 @@ def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch):
 
     primary = Scripted([RateLimitError("primary"), "recovered"])
     primary.context_size = 8192
+    primary.max_output_tokens = 2048
     local = Scripted(["local answer"], local=True)
     local.context_size = 2048
+    local.max_output_tokens = 512
     monkeypatch.setattr(fallback_provider, "FALLBACK_CHAIN", [
         ("primary", lambda: primary), ("local", lambda: local),
     ])
@@ -211,6 +213,7 @@ def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch):
     agent.system = "Short test instructions."
     assert agent.run("explain this") == "local answer"
     assert agent.context_window == 2048
+    assert agent.output_reserve == provider.max_output_tokens == 512
     assert context.history_tokens(local.seen[0]) <= 2048 - 512 - context.estimate_tokens(agent.system)
     assert len(primary.seen[0]) > len(local.seen[0])
     assert provider.before_request is None
@@ -218,5 +221,6 @@ def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch):
     provider._recovery_cooldown = 0
     assert agent.run("continue") == "recovered"
     assert agent.context_window == 8192
+    assert agent.output_reserve == provider.max_output_tokens == 2048
     assert len(primary.seen[1]) > len(local.seen[0])
     assert provider.before_request is None

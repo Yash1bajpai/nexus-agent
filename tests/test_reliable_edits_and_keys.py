@@ -85,6 +85,148 @@ def test_trailing_whitespace_difference_is_tolerated(tmp_path):
     assert "return 2" in p.read_text()
 
 
+@pytest.mark.parametrize(("original", "target", "replacement", "expected"), [
+    pytest.param(
+        "def add(a,b):\n    return a-b\n",
+        "def add(a, b):\n    return a - b",
+        "def add(a, b):\n    return a + b",
+        "def add(a, b):\n    return a + b\n",
+        id="whole-function",
+    ),
+    pytest.param(
+        "def add(a,b):\n    return a-b\n",
+        "    return a - b",
+        "    return a + b",
+        "def add(a,b):\n    return a + b\n",
+        id="indented-statement",
+    ),
+    pytest.param(
+        "def add(a,b):\r\n    return a-b\r\n",
+        "def add(a, b):\n    return a - b",
+        "def add(a, b):\n    return a + b",
+        "def add(a, b):\r\n    return a + b\r\n",
+        id="crlf-function",
+    ),
+])
+def test_python_patch_tolerates_token_equivalent_horizontal_spacing(
+    tmp_path, original, target, replacement, expected
+):
+    p = tmp_path / "buggy.py"
+    p.write_bytes(original.encode("utf-8"))
+    T.execute_read_file("buggy.py")
+
+    result = T.execute_patch_file("buggy.py", target, replacement)
+
+    assert not result.startswith("ERROR:"), result
+    assert p.read_bytes() == expected.encode("utf-8")
+    assert p.with_name("buggy.py.bak").read_bytes() == original.encode("utf-8")
+
+
+@pytest.mark.parametrize(("original", "target"), [
+    pytest.param(
+        "def add(a,b):\n    return a-b\n",
+        "def add(a, b):\n    return a * b",
+        id="different-operator",
+    ),
+    pytest.param(
+        "def add(a,b):\n    return a-b\n",
+        "def subtract(a, b):\n    return a - b",
+        id="different-function-name",
+    ),
+    pytest.param(
+        'value = "a b"\n',
+        'value= "ab"',
+        id="string-whitespace",
+    ),
+    pytest.param(
+        "value=1  # keep  spacing\n",
+        "value = 1  # keep spacing",
+        id="comment-whitespace",
+    ),
+    pytest.param(
+        "def add(a,b):\n    return a-b\n",
+        "def add(a, b):\n        return a - b",
+        id="different-indentation-width",
+    ),
+    pytest.param(
+        "def add(a,b):\n    return a-b\n",
+        "def add(a, b):\n\treturn a - b",
+        id="tab-indentation",
+    ),
+    pytest.param(
+        "def add(a,b):\n    return a-b\n",
+        "def add(a, b): return a - b",
+        id="different-line-structure",
+    ),
+    pytest.param(
+        'text = """example:\n    return a-b\n"""\n',
+        "    return a - b",
+        id="code-looking-multiline-string",
+    ),
+    pytest.param(
+        "# return a-b\n",
+        "return a - b",
+        id="code-looking-comment",
+    ),
+])
+def test_python_patch_spacing_never_changes_semantically_different_target(tmp_path, original, target):
+    p = tmp_path / "buggy.py"
+    p.write_text(original, encoding="utf-8")
+    T.execute_read_file("buggy.py")
+
+    replacement = target.replace("a - b", "a + b")
+    result = T.execute_patch_file("buggy.py", target, replacement)
+
+    assert result.startswith("ERROR:"), result
+    assert p.read_text(encoding="utf-8") == original
+    assert not p.with_name("buggy.py.bak").exists()
+
+
+@pytest.mark.parametrize("allow_multiple", [False, True])
+def test_python_patch_spacing_requires_unique_target(tmp_path, allow_multiple):
+    p = tmp_path / "buggy.py"
+    original = "def add(a,b):\n    return a-b\n\ndef subtract(a,b):\n    return a -b\n"
+    p.write_text(original, encoding="utf-8")
+    T.execute_read_file("buggy.py")
+
+    result = T.execute_patch_file(
+        "buggy.py", "    return a - b", "    return a + b", allow_multiple=allow_multiple
+    )
+
+    assert result.startswith("ERROR:"), result
+    assert p.read_text(encoding="utf-8") == original
+    assert not p.with_name("buggy.py.bak").exists()
+
+
+@pytest.mark.parametrize(("original", "target"), [
+    pytest.param(
+        'value = """left  \nright"""\n',
+        'value = """left\nright"""',
+        id="complete-literal",
+    ),
+    pytest.param(
+        'value = """first\nmiddle  \nlast"""\n',
+        "middle\n",
+        id="inside-literal",
+    ),
+    pytest.param(
+        "value = 1  # keep  \n",
+        "value = 1  # keep \n",
+        id="comment-trailing-whitespace",
+    ),
+])
+def test_python_patch_trailing_whitespace_preserves_literal_and_comment_content(tmp_path, original, target):
+    p = tmp_path / "buggy.py"
+    p.write_text(original, encoding="utf-8")
+    T.execute_read_file("buggy.py")
+
+    result = T.execute_patch_file("buggy.py", target, 'value = "changed"')
+
+    assert result.startswith("ERROR:"), result
+    assert p.read_text(encoding="utf-8") == original
+    assert not p.with_name("buggy.py.bak").exists()
+
+
 def test_not_found_shows_closest_real_text(tmp_path):
     p = tmp_path / "c.py"
     p.write_text("def compute_total(items):\n    return sum(items)\n")
