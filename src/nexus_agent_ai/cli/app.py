@@ -66,7 +66,7 @@ def _check_run_outcome(agent: Agent, *, exit_on_failure: bool = True) -> bool:
     elif getattr(agent, "requirements_incomplete", None):
         error = (
             "Request incomplete: " + " ".join(agent.requirements_incomplete)
-            + " Any partial edits remain in place; requested function names are not all confirmed."
+            + " Any partial edits remain in place; requested artifacts are not all confirmed."
         )
     elif getattr(agent, "claim_unverified", False):
         error = getattr(

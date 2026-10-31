@@ -38,23 +38,163 @@ jobs:
     # Real engine + model download and one chat. Manual only (slow, downloads ~0.7 GB).
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
+    env:
+      NEXUS_AGENT_MODEL_REPO: LiquidAI/LFM2.5-1.2B-Instruct-GGUF
+      NEXUS_AGENT_MODEL_FILENAME: LFM2.5-1.2B-Instruct-Q4_0.gguf
+      NEXUS_AGENT_ASSUME_YES: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install
-        run: python -m pip install -e ".[dev]"
-      - name: First run with small model and one chat
-        env:
-          NEXUS_AGENT_MODEL_REPO: LiquidAI/LFM2.5-1.2B-Instruct-GGUF
-          NEXUS_AGENT_MODEL_FILENAME: LFM2.5-1.2B-Instruct-Q4_0.gguf
-          NEXUS_AGENT_ASSUME_YES: "1"
+        id: install
+        shell: pwsh
         run: |
-          set -o pipefail
-          nexus-agent chat -p local "say hi in five words" 2>&1 | tee chat.log
-          test "$(wc -c < chat.log)" -gt 3
+          $PSNativeCommandUseErrorActionPreference = $false
+          $logs = "$env:RUNNER_TEMP/nexus-first-run"
+          New-Item -ItemType Directory -Force $logs | Out-Null
+          python -m pip install -e ".[dev,all,web]" 2>&1 | Tee-Object -FilePath "$logs/install.log"
+          $installExit = $LASTEXITCODE
+          "Install exit code: $installExit" | Tee-Object -FilePath "$logs/install.log" -Append
+          if ($installExit -ne 0) { throw "pip install failed with exit code $installExit" }
+          Get-Command nexus-agent -CommandType Application -ErrorAction Stop | Out-Null
+          nexus-agent --version 2>&1 | Tee-Object -FilePath "$logs/install.log" -Append
+          $versionExit = $LASTEXITCODE
+          if ($versionExit -ne 0) { throw "nexus-agent cannot start (exit code $versionExit)" }
+      - name: First run with small model and one chat
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $work = "$env:RUNNER_TEMP/nexus-first-run/smoke"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          nexus-agent chat -p local --verbose "say hi in five words" 2>&1 | Tee-Object -FilePath chat.log
+          $chatExit = $LASTEXITCODE
+          "Chat exit code: $chatExit" | Tee-Object -FilePath status.log
+          if ($chatExit -ne 0) { throw "chat failed with exit code $chatExit" }
+      - name: S1 - tool arithmetic returns the exact result
+        if: ${{ always() && !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $work = "$env:RUNNER_TEMP/nexus-first-run/s1"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          Get-Command nexus-agent -CommandType Application -ErrorAction Stop | Out-Null
+          nexus-agent chat -p local --verbose 'What is 4829102 + 7712345? Use a tool.' 2>&1 | Tee-Object -FilePath chat.log
+          $chatExit = $LASTEXITCODE
+          "S1 exit code: $chatExit" | Tee-Object -FilePath status.log
+          if ($chatExit -ne 0) { throw "S1 failed with exit code $chatExit" }
+          if ((Get-Content chat.log -Raw) -notmatch '(?<!\d)12541447(?!\d)') {
+            throw "S1 did not log the exact expected result 12541447"
+          }
+          "S1: PASS (exit 0, exact result 12541447)" | Tee-Object -FilePath status.log -Append
+          Get-Content status.log | Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: S2 - real file edit or an honest agent failure
+        if: ${{ always() && !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $work = "$env:RUNNER_TEMP/nexus-first-run/s2"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          Set-Content s2target.py 'x = 1'
+          Get-Command nexus-agent -CommandType Application -ErrorAction Stop | Out-Null
+          nexus-agent chat -p local --verbose 'Change x to 2 in s2target.py' 2>&1 | Tee-Object -FilePath chat.log
+          $chatExit = $LASTEXITCODE
+          "S2 exit code: $chatExit" | Tee-Object -FilePath status.log
+          if (Test-Path s2target.py) {
+            "s2target.py after the command:" | Tee-Object -FilePath status.log -Append
+            Get-Content s2target.py | Tee-Object -FilePath status.log -Append
+          } else {
+            "s2target.py is missing after the command" | Tee-Object -FilePath status.log -Append
+          }
+          python -c "import ast, pathlib, sys; p = pathlib.Path('s2target.py'); tree = ast.parse(p.read_text(encoding='utf-8-sig')) if p.is_file() else ast.Module(body=[], type_ignores=[]); edited = any(isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'x' for t in n.targets) and isinstance(n.value, ast.Constant) and type(n.value.value) is int and n.value.value == 2 for n in tree.body); print('AST assignment x = 2:', edited); sys.exit(0 if edited else 1)" 2>&1 | Tee-Object -FilePath status.log -Append
+          $fileCheckExit = $LASTEXITCODE
+          $output = (Get-Content chat.log -Raw) -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
+          if ($chatExit -eq 0) {
+            if ($fileCheckExit -ne 0) { throw "S2 falsely reported success without an x = 2 assignment" }
+            $result = 'S2: PASS - EDITED (exit 0 and AST-confirmed x = 2)'
+          } else {
+            if ($chatExit -ne 1 -or $output -notmatch '(?s)Tokens:.*Time:' -or
+                $output -notmatch '\[ERROR\]' -or $output -match 'Fatal execution error:') {
+              throw "S2 failed to run normally; exit $chatExit is not an honest agent outcome"
+            }
+            $result = "S2: PASS - HONEST FAILURE (agent exit $chatExit; AST check exit $fileCheckExit; not accepted as completed)"
+            Write-Warning $result
+          }
+          $result | Tee-Object -FilePath status.log -Append
+          Get-Content status.log | Add-Content $env:GITHUB_STEP_SUMMARY
+          $global:LASTEXITCODE = 0
+      - name: S3 - current Python release with a retrieved source URL
+        if: ${{ always() && !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $work = "$env:RUNNER_TEMP/nexus-first-run/s3"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          Get-Command nexus-agent -CommandType Application -ErrorAction Stop | Out-Null
+          nexus-agent chat -p local --verbose 'What is the latest stable Python version? Search the web.' 2>&1 | Tee-Object -FilePath chat.log
+          $chatExit = $LASTEXITCODE
+          "S3 exit code: $chatExit" | Tee-Object -FilePath status.log
+          if ($chatExit -ne 0) { throw "S3 failed with exit code $chatExit" }
+          $output = (Get-Content chat.log -Raw) -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
+          $search = [regex]::Match($output, '(?s)\[ACTION\]\s+search_web\b.*?\[OBSERVE\](?<retrieval>.*)')
+          if (-not $search.Success) { throw "S3 did not log an observed web search" }
+          $finalText = $output
+          if ($finalText -match '(?s)╭─+\s*Response\s*─+╮\s*(?<ans>.*?)\s*╰─+') {
+            $finalText = $Matches['ans']
+          } else {
+            $parts = [regex]::Split($finalText, '(?m)^\s*\[OBSERVE\].*$')
+            if ($parts.Length -gt 1) {
+              $finalText = $parts[-1]
+            }
+            if ($finalText -match '(?s)(?<ans>.*?)\s*Tokens:\s*') {
+              $finalText = $Matches['ans']
+            }
+          }
+          $finalSources = @(
+            foreach ($match in [regex]::Matches($finalText, 'https?://[^\s<>"''|]+')) {
+              $uri = $null
+              $candidate = $match.Value.TrimEnd([char[]]').,]')
+              if ([Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -and
+                  -not $uri.IsLoopback -and $uri.HostNameType -eq [UriHostNameType]::Dns -and
+                  $uri.Host.Contains('.') -and $uri.Host -notmatch '\.(localhost|local|invalid|test|example)$') {
+                $candidate
+              }
+            }
+          )
+          if ($finalSources.Count -eq 0) { throw "S3 final user-facing answer did not log an external HTTP(S) source URL after searching" }
+          "S3: PASS (exit 0, observed search, final answer external source URL; no fixed version asserted)" | Tee-Object -FilePath status.log -Append
+          $finalSources | Tee-Object -FilePath status.log -Append
+          Get-Content status.log | Add-Content $env:GITHUB_STEP_SUMMARY
+          $global:LASTEXITCODE = 0
+      - name: Capture first-run engine server logs
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $logs = "$env:RUNNER_TEMP/nexus-first-run"
+          New-Item -ItemType Directory -Force $logs | Out-Null
+          $serverDirectory = Join-Path $HOME '.nexus-agent/llama-server'
+          if (Test-Path -LiteralPath $serverDirectory -PathType Container) {
+            $serverLogs = @(Get-ChildItem -LiteralPath $serverDirectory -Filter 'server-nexus-*.log' -File)
+            if ($serverLogs.Count -gt 0) {
+              $destination = Join-Path $logs 'llama-server'
+              New-Item -ItemType Directory -Force $destination | Out-Null
+              # Preserve full server output, including any emitted engine build/backend evidence.
+              $serverLogs | Copy-Item -Destination $destination
+            }
+          }
+      - name: Upload first-run logs and qualification file state
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-first-run-qualification
+          path: ${{ runner.temp }}/nexus-first-run/
+          if-no-files-found: warn
 
   wizard-e2e:
     # First-run wizard through a real pty on Linux and macOS: fake key, pick a non-default model, download,

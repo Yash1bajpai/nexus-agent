@@ -2,13 +2,15 @@
 
 Small models hallucinate file names, claim tests pass when they failed, and
 describe git output they never read. These checks run inside the agent loop,
-check tool evidence and explicitly requested Python function names, and never change files.
+check tool evidence and explicitly requested Python bindings, and never change files.
 
 Turn off with NEXUS_GUARDRAILS=0 (for measuring the model alone).
 """
 import ast
+from dataclasses import dataclass
 import keyword
 import difflib
+import math
 import os
 import re
 from pathlib import Path
@@ -173,6 +175,268 @@ def check_function_requirements(requirements: Dict[str, List[str]]) -> List[str]
         if missing:
             incomplete.append(f"{path}: missing top-level Python function(s): {', '.join(missing)}.")
     return incomplete
+
+
+@dataclass(frozen=True)
+class LiteralAssignmentRequirement:
+    """A single explicit request, not a claim about runtime program behavior."""
+
+    path: str
+    name: str
+    literal: str
+    value: object
+
+
+_LITERAL_ASSIGNMENT = re.compile(
+    r"(?:please[ \t]+)?(?:change|set)[ \t]+(?P<name>" + _PYTHON_NAME + r")"
+    r"[ \t]+to[ \t]+(?P<literal>[^\r\n]+?)[ \t]+in[ \t]+"
+    r"(?P<path>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.py)[.!]?",
+    re.IGNORECASE,
+)
+
+
+def _literal_value(node: ast.AST) -> object:
+    """Accept only unambiguous scalars, lists, tuples, and dictionaries."""
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if type(value) not in (type(None), bool, int, float, str, bytes):
+            raise ValueError("unsupported literal")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite literal")
+        return value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        if not isinstance(node.operand, ast.Constant) or type(node.operand.value) not in (int, float):
+            raise ValueError("unsupported signed literal")
+        value = ast.literal_eval(node)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite literal")
+        return value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values = [_literal_value(item) for item in node.elts]
+        return tuple(values) if isinstance(node, ast.Tuple) else values
+    if isinstance(node, ast.Dict):
+        result = {}
+        for key, item in zip(node.keys, node.values):
+            if key is None:
+                raise ValueError("dictionary unpacking")
+            key_value = _literal_value(key)
+            if key_value in result:
+                raise ValueError("ambiguous duplicate dictionary key")
+            result[key_value] = _literal_value(item)
+        return result
+    raise ValueError("unsupported literal")
+
+
+def _literal_identity(value: object) -> tuple:
+    """Compare nested literal types too: Python's True == 1 is not sufficient."""
+    if isinstance(value, dict):
+        contents = frozenset(
+            (_literal_identity(key), _literal_identity(item)) for key, item in value.items()
+        )
+    elif isinstance(value, (list, tuple)):
+        contents = tuple(_literal_identity(item) for item in value)
+    else:
+        contents = value
+    return type(value), contents
+
+
+def requested_literal_assignment(request: str) -> Optional[LiteralAssignmentRequirement]:
+    """Recognize only a complete, unquoted, single-file literal edit instruction."""
+    # Bare retries route through the stored request, which may include auto-attached source.
+    request = (request or "").split("\n\n[Context attached from @", 1)[0]
+    match = _LITERAL_ASSIGNMENT.fullmatch((request or "").strip())
+    if match is None:
+        return None
+    name, path, literal = match.group("name", "path", "literal")
+    if keyword.iskeyword(name) or ".." in path.split("/"):
+        return None
+    try:
+        expression = ast.parse(literal, mode="eval")
+        value = _literal_value(expression.body)
+    except (SyntaxError, ValueError, TypeError, RecursionError, OverflowError):
+        return None
+    return LiteralAssignmentRequirement(path, name, literal, value)
+
+
+class _BindingWrites(ast.NodeVisitor):
+    """Find syntactic module writes, excluding function and class-local bindings."""
+
+    def __init__(self, name: str, enabled: bool = True) -> None:
+        self.name = name
+        self.enabled = enabled
+        self.found = False
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if self.enabled and node.id == self.name and isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.found = True
+
+    def _visit_mutation(self, node: ast.AST) -> None:
+        root = node
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            root = root.value
+        if (self.enabled and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(root, ast.Name) and root.id == self.name):
+            self.found = True
+        self.generic_visit(node)
+
+    visit_Attribute = _visit_mutation
+    visit_Subscript = _visit_mutation
+
+    def visit_Import(self, node: ast.Import) -> None:
+        if self.enabled and any(
+            (alias.asname or alias.name.split(".")[0]) == self.name for alias in node.names
+        ):
+            self.found = True
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if self.enabled and any(
+            alias.name == "*" or (alias.asname or alias.name) == self.name for alias in node.names
+        ):
+            self.found = True
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if self.enabled and node.name == self.name:
+            self.found = True
+        # Defaults, decorators, and annotations run outside the function body.
+        for field, value in ast.iter_fields(node):
+            if field != "body":
+                self._visit_field(value)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.visit(node.args)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if self.enabled and node.name == self.name:
+            self.found = True
+        for field, value in ast.iter_fields(node):
+            if field != "body":
+                self._visit_field(value)
+        # A class body executes, but only explicit global bindings escape its scope.
+        globals_visitor = _ScopeGlobals()
+        for statement in node.body:
+            globals_visitor.visit(statement)
+        body_writes = _BindingWrites(self.name, self.name in globals_visitor.names)
+        for statement in node.body:
+            body_writes.visit(statement)
+        self.found = self.found or body_writes.found
+
+    def _visit_field(self, value: object) -> None:
+        if isinstance(value, ast.AST):
+            self.visit(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, ast.AST):
+                    self.visit(item)
+
+    def _visit_comprehension(self, node: ast.AST) -> None:
+        # Iteration targets are comprehension-local; walrus expressions are not.
+        for generator in node.generators:
+            self.visit(generator.iter)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for field in ("elt", "key", "value"):
+            value = getattr(node, field, None)
+            if value is not None:
+                self.visit(value)
+
+    visit_ListComp = _visit_comprehension
+    visit_SetComp = _visit_comprehension
+    visit_DictComp = _visit_comprehension
+    visit_GeneratorExp = _visit_comprehension
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if self.enabled and node.name == self.name:
+            self.found = True
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if self.enabled and node.name == self.name:
+            self.found = True
+        self.generic_visit(node)
+
+    visit_MatchStar = visit_MatchAs
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if self.enabled and node.rest == self.name:
+            self.found = True
+        self.generic_visit(node)
+
+
+class _ScopeGlobals(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.names.update(node.names)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        pass
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+
+
+def check_literal_assignment_requirement(
+    requirement: Optional[LiteralAssignmentRequirement],
+) -> List[str]:
+    """Check the last supported syntactic module binding without executing source."""
+    if requirement is None:
+        return []
+    from .tools import execute_read_file
+
+    path, name = requirement.path, requirement.name
+    source = execute_read_file(path)
+    if source.startswith("ERROR:"):
+        return [f"{path}: requested assignment for {name} is unverified: {source}"]
+    try:
+        module = ast.parse(source, filename=path)
+    except (SyntaxError, ValueError, RecursionError) as exc:
+        return [
+            f"{path}: requested assignment for {name} is unverified: "
+            f"source could not be parsed ({type(exc).__name__})."
+        ]
+
+    state, final_value = "missing", None
+    for statement in module.body:
+        value = None
+        if (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id == name):
+            value = statement.value
+        elif (isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name) and statement.target.id == name):
+            annotation_writes = _BindingWrites(name)
+            annotation_writes.visit(statement.annotation)
+            if not annotation_writes.found:
+                value = statement.value
+        if value is not None:
+            try:
+                final_value = _literal_value(value)
+                state = "literal"
+                continue
+            except (ValueError, TypeError, RecursionError, OverflowError):
+                pass
+        writes = _BindingWrites(name)
+        writes.visit(statement)
+        if writes.found:
+            state = "unverified"
+
+    if state == "missing":
+        return [f"{path}: missing module-level assignment for {name} to {requirement.literal}."]
+    if state == "unverified":
+        return [
+            f"{path}: final module-level binding of {name} is unverified "
+            "(unsupported or conditional write)."
+        ]
+    if _literal_identity(final_value) != _literal_identity(requirement.value):
+        return [
+            f"{path}: final module-level assignment for {name} does not match "
+            f"requested literal {requirement.literal}."
+        ]
+    return []
 
 
 
