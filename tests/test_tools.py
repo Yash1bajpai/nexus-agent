@@ -27,10 +27,34 @@ def test_list_directory_not_found():
     result = execute_list_directory("non_existent_folder_999")
     assert result.startswith("ERROR: Directory not found")
 
-@pytest.mark.filterwarnings("ignore::RuntimeWarning")
-def test_search_web():
+def test_search_web(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    calls = []
+
+    class FakeDDGS:
+        def text(self, query, max_results):
+            calls.append((query, max_results))
+            return [{
+                "title": "Python programming",
+                "href": "https://www.python.org/",
+                "body": "The Python programming language.",
+            }]
+
+    module = ModuleType("ddgs")
+    module.DDGS = FakeDDGS
+    monkeypatch.setitem(sys.modules, "ddgs", module)
+    monkeypatch.setitem(sys.modules, "duckduckgo_search", None)
+
     res = execute_tool("search_web", {"query": "python programming"})
-    assert "Search results for:" in res or "ERROR:" in res or "No web search results found" in res or "[Live Search Warning]:" in res
+    assert calls == [("python programming", 5)]
+    assert res == (
+        "Search results for: 'python programming'\n\n"
+        "1. Python programming\n"
+        "   URL: https://www.python.org/\n"
+        "   Summary: The Python programming language.\n"
+    )
 
 def test_write_file_success(tmp_path: Path):
     target = tmp_path / "new_dir" / "out.txt"

@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List
 from ..providers.base import BaseProvider, RateLimitError, ProviderResponse
 from . import context
-from .memory import ConversationMemory
+from .memory import ConversationMemory, is_genuine_user_message
 from .tools import get_all_tools, execute_tool, execute_list_directory
-from .guardrails import LoopGuard, guardrails_enabled
+from .guardrails import (
+    LoopGuard, guardrails_enabled, promises_tool_use, function_request_prose,
+    requested_function_names, check_function_requirements,
+)
 from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
@@ -20,8 +23,8 @@ RULES_PROMPT = """RULES:
 2. When creating new files, use write_file. When modifying existing files, always use patch_file
    to replace only the specific targeted code blocks and preserve file integrity.
    Read the file with read_file first; edits to unread or changed files are refused.
-   If patch_file says the target was not found, copy the target exactly from the
-   closest text it shows and retry once.
+   patch_file.target is OLD text already in the file; replacement is the desired NEW text.
+   If the target was not found, copy the exact target JSON from the error and retry once.
 3. When testing calculations or standalone algorithms, use run_code tool.
    When verifying bug fixes, test passes, or regressions, use run_tests tool to execute pytest.
 4. Use list_directory to understand project structure before project-level questions.
@@ -35,7 +38,7 @@ RULES_PROMPT = """RULES:
 11. Be direct. Skip unnecessary preamble.
 12. STOP using tools once you have enough information to answer. Give your final
     answer as plain text. Do NOT keep calling the same tool repeatedly.
-13. For simple math or factual questions, answer directly WITHOUT using tools.
+13. Use run_code for arithmetic. Answer conceptual questions directly when no tools are needed.
 14. If a duplicate tool call warning appears, immediately synthesize your final
     answer from the results you already have. Do NOT call any more tools.
 
@@ -51,6 +54,10 @@ This applies to every single tool call in every iteration."""
 
 # Keywords/patterns that indicate a query NEEDS tool access
 _TOOL_PATTERNS = [
+    # Explicit capability requests must not depend on underscores being word boundaries.
+    r'\b(?:read_file|write_file|patch_file|list_directory|run_code|run_tests|search_web|git_status|git_diff|git_commit)\b',
+    r'\b(?:calculate|compute|calculation|arithmetic)\b',
+    r'\b\d[\d,]*(?:\.\d+)?\s*(?:[+*/%−-]|plus\b|minus\b|times\b|divided by\b|multiplied by\b)\s*[-+]?\d',
     # File operations
     r'\b(read|open|show|view|display|print)\b.*\b(file|\.py|\.js|\.ts|\.java|\.cpp|\.c\b|\.h\b|\.go|\.rs|\.rb|\.html|\.css|\.json|\.yaml|\.yml|\.toml|\.md|\.txt|\.csv|\.xml|\.sql)',
     r'\b(write|create|generate|make|build)\b.*\b(file|class|function|script|module|program)',
@@ -133,13 +140,44 @@ def _wants_edit(user_input: str) -> bool:
     return bool(_EDIT_INTENT.search(text))
 
 
+_LIVE_SEARCH_REQUEST = re.compile(
+    r"\b(?:search|browse)\s+(?:the\s+)?(?:web|internet)\b|"
+    r"\b(?:search|browse|look\s+up|find)\b[^.!?\n]*\b"
+    r"(?:online|official\s+(?:sources?|docs?|documentation|release\s+notes)|"
+    r"live\s+(?:sources?|results?))\b|"
+    r"^\s*(?:please\s+)?(?:use\s+)?search_web\b|"
+    r"\b(?:current|latest)\s+(?:stable\s+)?(?:[\w.+-]+\s+){0,3}(?:version|release)\b",
+    re.IGNORECASE,
+)
+
+
 def _query_needs_tools(user_input: str) -> bool:
     """Determine if a query likely needs tool access (file ops, code, git, etc.)."""
     q = user_input.lower().strip()
+    if _LIVE_SEARCH_REQUEST.search(q):
+        return True
     for pattern in _TOOL_PATTERNS:
         if re.search(pattern, q, re.IGNORECASE):
             return True
     return False
+
+
+_RETRY_REQUEST = re.compile(
+    r"(?:please\s+)?(?:try again|retry|try once more|do it again)(?:\s+please)?[.!?]*",
+    re.IGNORECASE,
+)
+
+
+def _routing_request(user_input: str, history: list) -> str:
+    """Resolve bare retries against the last real request, never internal nudges."""
+    if not _RETRY_REQUEST.fullmatch(user_input.strip()):
+        return user_input
+    for message in reversed(history):
+        if is_genuine_user_message(message):
+            previous = message.get("content", "")
+            if isinstance(previous, str) and not _RETRY_REQUEST.fullmatch(previous.strip()):
+                return previous
+    return user_input
 
 
 def parse_at_mentions(user_input: str) -> str:
@@ -180,6 +218,26 @@ def parse_at_mentions(user_input: str) -> str:
     return clean_input
 
 _FILE_TOKEN = re.compile(r'(?<![\w@/\\.-])([\w][\w.\-]*(?:[/\\][\w.\-]+)*\.[A-Za-z0-9]{1,6})(?=[\s.,;:!?)\'"]|$)')
+
+def _named_function_requirements(request: str) -> tuple[Dict[str, List[str]], List[str]]:
+    """Bind recognized Python requests, or explicitly report an unverified scope."""
+    prose = function_request_prose(request)
+    names = requested_function_names(prose)
+    if not names:
+        return {}, []
+    paths = {match.group(1) for match in _FILE_TOKEN.finditer(prose.replace("@", " "))}
+    if paths and not any(Path(path).suffix == ".py" for path in paths):
+        return {}, []  # This guard does not impose Python rules on other languages.
+    if len(paths) == 1:
+        path = next(iter(paths))
+        if Path(path).suffix == ".py":
+            return {path: names}, []
+    return {}, [
+        f"Could not verify requested Python function names ({', '.join(names)}): "
+        "this bounded check requires one explicit unquoted relative .py target. "
+        "No file was inferred for verification."
+    ]
+
 
 
 def attach_named_files(user_input: str) -> str:
@@ -229,15 +287,17 @@ class Agent:
         self.event_callback = event_callback
         self.total_input_tokens = 0
         self.total_output_tokens = 0
-        # Only local llama providers expose a fixed window we can budget against.
-        window = getattr(provider, "context_size", None)
-        self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+        self._sync_context_window()
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
         self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
         self.edit_not_applied = False  # an edit was requested, nothing was written, and the model did not say nothing needs changing
         self.claim_unverified = False  # model said tests pass but they were not run / last run failed
+        self.claim_unverified_error = ""
+        self.unfulfilled_action = False
+        self.response_incomplete = False
         self.changed_files: set[str] = set()
+        self.requirements_incomplete: List[str] = []
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -270,6 +330,8 @@ class Agent:
         active = provider if provider is not None else getattr(self.provider, "active_provider", self.provider)
         window = getattr(active, "context_size", None)
         self.context_window = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+        output = getattr(active, "max_output_tokens", None)
+        self.output_reserve = output if isinstance(output, int) and not isinstance(output, bool) and output > 0 else 0
 
     def _nudge(self, text: str):
         self.memory.add_raw({"role": "user", "content": text, "metadata": {"internal": True}})
@@ -287,15 +349,37 @@ class Agent:
         if not self.context_window:
             return messages
         window = int(self.context_window * scale)
-        reserve = min(1024, max(256, window // 4))  # room for the answer
+        configured = self.output_reserve
+        reserve = configured
+        active = getattr(self.provider, "active_provider", self.provider)
+        adaptive = _is_local_provider(active) and getattr(active, "_supports_output_budget", False)
+        # Keep a usable reply allowance rather than shrinking all the way to a
+        # single token. Explicit smaller caps remain exact.
+        minimum_output = min(configured, 256)
         overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
-        budget = window - reserve - overhead
-        if budget <= 0:
-            raise context.ContextBudgetError(
-                f"Context window ({window} tokens) cannot fit instructions, tools and answer reserve "
-                f"({overhead + reserve} tokens). Use a larger context window or fewer tools."
-            )
-        fitted, stats = context.fit_messages(messages, budget)
+        while True:
+            budget = window - reserve - overhead
+            try:
+                if budget <= 0:
+                    raise context.ContextBudgetError(
+                        f"Configured context budget ({window} tokens) cannot fit instructions, tools and answer reserve "
+                        f"({overhead + reserve} tokens). Adjust the configured context/output budgets within "
+                        "the endpoint's documented capacity, or use fewer tools."
+                    )
+                fitted, stats = context.fit_messages(messages, budget)
+                break
+            except context.ContextBudgetError:
+                if not adaptive or reserve <= minimum_output:
+                    raise
+                reserve = max(minimum_output, reserve // 2)
+        if adaptive:
+            active._request_output_cap = reserve
+            self.output_reserve = reserve
+            if reserve < configured:
+                display.print_warn(
+                    f"Local output cap reduced for this request: {configured} -> {reserve} tokens "
+                    "so input plus reserved output fits the context window."
+                )
         self.last_trim = stats
         if stats["dropped_messages"] or stats["truncated_messages"]:
             display.print_warn(
@@ -305,8 +389,10 @@ class Agent:
         return fitted
 
     def context_used(self) -> int:
-        """Estimated tokens the next request would use (history + instructions)."""
-        return context.history_tokens(self.memory.get()) + context.estimate_tokens(self.system) + context.tools_tokens(self.tools)
+        """Estimated context allocation, including the configured generation reserve."""
+        self._sync_context_window()
+        return (context.history_tokens(self.memory.get()) + context.estimate_tokens(self.system)
+                + context.tools_tokens(self.tools) + self.output_reserve)
 
     def compact(self, keep_turns: int = 2):
         """Shrink stored history; returns (before_tokens, after_tokens, info)."""
@@ -318,8 +404,13 @@ class Agent:
 
     def run(self, user_input: str, stream: bool = False, require_edit: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
+        routing_input = _routing_request(user_input, self.memory.get())
+        requires_search = bool(_LIVE_SEARCH_REQUEST.search(routing_input))
         wants_edit = require_edit or (
-            any(tool.name in _WRITE_TOOLS for tool in self.tools) and _wants_edit(user_input)
+            any(tool.name in _WRITE_TOOLS for tool in self.tools) and _wants_edit(routing_input)
+        )
+        function_requirements, requirement_scope_errors = (
+            _named_function_requirements(routing_input) if self.guardrails else ({}, [])
         )
         processed_input = parse_at_mentions(attach_named_files(user_input))
         self.memory.add("user", processed_input)
@@ -331,7 +422,7 @@ class Agent:
         # model from looping on tools for simple questions.
         use_tools = self.tools
         local_mode = _is_local_provider(self.provider)
-        if local_mode and not wants_edit and not _query_needs_tools(processed_input):
+        if local_mode and not wants_edit and not _query_needs_tools(routing_input) and not _query_needs_tools(processed_input):
             use_tools = []  # no tools → model answers directly
             effective_max_iter = 1
         else:
@@ -349,13 +440,20 @@ class Agent:
         unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
         window_scale = 1.0
         wrote_ok = False
+        tool_executed = False
+        search_succeeded = False
         offered_tools = list(use_tools)  # use_tools is emptied by the anti-loop stop; keep what was offered
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
         self.claimed_unapplied_edit = False
         self.edit_not_applied = False
         self.claim_unverified = False
+        self.claim_unverified_error = ""
+        retrieved_search_urls: List[str] = []
+        self.unfulfilled_action = False
+        self.response_incomplete = False
         self.changed_files = set()
+        self.requirements_incomplete = []
         previous_before_request = getattr(self.provider, "before_request", None)
         managed_fallback = hasattr(self.provider, "before_request")
         if managed_fallback:
@@ -411,11 +509,20 @@ class Agent:
                         display.print_warn("The model rejected the request as too large. Retrying once with a smaller history.")
                         continue
                     raise
+                finally:
+                    active = getattr(self.provider, "active_provider", self.provider)
+                    if hasattr(active, "_request_output_cap"):
+                        del active._request_output_cap
 
                 self.total_input_tokens += response.input_tokens
                 self.total_output_tokens += response.output_tokens
                 self._sync_context_window()
                 local_mode = _is_local_provider(self.provider)
+
+                if response.finish_reason == "length":
+                    # Even complete-looking arguments may belong to an unfinished plan.
+                    self.response_incomplete = True
+                    response.tool_calls = []
 
                 if response.has_tool_calls:
                     self.memory.add_raw(assistant_message(response.text, response.tool_calls))
@@ -477,7 +584,14 @@ class Agent:
                             executed_tools.add(tool_sig)
                             edit_path = _edit_path(tool_call.args) if tool_call.name in _WRITE_TOOLS else None
                             before_edit = _file_state(edit_path) if edit_path is not None else None
+                            tool_executed = True
                             result = execute_tool(tool_call.name, tool_call.args)
+                            if tool_call.name == "search_web" and str(result).startswith("Search results for:"):
+                                search_succeeded = True
+                                for u in re.findall(r"^\s*URL:\s*(https?://\S+)", str(result), re.MULTILINE):
+                                    clean_u = u.strip().rstrip(".,;)]}>\"'")
+                                    if clean_u.startswith(("http://", "https://")) and clean_u not in retrieved_search_urls:
+                                        retrieved_search_urls.append(clean_u)
                             changed = (edit_path is not None and before_edit is not None
                                        and (after_edit := _file_state(edit_path)) is not None
                                        and after_edit != before_edit
@@ -544,7 +658,14 @@ class Agent:
                     display.stop_status(status)
                     status = None
                     final_text = response.text
-                    if guard:
+                    if self.response_incomplete:
+                        final_text += ("\n\nNot completed: the model reached its output limit. "
+                                       "This response is incomplete; no tool calls from the cut-off response were executed.")
+                    self.unfulfilled_action = not tool_executed and promises_tool_use(response.text)
+                    if self.unfulfilled_action:
+                        final_text += ("\n\nNot completed: the model announced an action, but no tool was executed "
+                                       "in this turn. Any calculation or verification above is unverified.")
+                    if guard and not self.response_incomplete:
                         verdict, reviewed = guard.review_final(final_text)
                         if verdict == "retry":
                             self.memory.add("assistant", final_text)
@@ -561,7 +682,9 @@ class Agent:
                             continue
                         final_text = reviewed
                         self.claim_unverified = guard.claim_unverified
-                    if (local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
+                        if getattr(guard, "claim_unverified_error", ""):
+                            self.claim_unverified_error = guard.claim_unverified_error
+                    if (not self.response_incomplete and local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
                         # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
                         error_nudges += 1
                         self.memory.add("assistant", final_text or "(no answer)")
@@ -571,7 +694,7 @@ class Agent:
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
                         continue
-                    if (local_mode and use_tools and not wrote_ok and not unresolved and error_nudges < 2
+                    if (not self.response_incomplete and local_mode and use_tools and not wrote_ok and not unresolved and error_nudges < 2
                             and iteration < effective_max_iter and wants_edit
                             and any(getattr(t, "name", None) in _WRITE_TOOLS for t in use_tools)
                             and not _NO_CHANGE_OK.search(final_text or "")):
@@ -584,6 +707,13 @@ class Agent:
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
                         continue
+                    if requires_search and not search_succeeded:
+                        unresolved["live_search"] = (
+                            "Unverified web grounding: no successful search_web result was retrieved in this turn. "
+                            "The live-search request is not complete; any current-source claims above are unverified."
+                        )
+                    if retrieved_search_urls and not any(u in final_text for u in retrieved_search_urls):
+                        final_text += f"\n\nSource: {retrieved_search_urls[0]}"
                     self.unresolved_errors = list(unresolved.values())
                     if not wrote_ok and wants_edit and not _NO_CHANGE_OK.search(final_text or ""):
                         final_text += ("\n\nWarning: no file was changed. No file tool actually changed file contents "
@@ -594,6 +724,20 @@ class Agent:
                             # Not just "nothing to change": the model claimed an edit that never happened.
                             self.claimed_unapplied_edit = True
                             final_text += "\nThe claim above that the code was changed is false: the files were not modified."
+                    self.requirements_incomplete = requirement_scope_errors + check_function_requirements(function_requirements)
+                    if self.requirements_incomplete:
+                        final_text += (
+                            "\n\nRequest incomplete: "
+                            + " ".join(self.requirements_incomplete)
+                            + " Any partial edits remain in place; no automatic repair was attempted. "
+                            "This check verifies function names only, not behavior or all request requirements."
+                        )
+                    elif function_requirements:
+                        final_text += (
+                            "\n\nCompletion check: requested top-level Python function names exist. "
+                            "This guard checks names only; it has not verified function behavior or every instruction. "
+                            "Review the diff and run trusted tests."
+                        )
                     if self.unresolved_errors:
                         final_text += "\n\nTool errors occurred; do not assume the task succeeded:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
                     if self.event_callback:
@@ -623,6 +767,10 @@ class Agent:
         if wants_edit and not self.changed_files:
             self.edit_not_applied = True
             final_text += " No file was changed."
+        self.requirements_incomplete = requirement_scope_errors + check_function_requirements(function_requirements)
+        if self.requirements_incomplete:
+            final_text += "\nRequest incomplete: " + " ".join(self.requirements_incomplete)
+            final_text += " Any partial edits remain in place; no automatic repair was attempted."
         if self.unresolved_errors:
             final_text += "\nUnresolved tool errors:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
         self.memory.add("assistant", final_text)

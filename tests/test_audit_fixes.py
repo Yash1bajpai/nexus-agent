@@ -143,11 +143,27 @@ def test_memory_pruning_user_boundaries():
     assert msgs[0].get("role") == "user"
     assert msgs[0].get("content") == "user2"
 
-def test_search_web_offline_labeling():
-    """Verify that execute_search_web explicitly indicates offline reference data when live search is unavailable."""
+def test_search_web_offline_labeling(monkeypatch):
+    """An empty live response is an error, not invented cached reference data."""
+    import sys
+    from types import ModuleType
+
+    class EmptyDDGS:
+        def text(self, query, max_results):
+            return []
+
+    module = ModuleType("ddgs")
+    module.DDGS = EmptyDDGS
+    monkeypatch.setitem(sys.modules, "ddgs", module)
+    monkeypatch.setitem(sys.modules, "duckduckgo_search", None)
+
     res = execute_search_web("python 3.13 new features")
-    if "Offline/Cached Reference Data" in res:
-        assert "[Offline/Cached Reference Data (as of 2025) - Live search unavailable or rate-limited]:" in res
+    assert res.startswith("ERROR: search_web [empty]:")
+    assert "returned no results" in res
+    assert "underlying cause is unknown" in res
+    assert "Offline/Cached" not in res
+    assert "rate-limit" not in res
+    assert "network" not in res.lower()
 
 def test_local_provider_setup_model_verify(monkeypatch):
     """setup_model(verify_download=True) raises RuntimeError if the download fails."""

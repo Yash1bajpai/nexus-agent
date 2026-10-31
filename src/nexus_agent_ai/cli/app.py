@@ -24,6 +24,7 @@ if sys.platform == "win32":
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 from ..utils.config import DEFAULT_PROVIDER, ConfigError
+from ..utils.interactive import stdin_is_interactive
 from ..agent.memory import ConversationMemory
 from ..agent.core import Agent
 from . import display
@@ -62,8 +63,21 @@ def _check_run_outcome(agent: Agent, *, exit_on_failure: bool = True) -> bool:
         error = "The model said it changed code but no file was modified."
     elif getattr(agent, "edit_not_applied", False):
         error = "An edit was requested but no file was changed."
+    elif getattr(agent, "requirements_incomplete", None):
+        error = (
+            "Request incomplete: " + " ".join(agent.requirements_incomplete)
+            + " Any partial edits remain in place; requested function names are not all confirmed."
+        )
     elif getattr(agent, "claim_unverified", False):
-        error = "The model claimed the tests pass, but no passing test run backs that up."
+        error = getattr(
+            agent,
+            "claim_unverified_error",
+            "",
+        ) or "The model claimed the tests pass or changes were verified, but no tool execution backs that up."
+    elif getattr(agent, "unfulfilled_action", False):
+        error = "The model announced an action, but no tool was executed."
+    elif getattr(agent, "response_incomplete", False):
+        error = "The model reached its output limit; the response is incomplete."
     elif getattr(agent, "unresolved_errors", None):
         error = "Did not finish cleanly (unresolved tool errors or iteration limit)."
     if error is None:
@@ -120,7 +134,16 @@ def _fit_local_model(prov, context_size, kwargs):
     return LocalProvider(model_id=chosen["repo"], filename=chosen["filename"], **kwargs)
 
 
-def _make_local_provider(context_size: Optional[int] = None) -> Tuple[Any, str]:
+def _limit_kwargs(context_size=None, max_output_tokens=None):
+    """Unwrap Typer defaults for direct calls without changing process configuration."""
+    return {
+        key: value.default if hasattr(value, "default") else value
+        for key, value in (("context_size", context_size), ("max_output_tokens", max_output_tokens))
+        if (value.default if hasattr(value, "default") else value) is not None
+    }
+
+
+def _make_local_provider(context_size: Optional[int] = None, max_output_tokens: Optional[int] = None) -> Tuple[Any, str]:
     """Build the default local provider and pre-flight the inference engine.
 
     Downloads/verifies llama-server up front (idempotent, ~50 MB once) so a
@@ -130,7 +153,7 @@ def _make_local_provider(context_size: Optional[int] = None) -> Tuple[Any, str]:
     if _local_downloads_declined.get():
         raise ConfigError("Local downloads were declined during setup. Run again when ready, or choose a cloud provider.")
     from ..providers.local_provider import LocalProvider, ensure_llama_server_binary
-    kwargs = {"context_size": context_size} if context_size is not None else {}
+    kwargs = _limit_kwargs(context_size, max_output_tokens)
     prov = _fit_local_model(LocalProvider(**kwargs), context_size, kwargs)
     prov.setup_model()
     try:
@@ -140,7 +163,7 @@ def _make_local_provider(context_size: Optional[int] = None) -> Tuple[Any, str]:
     return prov, f"Local ({prov.filename})"
 
 
-def get_provider_instance(provider_name: Any, context_size: Optional[int] = None) -> Tuple[Any, str]:
+def get_provider_instance(provider_name: Any, context_size: Optional[int] = None, max_output_tokens: Optional[int] = None) -> Tuple[Any, str]:
     """
     Factory to return (provider_instance, resolved_name).
     Returns a resolved name so print_header() always shows the actual provider,
@@ -150,9 +173,8 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
         provider_name = provider_name.default
     provider_name = provider_name or os.getenv("DEFAULT_PROVIDER", DEFAULT_PROVIDER)
     name_clean = str(provider_name).lower().strip()
-    if context_size is not None:
-        if name_clean not in {"local", "liquid", "lfm", "default", "demo"}:
-            raise ConfigError("--context-size requires --provider local (not cloud, ollama, or auto).")
+    kwargs = _limit_kwargs(context_size, max_output_tokens)
+    if context_size is not None and name_clean in {"local", "liquid", "lfm", "default", "demo"}:
         display.print_warn(
             f"Local context: {context_size} tokens. Larger windows use more RAM; "
             "stay within your model's supported context. This does not compact history."
@@ -160,20 +182,20 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
 
     if name_clean == "anthropic":
         from ..providers.anthropic_provider import AnthropicProvider
-        return AnthropicProvider(), "anthropic"
+        return AnthropicProvider(**kwargs), "anthropic"
     elif name_clean in ["gemini", "gemini-lite", "lite"]:
         from ..providers.gemini_provider import GeminiProvider
-        return GeminiProvider(), "gemini"
+        return GeminiProvider(**kwargs), "gemini"
     elif name_clean in ["openai", "gpt", "gpt-4o"]:
         from ..providers.openai_provider import OpenAIProvider
-        return OpenAIProvider(), "openai"
+        return OpenAIProvider(**kwargs), "openai"
     elif name_clean in ["local", "liquid", "lfm", "default", "demo"]:
-        return _make_local_provider(context_size=context_size)
+        return _make_local_provider(**kwargs)
     elif name_clean in ["ollama"]:
         from ..providers.openai_provider import OpenAIProvider
         base_url = os.getenv("OLLAMA_HOST", "http://localhost:11434/v1")
         local_model = os.getenv("LOCAL_MODEL", "llama3.2:3b")
-        return OpenAIProvider(model=local_model, base_url=base_url), f"ollama ({local_model})"
+        return OpenAIProvider(model=local_model, base_url=base_url, **kwargs), f"ollama ({local_model})"
     elif name_clean in ["openrouter", "laguna", "free"]:
         from ..providers.openai_provider import OpenAIProvider
         or_key = os.getenv("OPENROUTER_API_KEY", "")
@@ -184,15 +206,16 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
             model=model,
             base_url="https://openrouter.ai/api/v1",
             api_key=or_key,
+            **kwargs,
         ), f"OpenRouter ({model.split('/')[-1]})"
     elif name_clean == "auto":
         from ..providers.fallback_provider import FallbackProvider
-        fb = FallbackProvider(start_provider=os.getenv("DEFAULT_PROVIDER", DEFAULT_PROVIDER))
+        fb = FallbackProvider(start_provider=os.getenv("DEFAULT_PROVIDER", DEFAULT_PROVIDER), **kwargs)
         fb._warn_fn = display.print_fallback_switch
         return fb, f"auto ({fb._current_name})"
     else:
         display.print_warn(f"Unknown provider '{provider_name}'. Using local fallback.")
-        return _make_local_provider(context_size=context_size)
+        return _make_local_provider(**kwargs)
 
 
 @app.command()
@@ -205,7 +228,8 @@ def chat(
     persist: bool = typer.Option(False, "--persist/--no-persist", help="Persist conversation history across sessions (SQLite-backed)."),
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
     continue_last: bool = typer.Option(False, "--continue", "-c", help="Resume the most recent saved session."),
-    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Local llama context window in tokens (default: NEXUS_CONTEXT_SIZE or 4096). Larger windows use more RAM."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Context budget in tokens (NEXUS_CONTEXT_SIZE or provider default). Larger local windows use more RAM."),
+    max_output_tokens: Optional[int] = typer.Option(None, "--max-output-tokens", min=1, help="Generation cap in tokens (NEXUS_MAX_OUTPUT_TOKENS or provider default)."),
 ):
     """Execute a single-turn chat instruction with autonomous tool calling."""
     if hasattr(persist, "default"):
@@ -214,12 +238,15 @@ def chat(
         session = session.default
     if hasattr(context_size, "default"):
         context_size = context_size.default
+    if hasattr(max_output_tokens, "default"):
+        max_output_tokens = max_output_tokens.default
     if hasattr(continue_last, "default"):
         continue_last = bool(continue_last.default)
     if query is None or (hasattr(query, "default") and query.default is None):
         # `nexus-agent chat` with no question behaves like `nexus-agent repl`.
         repl(provider=provider, verbose=True, no_stream=True, max_iterations=max_iterations,
-             persist=True, session=session, context_size=context_size, continue_last=continue_last)
+             persist=True, session=session, context_size=context_size, continue_last=continue_last,
+             max_output_tokens=max_output_tokens)
         return
     if not query.strip():
         display.print_error("Query cannot be empty.")
@@ -229,7 +256,7 @@ def chat(
         raise typer.Exit(code=1)
     try:
         persist, session = _resolve_session(persist, session, continue_last)
-        prov, resolved_name = get_provider_instance(provider, context_size=context_size) if context_size is not None else get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, **_limit_kwargs(context_size, max_output_tokens))
         if persist:
             try:
                 from ..agent.persistence import SQLiteMemory
@@ -332,7 +359,8 @@ def repl(
     persist: bool = typer.Option(True, "--persist/--no-persist", help="Save the conversation so it resumes next time in this folder (default: on). Use --no-persist for a throwaway session."),
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Session ID for conversation history (defaults to workspace ID)."),
     continue_last: bool = typer.Option(False, "--continue", "-c", help="Resume the most recent saved session."),
-    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Local llama context window in tokens (default: NEXUS_CONTEXT_SIZE or 4096). Larger windows use more RAM."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Context budget in tokens (NEXUS_CONTEXT_SIZE or provider default). Larger local windows use more RAM."),
+    max_output_tokens: Optional[int] = typer.Option(None, "--max-output-tokens", min=1, help="Generation cap in tokens (NEXUS_MAX_OUTPUT_TOKENS or provider default)."),
 ):
     """Start an interactive multi-turn REPL chat session."""
     if hasattr(provider, "default"):
@@ -349,6 +377,8 @@ def repl(
         session = session.default
     if hasattr(context_size, "default"):
         context_size = context_size.default
+    if hasattr(max_output_tokens, "default"):
+        max_output_tokens = max_output_tokens.default
     if hasattr(continue_last, "default"):
         continue_last = bool(continue_last.default)
     if max_iterations <= 0:
@@ -356,7 +386,7 @@ def repl(
         raise typer.Exit(code=1)
     try:
         persist, session = _resolve_session(persist, session, continue_last)
-        prov, resolved_name = get_provider_instance(provider, context_size=context_size) if context_size is not None else get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, **_limit_kwargs(context_size, max_output_tokens))
         if persist:
             try:
                 from ..agent.persistence import SQLiteMemory
@@ -378,7 +408,7 @@ def repl(
         typer.echo("Type /help for available commands, or /exit to quit.\n")
 
         session = None
-        if sys.stdin.isatty():
+        if stdin_is_interactive():
             try:
                 from prompt_toolkit import PromptSession
                 from prompt_toolkit.history import FileHistory
@@ -395,7 +425,7 @@ def repl(
 
         while True:
             try:
-                if session is not None and sys.stdin.isatty():
+                if session is not None and stdin_is_interactive():
                     try:
                         user_input = session.prompt(">> You: ").strip()
                     except KeyboardInterrupt:
@@ -417,13 +447,14 @@ def repl(
                     display.print_info("Conversation memory cleared.")
                     continue
                 elif lower_input == "/context":
-                    window = getattr(prov, "context_size", None)
+                    agent._sync_context_window()
+                    window = agent.context_window
                     if window is None:
-                        display.print_info("Context window is managed by this provider; --context-size applies only to local llama engines.")
+                        display.print_info("This provider does not expose a context budget.")
                     else:
                         display.print_info(
-                            f"Local context window: {window} tokens (includes instructions, tools, history and output). "
-                            "Restart with --context-size <tokens> to change it. Larger windows use more RAM. "
+                            f"Configured context budget: {window} tokens; configured output ceiling: {agent.output_reserve} tokens. "
+                            "Restart with --context-size / --max-output-tokens to change the budgets. Larger local windows use more RAM. "
                             "Old turns are dropped and big items cut automatically when a request would not fit; "
                             "/compact shrinks stored history, /clear clears it (including a persistent session)."
                         )
@@ -612,6 +643,8 @@ def review(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Context budget in tokens (NEXUS_CONTEXT_SIZE or provider default)."),
+    max_output_tokens: Optional[int] = typer.Option(None, "--max-output-tokens", min=1, help="Generation cap in tokens (NEXUS_MAX_OUTPUT_TOKENS or provider default)."),
 ):
     """Review code quality, security, and potential bugs in a local file."""
     if not file_path or not file_path.strip():
@@ -630,7 +663,7 @@ def review(
             display.print_error(f"File not found: {file_path}")
             raise typer.Exit(code=1)
 
-        prov, resolved_name = get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, **_limit_kwargs(context_size, max_output_tokens))
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations, tools=get_readonly_tools())
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
@@ -657,6 +690,8 @@ def debug(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Context budget in tokens (NEXUS_CONTEXT_SIZE or provider default)."),
+    max_output_tokens: Optional[int] = typer.Option(None, "--max-output-tokens", min=1, help="Generation cap in tokens (NEXUS_MAX_OUTPUT_TOKENS or provider default)."),
 ):
     """Diagnose and fix an error in a local codebase."""
     if not file_path or not file_path.strip() or not error or not error.strip():
@@ -675,7 +710,7 @@ def debug(
             display.print_error(f"File not found: {file_path}")
             raise typer.Exit(code=1)
 
-        prov, resolved_name = get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, **_limit_kwargs(context_size, max_output_tokens))
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
@@ -702,6 +737,8 @@ def generate(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Context budget in tokens (NEXUS_CONTEXT_SIZE or provider default)."),
+    max_output_tokens: Optional[int] = typer.Option(None, "--max-output-tokens", min=1, help="Generation cap in tokens (NEXUS_MAX_OUTPUT_TOKENS or provider default)."),
 ):
     """Generate code autonomously and save directly to file."""
     if not prompt or not prompt.strip() or not output or not output.strip():
@@ -720,7 +757,7 @@ def generate(
         existed = target.is_file()
         before = target.read_bytes() if existed else None
 
-        prov, resolved_name = get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, **_limit_kwargs(context_size, max_output_tokens))
         memory = ConversationMemory()
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations)
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
@@ -752,6 +789,8 @@ def commit(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show verbose ReAct tool trace."),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable output streaming."),
     max_iterations: int = typer.Option(10, "--max-iterations", "-m", help="Max tool iterations per query (default: 10)."),
+    context_size: Optional[int] = typer.Option(None, "--context-size", min=512, help="Context budget in tokens (NEXUS_CONTEXT_SIZE or provider default)."),
+    max_output_tokens: Optional[int] = typer.Option(None, "--max-output-tokens", min=1, help="Generation cap in tokens (NEXUS_MAX_OUTPUT_TOKENS or provider default)."),
 ):
     """Read git diff, generate a conventional commit message, and commit."""
     import subprocess
@@ -772,7 +811,7 @@ def commit(
             display.print_error("No staged or unstaged changes found to commit.")
             raise typer.Exit(code=1)
 
-        prov, resolved_name = get_provider_instance(provider)
+        prov, resolved_name = get_provider_instance(provider, **_limit_kwargs(context_size, max_output_tokens))
         memory = ConversationMemory()
         from ..agent.tools import get_readonly_tools
         agent = Agent(provider=prov, memory=memory, verbose=verbose, max_iterations=max_iterations, tools=get_readonly_tools())

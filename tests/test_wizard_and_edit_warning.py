@@ -46,13 +46,6 @@ def test_no_warning_for_plain_question(tmp_path):
     assert "no file was changed" not in out
 
 
-def test_closest_hint_for_reworded_single_line(tmp_path):
-    (tmp_path / "c.py").write_text("def add(a, b):\n    return a - b\n")
-    T.execute_read_file("c.py")
-    res = T.execute_patch_file("c.py", "    return a-b  # sub", "x")
-    assert "Closest text" in res and "return a - b" in res
-
-
 def test_wizard_skips_when_not_interactive(tmp_path, monkeypatch):
     monkeypatch.setattr(onboarding, "INIT_FILE", tmp_path / "init")
     monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": lambda self: False})())

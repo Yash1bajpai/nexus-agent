@@ -118,6 +118,9 @@ def test_parameterless_json_tool_call_accepts_null_arguments():
 def fake_openai(create):
     provider = OpenAIProvider.__new__(OpenAIProvider)
     provider.model = "offline-test"
+    provider.context_size = 8192
+    provider.max_output_tokens = 3072
+    provider._max_tokens_field = "max_completion_tokens"
     provider._openai = NS(RateLimitError=type("SDKRateLimit", (Exception,), {}))
     provider.client = NS(chat=NS(completions=NS(create=create)))
     return provider

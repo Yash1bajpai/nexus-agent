@@ -88,9 +88,15 @@ def test_one_shot_chat_stays_throwaway_unless_asked():
 
 def test_python_dash_m_entry_point_runs():
     import subprocess
-    out = subprocess.run([sys.executable, "-m", "nexus_agent_ai", "--version"], capture_output=True, text=True,
-                         env={**os.environ, "HOME": str(Path.home()), "USERPROFILE": str(Path.home())})
-    assert out.returncode == 0 and "Nexus-Agent CLI" in out.stdout
+    # pytest's pythonpath setting is process-local. HOME isolation also hides
+    # user-site dependencies, even when the project itself is editable-installed.
+    # Keep cwd/home isolated while giving the child the parent's import environment.
+    env = {**os.environ, "HOME": str(Path.home()), "USERPROFILE": str(Path.home()),
+           "PYTHONPATH": os.pathsep.join(str(Path(p).resolve()) for p in sys.path if p)}
+    out = subprocess.run([sys.executable, "-m", "nexus_agent_ai", "--version"],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr
+    assert "Nexus-Agent CLI" in out.stdout
 
 
 @pytest.mark.parametrize("machine,expected", [("AMD64", "win-cpu-x64.zip"), ("ARM64", "win-cpu-arm64.zip")])

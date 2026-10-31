@@ -1,15 +1,32 @@
-import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 # pyrefly: ignore [missing-import]
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
+from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
+from .capabilities import resolve_limits
 # pyrefly: ignore [missing-import]
 from ..utils.config import get_env_or_raise
-from .messages import assistant_message, gemini_messages, tool_result
+from .messages import assistant_message, decode_native_tool_call, gemini_messages, tool_result
+
+def _finish_reason(raw: Any) -> Optional[str]:
+    """Report Gemini's token-limit stops with the same "length" value other providers use."""
+    if raw is None:
+        return None
+    name = getattr(raw, "name", None)
+    text = (name if isinstance(name, str) else str(raw)).rsplit(".", 1)[-1].upper()
+    if text == "MAX_TOKENS":
+        return "length"
+    return text.lower() or None
+
 
 class GeminiProvider(BaseProvider):
     """LLM Provider implementation for Google Gemini models via google-genai SDK."""
 
-    def __init__(self, model: str = "gemini-2.5-flash-lite"):
+    def __init__(
+        self, model: str = "gemini-2.5-flash-lite", context_size: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+    ):
+        limits = resolve_limits("gemini", model, context_size, max_output_tokens)
+        self.context_size = limits.context_size
+        self.max_output_tokens = limits.max_output_tokens
         try:
             from google import genai
             from google.genai import types
@@ -44,6 +61,7 @@ class GeminiProvider(BaseProvider):
         config = self._types.GenerateContentConfig(
             system_instruction=system if system else None,
             tools=genai_tools if genai_tools else None,
+            max_output_tokens=self.max_output_tokens,
         )
 
         gemini_contents = self._format_messages(messages)
@@ -67,6 +85,7 @@ class GeminiProvider(BaseProvider):
             reason = getattr(feedback, "block_reason", None) or "empty response"
             raise RuntimeError(f"Gemini returned no candidates ({reason}).")
         candidate = response.candidates[0]
+        finish_reason = _finish_reason(getattr(candidate, "finish_reason", None))
         parts = None
         if candidate.content and candidate.content.parts:
             parts = candidate.content.parts
@@ -75,13 +94,14 @@ class GeminiProvider(BaseProvider):
             for part in parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
-                if hasattr(part, "function_call") and part.function_call:
+                if finish_reason != "length" and hasattr(part, "function_call") and part.function_call:
                     fc = part.function_call
+                    # The SDK represents an omitted parameterless args field as None.
+                    arguments = getattr(fc, "args", None)
                     tool_calls.append(
-                        ToolCall(
-                            id=fc.id if isinstance(getattr(fc, "id", None), str) and fc.id else f"call_{uuid.uuid4().hex}",
-                            name=fc.name,
-                            args=dict(fc.args) if fc.args else {},
+                        decode_native_tool_call(
+                            fc.name, {} if arguments is None else arguments,
+                            fc.id if isinstance(getattr(fc, "id", None), str) else None,
                         )
                     )
 
@@ -107,6 +127,7 @@ class GeminiProvider(BaseProvider):
             raw_assistant_message=raw_msg,
             input_tokens=in_tokens,
             output_tokens=out_tokens,
+            finish_reason=finish_reason,
         )
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
@@ -114,6 +135,7 @@ class GeminiProvider(BaseProvider):
         config = self._types.GenerateContentConfig(
             system_instruction=system if system else None,
             tools=genai_tools if genai_tools else None,
+            max_output_tokens=self.max_output_tokens,
         )
         gemini_contents = self._format_messages(messages)
         try:
@@ -124,7 +146,9 @@ class GeminiProvider(BaseProvider):
             )
             full_text = []
             tool_calls = []
+            pending_calls = []
             last_chunk = None
+            finish_reason = None
             for chunk in response_stream:
                 last_chunk = chunk
                 if hasattr(chunk, "text") and chunk.text:
@@ -132,19 +156,26 @@ class GeminiProvider(BaseProvider):
                     yield chunk.text
                 if hasattr(chunk, "candidates") and chunk.candidates:
                     for candidate in chunk.candidates:
+                        reason = _finish_reason(getattr(candidate, "finish_reason", None))
+                        if reason is not None and finish_reason != "length":
+                            finish_reason = reason
                         if candidate.content and candidate.content.parts:
                             for part in candidate.content.parts:
                                 if hasattr(part, "function_call") and part.function_call:
-                                    fc = part.function_call
-                                    tool_calls.append(
-                                        ToolCall(
-                                            id=fc.id if isinstance(getattr(fc, "id", None), str) and fc.id else f"call_{uuid.uuid4().hex}",
-                                            name=fc.name,
-                                            args=dict(fc.args) if fc.args else {},
-                                        )
-                                    )
+                                    pending_calls.append(part.function_call)
 
-            if not full_text and not tool_calls:
+            # A later chunk can report a cutoff after an incomplete function call.
+            # Validate only after the final status is known, never on partial args.
+            if finish_reason != "length":
+                for fc in pending_calls:
+                    arguments = getattr(fc, "args", None)
+                    tool_calls.append(
+                        decode_native_tool_call(
+                            fc.name, {} if arguments is None else arguments,
+                            fc.id if isinstance(getattr(fc, "id", None), str) else None,
+                        )
+                    )
+            if not full_text and not tool_calls and finish_reason != "length":
                 feedback = getattr(last_chunk, "prompt_feedback", None)
                 reason = getattr(feedback, "block_reason", None) or "empty stream"
                 raise RuntimeError(f"Gemini returned no usable content ({reason}).")
@@ -161,6 +192,7 @@ class GeminiProvider(BaseProvider):
                 raw_assistant_message=raw_msg,
                 input_tokens=in_tokens,
                 output_tokens=out_tokens,
+                finish_reason=finish_reason,
             )
         except Exception as e:
             err_str = str(e).lower()

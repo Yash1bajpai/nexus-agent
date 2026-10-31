@@ -1,13 +1,26 @@
 from typing import Any, Dict, List, Optional
-from .base import BaseProvider, ProviderResponse, Tool, ToolCall, RateLimitError
+from .base import BaseProvider, ProviderResponse, Tool, RateLimitError
+from .capabilities import resolve_limits
 from ..utils.config import get_env_or_raise
-from .messages import anthropic_messages, assistant_message, tool_result
-import uuid
+from .messages import anthropic_messages, assistant_message, decode_native_tool_call, tool_result
+
+def _finish_reason(stop_reason: Any) -> Optional[str]:
+    """Report Claude's token-limit stops with the same "length" value other providers use."""
+    if stop_reason == "max_tokens":
+        return "length"
+    return stop_reason if isinstance(stop_reason, str) else None
+
 
 class AnthropicProvider(BaseProvider):
     """LLM Provider implementation for Anthropic Claude models."""
 
-    def __init__(self, model: str = "claude-sonnet-4-6"):
+    def __init__(
+        self, model: str = "claude-sonnet-4-6", context_size: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+    ):
+        limits = resolve_limits("anthropic", model, context_size, max_output_tokens)
+        self.context_size = limits.context_size
+        self.max_output_tokens = limits.max_output_tokens
         try:
             import anthropic
         except ImportError as e:
@@ -28,56 +41,19 @@ class AnthropicProvider(BaseProvider):
         ]
 
     def complete(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> ProviderResponse:
-        converted_tools = self._convert_tools(tools)
-
-        kwargs: Dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": 4096,
-            "system": system,
-            "messages": anthropic_messages(messages),
-        }
-        if converted_tools:
-            kwargs["tools"] = converted_tools
-
-        try:
-            response = self.client.messages.create(**kwargs)
-        except self._anthropic.RateLimitError as e:
-            raise RateLimitError("Anthropic", str(e))
-        except Exception as e:
-            err_str = str(e).lower()
-            if "429" in str(e) or "rate limit" in err_str or "quota" in err_str:
-                raise RateLimitError("Anthropic", str(e))
-            raise
-
-        text = ""
-        tool_calls = []
-        for content_block in response.content:
-            if content_block.type == "text":
-                text += content_block.text
-            elif content_block.type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        id=content_block.id or f"call_{uuid.uuid4().hex}",
-                        name=content_block.name,
-                        args=content_block.input,
-                    )
-                )
-
-        raw_msg = assistant_message(text, tool_calls)
-
-        return ProviderResponse(
-            text=text,
-            tool_calls=tool_calls,
-            raw_assistant_message=raw_msg,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
+        # High synchronous output caps require streaming transport in the SDK.
+        # Collect internally without rendering chunks; this is not the Batches API.
+        # https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python#long-requests
+        for chunk in self.stream(messages, tools, system):
+            if isinstance(chunk, ProviderResponse):
+                return chunk
+        raise RuntimeError("Anthropic stream completed without a final response.")
 
     def stream(self, messages: List[Dict[str, Any]], tools: List[Tool], system: str) -> Any:
         converted_tools = self._convert_tools(tools)
         kwargs: Dict[str, Any] = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": self.max_output_tokens,
             "system": system,
             "messages": anthropic_messages(messages),
         }
@@ -94,14 +70,11 @@ class AnthropicProvider(BaseProvider):
 
             text = "".join(full_text)
             tool_calls = []
+            finish_reason = _finish_reason(getattr(final_msg, "stop_reason", None))
             for content_block in final_msg.content:
-                if content_block.type == "tool_use":
+                if content_block.type == "tool_use" and finish_reason != "length":
                     tool_calls.append(
-                        ToolCall(
-                            id=content_block.id or f"call_{uuid.uuid4().hex}",
-                            name=content_block.name,
-                            args=content_block.input,
-                        )
+                        decode_native_tool_call(content_block.name, content_block.input, content_block.id)
                     )
 
             raw_msg = assistant_message(text, tool_calls)
@@ -114,6 +87,7 @@ class AnthropicProvider(BaseProvider):
                 raw_assistant_message=raw_msg,
                 input_tokens=in_tokens,
                 output_tokens=out_tokens,
+                finish_reason=finish_reason,
             )
         except self._anthropic.RateLimitError as e:
             raise RateLimitError("Anthropic", str(e))

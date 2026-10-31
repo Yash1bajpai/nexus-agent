@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import tempfile
 import subprocess
 import ast
@@ -262,15 +263,52 @@ def execute_write_file(path: str, content: str) -> str:
     except Exception as e:
         return f"ERROR: Could not write file: {str(e)}"
 
-def _find_loose_match(content: str, target: str):
-    """Find a unique span equal to target when trailing whitespace is ignored. Returns (start, end) or None."""
-    target_lines = [ln.rstrip() for ln in target.replace("\r\n", "\n").split("\n")]
-    while target_lines and target_lines[-1] == "":
-        target_lines.pop()
-    if not target_lines or not any(target_lines):
+def _python_line_signatures(text: str):
+    """Ignore horizontal token gaps, never indentation or literal/comment content."""
+    import io
+    import tokenize
+
+    lines = io.StringIO(text).readlines()
+    signatures = []
+    for line in lines:
+        indentation = line[:len(line) - len(line.lstrip(" \t\f"))]
+        continuation = line.rstrip("\r\n").rstrip(" \t").endswith("\\")
+        signatures.append((indentation, continuation, []))
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type in (tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
+                continue
+            if token.type == tokenize.ERRORTOKEN:
+                return None
+            spelling = "\n" if token.type in (tokenize.NL, tokenize.NEWLINE) else token.string
+            first, last = token.start[0], token.end[0]
+            # Mark every occupied line, so a fragment inside a multiline string
+            # cannot masquerade as standalone Python code.
+            for row in range(first, last + 1):
+                if row <= len(signatures):
+                    signatures[row - 1][2].append((token.type, spelling, row - first, last - first))
+    except (tokenize.TokenError, SyntaxError):
         return None
-    content_lines = content.splitlines(keepends=True)
-    stripped = [ln.rstrip("\r\n").rstrip() for ln in content_lines]
+    return signatures
+
+
+def _find_loose_match(content: str, target: str, *, python: bool = False):
+    """Find one complete-line span with only safe whitespace differences."""
+    if not target.strip():
+        return None
+    if python:
+        import io
+        content_lines = io.StringIO(content).readlines()
+        target_lines = _python_line_signatures(target)
+        stripped = _python_line_signatures(content)
+        if target_lines is None or stripped is None:
+            return None
+    else:
+        target_lines = [ln.rstrip() for ln in target.replace("\r\n", "\n").split("\n")]
+        while target_lines and target_lines[-1] == "":
+            target_lines.pop()
+        content_lines = content.splitlines(keepends=True)
+        stripped = [ln.rstrip("\r\n").rstrip() for ln in content_lines]
     n = len(target_lines)
     hits = [i for i in range(len(stripped) - n + 1) if stripped[i:i + n] == target_lines]
     if len(hits) != 1:
@@ -287,9 +325,17 @@ def _find_loose_match(content: str, target: str):
 def _target_not_found_message(path: str, content: str, target: str) -> str:
     """Explain the miss and show the closest real lines so the model can retry accurately."""
     import difflib
+    import json
     msg = (f"ERROR: Target content not found in '{path}'. "
            "Ensure the target matches existing file content exactly, including whitespace and line breaks.")
     lines = content.splitlines()
+    if len(lines) <= 12 and len(content) <= 1200:
+        return (
+            msg + "\nNothing was changed. target must be OLD text already in the file, "
+            "not the requested new text. Copy this exact target (JSON):\n"
+            + json.dumps({"path": path, "target": content}, ensure_ascii=False)
+            + "\nRetry patch_file with this OLD target and put the requested NEW text in replacement."
+        )
     t_lines = target.splitlines() or [target]
     n = max(1, len(t_lines))
     flat_target = "\n".join(t_lines)
@@ -344,11 +390,13 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
 
         count = content.count(target)
         if count == 0:
-            loose = _find_loose_match(content, target)
+            is_python = p.suffix.lower() == ".py"
+            loose = _find_loose_match(content, target, python=is_python)
             if loose is not None:
                 start, end = loose
                 new_content = content[:start] + replacement + content[end:]
-                note = " Target matched after ignoring trailing whitespace."
+                note = (" Target matched after ignoring token-equivalent horizontal/trailing whitespace."
+                        if is_python else " Target matched after ignoring trailing whitespace.")
                 count = 1
             else:
                 return _target_not_found_message(path, content, target)
@@ -615,57 +663,83 @@ def execute_run_code(code: str, language: str = "python") -> str:
         return f"ERROR: Code execution failed: {str(e)}"
 
 def execute_search_web(query: str) -> str:
-    """Search the web using DuckDuckGo with relevance validation and resilient fallback."""
-    def _get_curated_fallback(query: str) -> str:
-        """Return a curated fallback when DuckDuckGo is unavailable or returns off-topic results."""
-        return f"Live web search is currently unavailable or rate-limited for query: '{query}'."
+    """Return formatted results (ok), or an ERROR with a stable search category.
+
+    Empty responses try the remaining backend; irrelevant responses are final.
+    If retrieval never succeeds, an observed empty response remains an empty
+    outcome even if the other backend failed. both_failed requires two execution
+    exceptions; backend_error covers failures without any empty response.
+    """
 
     def _is_relevant(results: list, query: str) -> bool:
-        """Check if DuckDuckGo results are actually relevant to the query."""
+        """Require subject overlap, not just generic freshness/release wording."""
         if not results:
             return False
-        query_keywords = set(w.lower() for w in query.split() if len(w) > 3)
-        if not query_keywords:
+        query_keywords = set(re.findall(r"\w+(?:\+\+|#)?", query.lower()))
+        modifiers = {
+            "a", "an", "and", "about", "current", "documentation", "docs", "download", "downloads",
+            "find", "for", "from", "in", "is", "latest", "notes", "of", "official", "on", "please",
+            "release", "releases", "search", "stable", "that", "the", "this", "to", "version", "versions",
+            "web", "what", "when", "where", "which", "with",
+        }
+        subjects = query_keywords - modifiers
+        keywords = subjects or query_keywords
+        if not keywords:
             return True
-        hits = 0
-        for r in results[:3]:
-            combined = (r.get("title", "") + " " + r.get("body", "") + " " + r.get("href", "")).lower()
-            if any(kw in combined for kw in query_keywords):
-                hits += 1
-        return hits >= 1
+        for result in results[:3]:
+            combined = " ".join(result.get(key, "") for key in ("title", "body", "href"))
+            if keywords.intersection(re.findall(r"\w+(?:\+\+|#)?", combined.lower())):
+                return True
+        return False
 
-    try:
-        import warnings
-        orig_warn = warnings.warn
-        results = []
+    from importlib import import_module
+
+    failures = []
+    execution_failures = []
+    empty_backends = []
+    for backend in ("ddgs", "duckduckgo_search"):
         try:
-            warnings.warn = lambda msg, *a, **kw: None if "duckduckgo_search" in str(msg) or "ddgs" in str(msg) else orig_warn(msg, *a, **kw)
-            try:
-                from ddgs import DDGS
-                results = DDGS().text(query, max_results=5)
-            except Exception:
-                try:
-                    from duckduckgo_search import DDGS
-                    results = DDGS().text(query, max_results=5)
-                except Exception:
-                    results = []
-        except Exception:
-            results = []
-        finally:
-            warnings.warn = orig_warn
+            DDGS = import_module(backend).DDGS
+        except Exception as exc:
+            failures.append(f"{backend}: import failed ({type(exc).__name__})")
+            continue
 
-        if not results or not _is_relevant(results, query):
-            return f"[Live Search Warning]: {_get_curated_fallback(query)}"
+        try:
+            results = DDGS().text(query, max_results=5)
+            if not results:
+                empty_backends.append(backend)
+                continue
+            if not _is_relevant(results, query):
+                return (
+                    f"ERROR: search_web [irrelevant]: Results from {backend} did not pass "
+                    f"the relevance check for query: '{query}'."
+                )
 
-        formatted = [f"Search results for: '{query}'\n"]
-        for idx, r in enumerate(results, 1):
-            title = r.get("title", "No Title")
-            href = r.get("href", "")
-            body = r.get("body", "")
-            formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
-        return "\n".join(formatted)
-    except Exception:
-        return f"[Live Search Warning]: {_get_curated_fallback(query)}"
+            formatted = [f"Search results for: '{query}'\n"]
+            for idx, r in enumerate(results, 1):
+                title = r.get("title", "No Title")
+                href = r.get("href", "")
+                body = r.get("body", "")
+                formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
+            return "\n".join(formatted)
+        except Exception as exc:
+            execution_failures.append(backend)
+            # Exception messages may contain credential-bearing URLs or tokens.
+            failures.append(f"{backend}: execution failed ({type(exc).__name__})")
+
+    if empty_backends:
+        details = (" " + "; ".join(failures) + ".") if failures else ""
+        return (
+            f"ERROR: search_web [empty]: Backend(s) {', '.join(empty_backends)} returned no results "
+            f"for query: '{query}'." + details + " The underlying cause is unknown."
+        )
+
+    category = "both_failed" if len(execution_failures) == 2 else "backend_error"
+    return (
+        f"ERROR: search_web [{category}]: No live search results could be retrieved "
+        f"for query: '{query}'. " + "; ".join(failures)
+        + ". The underlying cause is unknown."
+    )
 
 def _git_root() -> Path:
     result = _safe_git_run(["git", "rev-parse", "--show-toplevel"])
@@ -877,11 +951,11 @@ PATCH_FILE_TOOL = Tool(
             },
             "target": {
                 "type": "string",
-                "description": "The exact string or block of code to find and replace. Must match the existing file content exactly.",
+                "description": "OLD text copied from the current file before the change. Never put the desired new text here. On a mismatch, copy the exact target JSON from the error.",
             },
             "replacement": {
                 "type": "string",
-                "description": "The new replacement code or text.",
+                "description": "NEW text to insert in place of the OLD target. Preserve the intended indentation and line breaks.",
             },
             "allow_multiple": {
                 "type": "boolean",
