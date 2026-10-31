@@ -222,6 +222,82 @@ jobs:
           "S3: PASS (exit 0, observed search, final answer external source URL; no fixed version asserted)" | Tee-Object -FilePath status.log -Append
           $finalSources | Tee-Object -FilePath status.log -Append
           Get-Content status.log | Add-Content $env:GITHUB_STEP_SUMMARY
+          $global:LASTEXITCODE = 0
+      - name: S5 - review identifies an add-subtract mismatch
+        if: ${{ always() && !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $work = "$env:RUNNER_TEMP\nexus-first-run\s5"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          Set-Content review_target.py "def add(a, b):`r`n    return a - b"
+          Get-Command nexus-agent -CommandType Application -ErrorAction Stop | Out-Null
+          nexus-agent review review_target.py 2>&1 | Tee-Object -FilePath chat.log
+          $chatExit = $LASTEXITCODE
+          "S5 exit code: $chatExit" | Tee-Object -FilePath status.log
+          if ($chatExit -ne 0) { throw "S5 review failed with exit code $chatExit" }
+          $output = (Get-Content chat.log -Raw) -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
+          if ($output -match '(?i)\b(?:subtract(?:ion|s|ed|ing)?|minus|a\s*-\s*b)\b') {
+            $result = "S5: PASS (exit 0, review identified subtraction mismatch)"
+          } else {
+            $result = "S5: CAPABILITY-MISS (exit 0, review did not mention add/subtract mismatch)"
+            Write-Warning $result
+          }
+          $result | Tee-Object -FilePath status.log -Append
+          Get-Content status.log | Add-Content $env:GITHUB_STEP_SUMMARY
+          $global:LASTEXITCODE = 0
+      - name: S7 - debug fixes a zero-division error or honest failure
+        if: ${{ always() && !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $work = "$env:RUNNER_TEMP\nexus-first-run\s7"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          Set-Content buggy.py "def divide(a, b):`r`n    return a / b"
+          Get-Command nexus-agent -CommandType Application -ErrorAction Stop | Out-Null
+          nexus-agent debug buggy.py -e "ZeroDivisionError: division by zero" --verbose 2>&1 | Tee-Object -FilePath chat.log
+          $chatExit = $LASTEXITCODE
+          "S7 exit code: $chatExit" | Tee-Object -FilePath status.log
+          if (Test-Path buggy.py) {
+            "buggy.py after debug:" | Tee-Object -FilePath status.log -Append
+            Get-Content buggy.py | Tee-Object -FilePath status.log -Append
+          } else {
+            "buggy.py is missing after debug" | Tee-Object -FilePath status.log -Append
+          }
+          python -c "import ast, pathlib, sys; p = pathlib.Path('buggy.py'); tree = ast.parse(p.read_text(encoding='utf-8-sig')) if p.is_file() else ast.Module(body=[], type_ignores=[]); src = p.read_text(encoding='utf-8-sig') if p.is_file() else ''; has_if = any(isinstance(n, (ast.If, ast.IfExp)) for n in ast.walk(tree)); has_try = any(isinstance(n, ast.Try) for n in ast.walk(tree)); has_zero = any(isinstance(n, ast.Constant) and n.value == 0 for n in ast.walk(tree)); guarded = (has_if and (has_zero or 'b' in src)) or (has_try and 'ZeroDivisionError' in src); print('AST parsed:', bool(tree.body), 'Guarded:', guarded); sys.exit(0 if (bool(tree.body) and guarded) else 1)" 2>&1 | Tee-Object -FilePath status.log -Append
+          $fileCheckExit = $LASTEXITCODE
+          $output = (Get-Content chat.log -Raw) -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
+          if ($chatExit -eq 0) {
+            if ($fileCheckExit -ne 0) { throw "S7 falsely reported success without a valid zero-division guard in buggy.py" }
+            $finalText = $output
+            if ($finalText -match '(?s)╭─+\s*Response\s*─+╮\s*(?<ans>.*?)\s*╰─+') {
+              $finalText = $Matches['ans']
+            } else {
+              $parts = [regex]::Split($finalText, '(?m)^\s*\[OBSERVE\].*$')
+              if ($parts.Length -gt 1) { $finalText = $parts[-1] }
+              if ($finalText -match '(?s)(?<ans>.*?)\s*Tokens:\s*') { $finalText = $Matches['ans'] }
+            }
+            $claimsVerification = ($finalText -match '(?i)\b(?:verified|ran\s+(?:a\s+)?tests?|checked\s+the\s+file)\b')
+            $ranTestsOrCode = ($output -match '\[ACTION\]\s+(?:run_code|run_tests)\b')
+            if ($claimsVerification -and -not $ranTestsOrCode) {
+              $result = "S7: PARTIAL (exit 0, zero-guard added, but claimed verification without executing run_code or run_tests)"
+              Write-Warning $result
+            } else {
+              $result = "S7: PASS (exit 0, AST-confirmed zero-guard)"
+            }
+          } else {
+            if ($chatExit -ne 1 -or $output -notmatch '(?s)Tokens:.*Time:' -or
+                $output -notmatch '\[ERROR\]' -or $output -match 'Fatal execution error:') {
+              throw "S7 failed to run normally; exit $chatExit is not an honest agent outcome"
+            }
+            $result = "S7: PASS - HONEST FAILURE (agent exit $chatExit; AST check exit $fileCheckExit; not accepted as completed)"
+            Write-Warning $result
+          }
+          $result | Tee-Object -FilePath status.log -Append
+          Get-Content status.log | Add-Content $env:GITHUB_STEP_SUMMARY
+          $global:LASTEXITCODE = 0
       - name: Upload first-run logs and qualification file state
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
