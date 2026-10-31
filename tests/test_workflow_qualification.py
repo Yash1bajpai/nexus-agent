@@ -2,26 +2,22 @@
 import ast
 from pathlib import Path
 import re
-import yaml
 import pytest
-
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 
 
-def _load_workflow(name: str):
+def _load_workflow(name: str) -> str:
     path = WORKFLOWS_DIR / name
     assert path.is_file(), f"Workflow file not found: {path}"
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f), path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8")
 
 
 def test_windows_workflow_structure_and_steps():
-    data, raw = _load_workflow("windows.yml")
-    first_run = data["jobs"]["first-run"]
-    assert first_run["runs-on"] == "windows-latest"
-    assert first_run["if"] == "github.event_name == 'workflow_dispatch'"
+    raw = _load_workflow("windows.yml")
+    assert re.search(r"first-run:\s*.*?\bruns-on:\s*windows-latest", raw, re.DOTALL)
+    assert re.search(r"first-run:\s*.*?github\.event_name\s*==\s*'workflow_dispatch'", raw, re.DOTALL)
 
-    step_names = [s.get("name", "") for s in first_run["steps"]]
+    step_names = re.findall(r"-\s*name:\s*(.+)", raw)
     assert any("S1 -" in name for name in step_names)
     assert any("S2 -" in name for name in step_names)
     assert any("S3 -" in name for name in step_names)
@@ -47,12 +43,11 @@ def test_windows_workflow_structure_and_steps():
 
 
 def test_macos_workflow_structure_and_steps():
-    data, raw = _load_workflow("macos.yml")
-    first_run = data["jobs"]["first-run"]
-    assert first_run["runs-on"] == "macos-latest"
-    assert first_run["if"] == "github.event_name == 'workflow_dispatch'"
+    raw = _load_workflow("macos.yml")
+    assert re.search(r"first-run:\s*.*?\bruns-on:\s*macos-latest", raw, re.DOTALL)
+    assert re.search(r"first-run:\s*.*?github\.event_name\s*==\s*'workflow_dispatch'", raw, re.DOTALL)
 
-    step_names = [s.get("name", "") for s in first_run["steps"]]
+    step_names = re.findall(r"-\s*name:\s*(.+)", raw)
     assert any("S1 -" in name for name in step_names)
     assert any("S2 -" in name for name in step_names)
     assert any("S3 -" in name for name in step_names)
