@@ -117,6 +117,9 @@ _WHOLE_FILE_VERB = re.compile(
     r"\b(rewrite|re-write|recreate|re-create|overwrite|start over|from scratch|redo|scrap|wipe)\b",
     re.IGNORECASE)
 _PROTECTIVE = re.compile(r"\b(don't|do not|never|keep|preserve|without|avoid|leave)\b", re.IGNORECASE)
+_TRANSFORM = re.compile(
+    r"\b(?:rename|replace|change|swap|convert|turn)\s+(?:the\s+)?([A-Za-z_]\w*)"
+    r"\s*(?:\(\s*\)|function|method|class)?\s*(?:to|into|with|for)\b", re.IGNORECASE)
 _QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`[^`]*`')
 _FILE_REF = re.compile(r"\b[\w.-]+\.\w{1,5}\b")
 _SYMBOL_REF = re.compile(r"\b(?:the\s+)?([A-Za-z_]\w*)\s*(?:\(\s*\)|function|method|class)\b", re.IGNORECASE)
@@ -143,6 +146,8 @@ def _parse_removal_intent(text: str):
         if _PROTECTIVE.search(clause):
             protected |= cl_symbols
             continue
+        for m in _TRANSFORM.finditer(clause):
+            grants.add(("symbol", m.group(1).lower()))
         if not _DELETION_VERB.search(clause):
             continue
         if cl_files and _WHOLE_FILE_VERB.search(clause):
@@ -175,9 +180,11 @@ def _removal_authorized(p: Path, dropped_symbols) -> bool:
     name = p.name.lower()
     if ("file", name) in grants:
         return True
-    if lowered and all(
-            ("symbol", sym) in grants or ("filesymbol", name, sym) in grants
-            for sym in lowered):
+    def granted(sym):
+        bare = sym.split(".")[-1]
+        return (("symbol", sym) in grants or ("symbol", bare) in grants
+                or ("filesymbol", name, sym) in grants or ("filesymbol", name, bare) in grants)
+    if lowered and all(granted(sym) for sym in lowered):
         return True
     return False
 
@@ -350,21 +357,55 @@ def _atomic_file_update(p: Path, content: str) -> bool:
                 temporary.unlink()
     return True
 
+def _python_symbol_inventory(tree):
+    """(kind, name) pairs that are load-bearing if dropped: top-level defs/classes,
+    methods of classes, imported names, and module-level assigned names."""
+    import ast
+    out = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append(("function", node.name))
+        elif isinstance(node, ast.ClassDef):
+            out.append(("class", node.name))
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.append(("method", f"{node.name}.{sub.name}"))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                out.append(("import", (alias.asname or alias.name).split(".")[0]))
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                out.append(("import", alias.asname or alias.name))
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    out.append(("name", tgt.id))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.append(("name", node.target.id))
+    return out
+
+
 def _dropped_python_symbols(old: str, new: str):
-    """Top-level function/class names present in old but absent in new; None if either side unparseable."""
+    """(kind, name) symbols present in old but absent in new; None if either side unparseable."""
     import ast
     try:
         old_tree = ast.parse(old)
         new_tree = ast.parse(new)
     except (SyntaxError, ValueError):
         return None
-
-    def top_level(tree):
-        return [n.name for n in tree.body
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-
-    new_names = set(top_level(new_tree))
-    return [n for n in top_level(old_tree) if n not in new_names]
+    new_names = {name for _, name in _python_symbol_inventory(new_tree)}
+    new_classes = {name for kind, name in _python_symbol_inventory(new_tree) if kind == "class"}
+    dropped = []
+    for kind, name in _python_symbol_inventory(old_tree):
+        if kind == "method":
+            cls = name.split(".", 1)[0]
+            if cls not in new_classes:
+                continue  # the class drop itself is already reported
+            if name not in new_names:
+                dropped.append((kind, name))
+        elif name not in new_names:
+            dropped.append((kind, name))
+    return dropped
 
 
 def _describe_content_loss(name: str, old: str, new: str):
@@ -376,7 +417,8 @@ def _describe_content_loss(name: str, old: str, new: str):
     if name.endswith(".py"):
         dropped = _dropped_python_symbols(old, new)
         if dropped:
-            return "top-level definition(s): " + ", ".join(dropped), dropped
+            return ("existing " + ", ".join(f"{kind} {n}" for kind, n in dropped),
+                    [n for _, n in dropped])
         if dropped is not None:
             return None, []
     old_lines = [l for l in old.splitlines() if l.strip()]
@@ -575,6 +617,12 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         syntax_error = _validate_python_content(p, new_content)
         if syntax_error:
             return syntax_error
+
+        loss, dropped = _describe_content_loss(p.name, content, new_content)
+        if loss and not content_removal_approved(p, loss, dropped):
+            return (f"ERROR: This patch to '{path}' would delete {loss}. "
+                    "The user has not approved removing it. Ask the user to confirm the removal, "
+                    "or choose a target that keeps the existing content.")
 
         if not _atomic_file_update(p, new_content):
             return f"No changes: '{path}' already has the requested content."

@@ -949,3 +949,57 @@ def test_content_removal_consent_denial_and_no_tty_fail_closed(tmp_path, monkeyp
     result = tools_module.execute_write_file(str(path), rewrite)
     assert result.startswith("ERROR:")
     assert path.read_text() == CALC_WITH_ADD
+
+
+def test_patch_file_whole_file_target_cannot_smuggle_content_loss(tmp_path):
+    # The gate-run gap: patching with target=whole file, replacement=partial
+    # content must face the same removal authority as write_file.
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    result = tools_module.execute_patch_file(
+        str(path), CALC_WITH_ADD,
+        "def divide(a, b):\n    if b == 0:\n        raise ValueError('division by zero')\n    return a / b\n")
+    assert result.startswith("ERROR:") and "add" in result
+    assert path.read_text() == CALC_WITH_ADD
+    # A targeted patch that only rewrites divide still works.
+    result = tools_module.execute_patch_file(
+        str(path), "def divide(a, b):\n    return a / b\n",
+        "def divide(a, b):\n    if b == 0:\n        raise ValueError('division by zero')\n    return a / b\n")
+    assert result.startswith("Successfully")
+    assert "def add(" in path.read_text()
+    assert "ValueError" in path.read_text()
+
+
+def test_content_loss_covers_methods_imports_constants(tmp_path):
+    from nexus_agent_ai.agent.tools import _describe_content_loss
+    old = (
+        "import os\n"
+        "from typing import Optional\n"
+        "TIMEOUT = 30\n\n"
+        "class Calc:\n"
+        "    def add(self, a, b):\n"
+        "        return a + b\n"
+        "    def mul(self, a, b):\n"
+        "        return a * b\n"
+    )
+    # Method dropped from a retained class.
+    loss, dropped = _describe_content_loss("c.py", old, old.replace("    def mul(self, a, b):\n        return a * b\n", ""))
+    assert loss and "Calc.mul" in loss
+    # Import dropped.
+    loss, dropped = _describe_content_loss("c.py", old, old.replace("import os\n", ""))
+    assert loss and "import os" in loss
+    # Module constant dropped.
+    loss, dropped = _describe_content_loss("c.py", old, old.replace("TIMEOUT = 30\n", ""))
+    assert loss and "TIMEOUT" in loss
+    # Rename instruction authorizes dropping the old symbol.
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.set_user_intent("rename the mul method to multiply")
+    try:
+        assert tools_module._removal_authorized(tmp_path / "c.py", ["Calc.mul"]) is True
+        assert tools_module._removal_authorized(tmp_path / "c.py", ["Calc.add"]) is False
+    finally:
+        tools_module.set_user_intent("")
+    # Nothing dropped -> no loss.
+    assert _describe_content_loss("c.py", old, old + "\nX = 1\n") == (None, [])
