@@ -726,3 +726,140 @@ def test_search_web_surfaces_actual_supporting_url_in_final_answer(monkeypatch):
     assert "Source: https://www.python.org/downloads/latest/" in final
     assert not agent.claim_unverified
     assert cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+class BoostTranscript(Transcript):
+    """Local transcript that records output caps and supports the boost path."""
+
+    context_size = 4096
+    max_output_tokens = 512
+    _supports_output_budget = True
+
+    def __init__(self, turns):
+        super().__init__(turns)
+        self.caps = []
+
+    def complete(self, messages, tools, system):
+        self.caps.append(getattr(self, "_request_output_cap", None))
+        return super().complete(messages, tools, system)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_truncated_file_write_never_lands_and_boost_retry_writes_once(tmp_path, stream):
+    full = "line one\nline two\nline three\n"
+    provider = BoostTranscript([
+        # Truncated mid-write: partial args + finish_reason=length.
+        ProviderResponse(
+            text="partial",
+            tool_calls=[ToolCall("c1", "write_file", {"path": "notes.txt", "content": "line one\nline tw"})],
+            finish_reason="length",
+        ),
+        # The boosted retry completes the same write with full content.
+        ("write_file", {"path": "notes.txt", "content": full}),
+        "Created notes.txt with the three lines.",
+    ])
+    agent = Agent(provider, verbose=False)
+    final = agent.run("create a file notes.txt with these three lines", stream=stream)
+
+    # The truncated call was discarded before execution; the retried complete
+    # call executed exactly once; the file holds only the full content.
+    assert (tmp_path / "notes.txt").read_text() == full
+    assert not agent.response_incomplete
+    assert len(provider.caps) == 3
+    assert provider.caps[1] > provider.caps[0]  # the boosted retry
+    assert any(p.endswith("notes.txt") for p in agent.changed_files)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_truncation_fail_closed_when_boost_also_truncates(tmp_path, stream):
+    def truncated(call_id):
+        return ProviderResponse(
+            text="partial",
+            tool_calls=[ToolCall(call_id, "write_file", {"path": "notes.txt", "content": "never written"})],
+            finish_reason="length",
+        )
+
+    provider = BoostTranscript([truncated("c1"), truncated("c2")])
+    agent = Agent(provider, max_iterations=4, verbose=False)
+    final = agent.run("create a file notes.txt with this content", stream=stream)
+
+    # Fail closed: no partial file, no mutation, honest incomplete signal.
+    assert not (tmp_path / "notes.txt").exists()
+    assert agent.response_incomplete
+    assert "reached its output limit" in final
+    assert len(provider.caps) == 2  # original + one bounded boost retry
+    assert provider.caps[1] > provider.caps[0]
+    assert agent.changed_files == set()
+
+
+CALC_WITH_ADD = "def add(a, b):\n    return a + b\n\ndef divide(a, b):\n    return a / b\n"
+
+
+@pytest.mark.parametrize("prompt", [
+    "fix the bug in calc.py where divide crashes when b is zero",
+    "in calc.py, make divide raise a clear error instead of crashing when b is 0",
+])
+def test_bugfix_overwrite_cannot_silently_drop_unrelated_function(tmp_path, prompt):
+    # The physical-PC regression: model answered a targeted bugfix with a
+    # whole-file write that silently deleted the unrelated add() function.
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    provider = Transcript([
+        ("read_file", {"path": "calc.py"}),
+        ("write_file", {"path": "calc.py", "content": "def divide(a, b):\n    if b == 0:\n        raise ValueError('division by zero')\n    return a / b\n"}),
+        # Repair after the guard rejects the lossy overwrite.
+        ("patch_file", {"path": "calc.py", "target": "def divide(a, b):\n    return a / b\n",
+                        "replacement": "def divide(a, b):\n    if b == 0:\n        raise ValueError('division by zero')\n    return a / b\n"}),
+        "Fixed divide() and kept add() unchanged.",
+    ])
+    agent = Agent(provider, max_iterations=5, verbose=False)
+    agent.run(prompt)
+
+    text = path.read_text()
+    assert "def add(" in text  # unrelated content preserved
+    assert "ValueError" in text  # the fix landed
+    assert not agent.requirements_incomplete
+    assert cli._check_run_outcome(agent, exit_on_failure=False)
+
+
+def test_write_file_rejects_emptying_existing_file_without_override(tmp_path):
+    path = tmp_path / "notes.txt"
+    path.write_text("important notes\nsecond line\n")
+    from nexus_agent_ai.agent.tools import execute_write_file, execute_read_file
+    execute_read_file(str(path))
+    result = execute_write_file(str(path), "")
+    assert result.startswith("ERROR:") and "empty" in result
+    assert path.read_text() == "important notes\nsecond line\n"
+    result = execute_write_file(str(path), "", allow_content_removal=True)
+    assert result.startswith("Successfully")
+    assert path.read_text() == ""
+
+
+def test_write_file_line_heuristic_blocks_mass_deletion_non_python(tmp_path):
+    path = tmp_path / "data.txt"
+    original = "alpha\nbeta\ngamma\ndelta\nepsilon\n"
+    path.write_text(original)
+    from nexus_agent_ai.agent.tools import execute_write_file, execute_read_file
+    execute_read_file(str(path))
+    result = execute_write_file(str(path), "alpha\nbeta\n")
+    assert result.startswith("ERROR:") and "delete" in result
+    assert path.read_text() == original
+    # Small deletions stay allowed.
+    result = execute_write_file(str(path), "alpha\nbeta\ngamma\ndelta\n")
+    assert result.startswith("Successfully")
+
+
+def test_write_file_full_rewrite_allowed_with_explicit_override(tmp_path):
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent.tools import execute_write_file, execute_read_file
+    execute_read_file(str(path))
+    result = execute_write_file(str(path), "def multiply(a, b):\n    return a * b\n", allow_content_removal=True)
+    assert result.startswith("Successfully")
+    assert "multiply" in path.read_text()
+
+
+def test_write_file_new_file_unaffected_by_content_loss_guard(tmp_path):
+    from nexus_agent_ai.agent.tools import execute_write_file
+    result = execute_write_file(str(tmp_path / "fresh.py"), "def new():\n    return 1\n")
+    assert result.startswith("Successfully")

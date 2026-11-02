@@ -237,7 +237,51 @@ def _atomic_file_update(p: Path, content: str) -> bool:
                 temporary.unlink()
     return True
 
-def execute_write_file(path: str, content: str) -> str:
+def _dropped_python_symbols(old: str, new: str):
+    """Top-level function/class names present in old but absent in new; None if either side unparseable."""
+    import ast
+    try:
+        old_tree = ast.parse(old)
+        new_tree = ast.parse(new)
+    except (SyntaxError, ValueError):
+        return None
+
+    def top_level(tree):
+        return [n.name for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+
+    new_names = set(top_level(new_tree))
+    return [n for n in top_level(old_tree) if n not in new_names]
+
+
+def _check_content_loss(name: str, old: str, new: str, allow_removal: bool) -> str | None:
+    """Block overwrites that silently drop existing content; the model can retry
+    with patch_file, the full preserved content, or an explicit override."""
+    if allow_removal or not old.strip():
+        return None
+    guidance = ("Use patch_file for a targeted edit, or include ALL of the existing content you want to keep. "
+                "If replacing the whole file is intended, retry with allow_content_removal=True.")
+    if not new.strip():
+        return f"ERROR: This overwrite would empty '{name}' (all existing content deleted). {guidance}"
+    if name.endswith(".py"):
+        dropped = _dropped_python_symbols(old, new)
+        if dropped:
+            return (f"ERROR: This overwrite would delete existing top-level definition(s) from '{name}': "
+                    f"{', '.join(dropped)}. {guidance}")
+        if dropped is not None:
+            return None
+    old_lines = [l for l in old.splitlines() if l.strip()]
+    if len(old_lines) < 3:
+        return None
+    new_lines = {l.strip() for l in new.splitlines() if l.strip()}
+    removed = [l for l in old_lines if l.strip() not in new_lines]
+    if len(removed) > max(2, len(old_lines) // 2):
+        return (f"ERROR: This overwrite would delete {len(removed)} of {len(old_lines)} existing lines "
+                f"from '{name}'. {guidance}")
+    return None
+
+
+def execute_write_file(path: str, content: str, allow_content_removal: bool = False) -> str:
     """Write string content to a file (creating parent directories if needed)."""
     try:
         validated = _validate_workspace_path(path)
@@ -255,6 +299,13 @@ def execute_write_file(path: str, content: str) -> str:
         syntax_error = _validate_python_content(p, content)
         if syntax_error:
             return syntax_error
+
+        if p.exists():
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                old_content = f.read()
+            loss = _check_content_loss(p.name, old_content, content, allow_content_removal)
+            if loss:
+                return loss
 
         existed = p.exists()
         if not _atomic_file_update(p, content):
@@ -955,7 +1006,9 @@ READ_FILE_TOOL = Tool(
 
 WRITE_FILE_TOOL = Tool(
     name="write_file",
-    description="Write or overwrite contents of a file on disk. Use this when creating new code files or making edits.",
+    description=("Write or overwrite contents of a file on disk. Use this when creating new code files. "
+                 "For existing files, prefer patch_file; an overwrite that deletes existing content is "
+                 "rejected unless allow_content_removal=True."),
     input_schema={
         "type": "object",
         "properties": {
@@ -966,6 +1019,11 @@ WRITE_FILE_TOOL = Tool(
             "content": {
                 "type": "string",
                 "description": "The full text content to write into the file.",
+            },
+            "allow_content_removal": {
+                "type": "boolean",
+                "description": "Set true only when intentionally replacing or emptying the whole file, deleting existing content.",
+                "default": False,
             }
         },
         "required": ["path", "content"],
