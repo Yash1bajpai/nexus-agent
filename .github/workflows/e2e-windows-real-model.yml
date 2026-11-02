@@ -11,6 +11,12 @@ jobs:
   e2e:
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      # Pin the target machine-class model (4GB-class default) so the matrix is
+      # deterministic regardless of runner RAM; doctor's RAM-based selection is
+      # exercised separately by `nexus-agent-ai doctor` output.
+      NEXUS_AGENT_MODEL_REPO: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF"
+      NEXUS_AGENT_MODEL_FILENAME: "LFM2.5-1.2B-Instruct-Q4_0.gguf"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v6
