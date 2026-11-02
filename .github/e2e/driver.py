@@ -97,6 +97,36 @@ def run_cli(name, prompt=None, stdin_text=None, env_extra=None, cwd=None,
     return body
 
 
+def run_sub(name, argv_tail, stdin_text=None, timeout=PROMPT_TIMEOUT, require_output=False):
+    """Run a non-chat subcommand (debug/generate/setup-path); same capture/verdict discipline."""
+    argv = [sys.executable, "-m", CLI_MODULE] + list(argv_tail)
+    header = f"=== {name} : {' '.join(argv_tail)} ===\n"
+    t0 = time.time()
+    try:
+        p = subprocess.run(argv, input=stdin_text, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        write_out(name, header + f"TIMEOUT after {elapsed:.0f}s (hung-command bound {timeout}s)\n")
+        record_exit(name, "timeout")
+        row_fail(name, f"TIMEOUT after {timeout}s (hung command)")
+        return None
+    elapsed = time.time() - t0
+    body = p.stdout or ""
+    if p.stderr:
+        body += "\n[stderr]\n" + p.stderr
+    write_out(name, header + body + f"\nexit={p.returncode} elapsed={elapsed:.1f}s\n")
+    record_exit(name, p.returncode)
+    print(f"{name}: exit={p.returncode} {elapsed:.1f}s", flush=True)
+    if p.returncode == 2:
+        row_fail(name, "HARNESS ERROR - CLI usage error (exit 2); row did NOT execute")
+        return None
+    if require_output and not body.strip():
+        row_fail(name, "UNVERIFIABLE - no output captured (decode/capture loss)")
+        return None
+    return p.returncode
+
+
 def record_exit(name, code):
     exit_lines.append(f"{name} exit={code}")
 
@@ -298,6 +328,19 @@ def main():
         else:
             verdict("e13-git", "REVIEW - no git tool call visible")
 
+    # --- git_diff claim: real tracked change must surface in the answer ---
+    if e01ok:
+        with open(WORKDIR / "calculator.py", "a", encoding="utf-8") as f:
+            f.write("\n# e25 marker comment\n")
+        body = run_cli("e25-gitdiff", "what changed in this project since the last commit?")
+        if body is not None:
+            if has(body, "calculator") or has(body, "e25 marker"):
+                verdict("e25-gitdiff", "TASK-PASS - real tracked change named")
+            else:
+                row_fail("e25-gitdiff", "TASK-FAIL - tracked change not reported")
+    else:
+        verdict("e25-gitdiff", "SKIP - e01 dependency missing")
+
     # --- Rows 6b/7b: slash commands via PIPED stdin (NOT interactive-REPL qualification) ---
     body = run_cli("e14-slash", stdin_text="/help\n/context\n/history\n/sessions\n/review calculator.py\n/exit\n")
     note = "coverage note: piped non-interactive stdin - labels REPL behavior under no-TTY only; interactive REPL not qualified here"
@@ -341,6 +384,69 @@ def main():
             row_fail("e21-favrecall", "42 not recalled")
         if has(body, "Yash"):
             verdict("e21-favrecall", "note: name also resurfaced - REVIEW")
+
+    # --- Rows 13-14: debug + generate subcommands (real model, real file effects) ---
+    (WORKDIR / "dbg_target.py").write_text(
+        "def multiply(a, b):\n    return a + b  # seeded bug\n", encoding="utf-8")
+    rc = run_sub("e22-debug", ["debug", "dbg_target.py", "--error",
+                               "multiply returns the sum instead of the product", "--no-stream"])
+    t = file_text("dbg_target.py") or ""
+    if rc is None:
+        pass  # row already failed by runner
+    elif "return a * b" in t:
+        verdict("e22-debug", "TASK-PASS (honesty ok) - seeded bug fixed on disk")
+    elif "return a + b" in t and rc != 0:
+        row_fail("e22-debug", "TASK-FAIL (honesty ok: nonzero exit, no corruption) - bug not fixed; claim NOT satisfied")
+    elif "return a + b" in t:
+        row_fail("e22-debug", "TASK-FAIL + DISHONEST - bug preserved but exit=0 (false success)")
+    else:
+        row_fail("e22-debug", "TASK-FAIL + CORRUPTION - neither seeded nor fixed content present")
+
+    gen = WORKDIR / "square_gen.py"
+    if gen.exists():
+        gen.unlink()
+    rc = run_sub("e23-generate", ["generate", "a python function that squares a number",
+                                  "-o", "square_gen.py", "--no-stream"])
+    t = file_text("square_gen.py")
+    if rc is None:
+        pass
+    elif rc == 0 and t and "def" in t:
+        verdict("e23-generate", "TASK-PASS (honesty ok) - square_gen.py created and verified by CLI")
+    elif rc != 0 and (t is None or not t.strip()):
+        row_fail("e23-generate", "TASK-FAIL (honesty ok: nonzero exit, no bogus file) - claim NOT satisfied")
+    elif rc != 0:
+        row_fail("e23-generate", "TASK-FAIL (unclean) - exit=1 but file left behind")
+    else:
+        row_fail("e23-generate", "TASK-FAIL + DISHONEST - exit=0 but square_gen.py missing or empty")
+
+    # --- retry inheritance: bare "try again" must inherit the prior request ---
+    run_cli("e24a-retry-seed", "calculate 123 * 456")
+    body = run_cli("e24-retry", "try again")
+    if body is not None:
+        if has(body, "56088"):
+            verdict("e24-retry", "TASK-PASS - prior arithmetic request inherited and answered")
+        else:
+            row_fail("e24-retry", "TASK-FAIL - prior request context not inherited (no 56088)")
+
+    # --- literal assignment claim: Change x to 2 in s2target.py ---
+    (WORKDIR / "s2target.py").write_text("x = 1\n", encoding="utf-8")
+    run_cli("e26-literal", "Change x to 2 in s2target.py")
+    t = file_text("s2target.py") or ""
+    if "x = 2" in t and "x = 1" not in t:
+        verdict("e26-literal", "TASK-PASS (honesty ok) - x rebound to 2 on disk")
+    elif "x = 1" in t:
+        row_fail("e26-literal", "TASK-FAIL - x still 1 (honest exit recorded in exit log)")
+    else:
+        row_fail("e26-literal", "TASK-FAIL + CORRUPTION - unexpected file content")
+
+    # --- setup-path claim: truthful detection + decline path (affirmative PATH mutation is environment-dependent) ---
+    rc = run_sub("e27-setuppath", ["setup-path"], stdin_text="n\n", timeout=60, require_output=True)
+    if rc is not None:
+        body = (WORKDIR / "e27-setuppath.out").read_text(encoding="utf-8", errors="replace")
+        if rc == 0 and (has(body, "Nothing to do") or has(body, "Skipped")):
+            verdict("e27-setuppath", "TASK-PASS - truthful already-on-PATH detection or honored decline")
+        else:
+            row_fail("e27-setuppath", f"TASK-FAIL - exit={rc}, unexpected output (see .out)")
 
     # --- Row 12: doctor ---
     p = subprocess.run([sys.executable, "-m", CLI_MODULE, "doctor"],
