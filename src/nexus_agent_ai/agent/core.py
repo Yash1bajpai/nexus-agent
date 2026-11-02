@@ -111,6 +111,22 @@ _NO_CHANGE_OK = re.compile(
 )
 
 
+_FILE_EXT = r"(?:py|js|ts|java|c|cpp|h|go|rs|rb|html|css|json|ya?ml|toml|md|txt|csv|xml|sql|sh)"
+_CREATE_VERBS = r"(?:created|written|saved|generated)"
+_FILE_REF = r"(?:[\w./\\-]+\." + _FILE_EXT + r"|\bthe\s+(?:file|script|module)\b)"
+_CLAIMED = r"(?:" + _VERBS + r"|" + _CREATE_VERBS + r")"
+# Output-claim guard: a past-tense claim that a concrete file was created/changed,
+# independent of what the user asked. Pure-advice answers ("you can create config.py by ...")
+# and intent statements ("I'll create ...") do not match.
+_FILE_CLAIM = re.compile(
+    r"\b(?:i(?:'ve|\s+have)?\s+(?:now\s+|successfully\s+|just\s+)?" + _CLAIMED
+    + r"|(?:has|have|was|were|is|are)\s+(?:now\s+|successfully\s+)?(?:been\s+)?" + _CLAIMED + r")"
+    + r"[^.\n]{0,160}?" + _FILE_REF
+    + r"|" + _FILE_REF + r"[^.\n]{0,80}?(?:has|have|was|were|is|are)\s+(?:now\s+|successfully\s+)?(?:been\s+)?" + _CLAIMED + r"\b",
+    re.IGNORECASE,
+)
+
+
 def _file_state(path: Path):
     """Fingerprint file bytes without retaining potentially large tool payloads."""
     try:
@@ -758,6 +774,17 @@ class Agent:
                             # Not just "nothing to change": the model claimed an edit that never happened.
                             self.claimed_unapplied_edit = True
                             final_text += "\nThe claim above that the code was changed is false: the files were not modified."
+                    if (not wrote_ok and not self.claimed_unapplied_edit
+                            and _FILE_CLAIM.search(final_text or "")
+                            and not _NO_CHANGE_OK.search(final_text or "")):
+                        # Zero-tool false success: the answer claims a concrete file was
+                        # created/changed but no mutating tool changed any file this turn.
+                        # Fail clean: correct the record, mark the turn not cleanly finished,
+                        # no automatic repair retry.
+                        self.claimed_unapplied_edit = True
+                        final_text += ("\n\nCorrection: the statement above that a file was created or "
+                                       "changed is not true - no file tool modified any file in this run, "
+                                       "so nothing was written to disk.")
                     self.requirements_incomplete = (
                         requirement_scope_errors + check_function_requirements(function_requirements)
                         + check_literal_assignment_requirement(literal_assignment_requirement)

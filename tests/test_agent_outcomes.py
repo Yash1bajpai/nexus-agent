@@ -252,3 +252,28 @@ def test_system_prompt_rules_run_file_arithmetic_speaker_identity():
     assert "offer run_code for pure computation or run_tests for project tests" in system
     # Rule 15: speaker identity
     assert "The user is the person typing; never claim the user's name" in system
+
+
+def test_zero_tool_file_creation_claim_is_corrected_without_retry():
+    # Output-claim guard: model claims a concrete file was created although no
+    # mutating tool ran; the request itself carries no edit intent keywords.
+    agent = Agent(Scripted(["I've created calculator.py with the add function."]), tools=[], verbose=False)
+    final = agent.run("make me a small example for addition")
+    assert agent.claimed_unapplied_edit
+    assert "no file tool modified any file" in final
+    assert len(agent.turns if hasattr(agent, "turns") else []) == 0  # no extra provider round-trip
+
+
+def test_zero_tool_file_claim_does_not_repair_retry():
+    provider = Scripted(["Done - math_utils.py has been saved with the helper."])
+    agent = Agent(provider, tools=[], verbose=False)
+    final = agent.run("set up the helper")
+    assert agent.claimed_unapplied_edit
+    assert len(provider.seen) == 1  # fail clean: exactly one provider call, no auto-retry
+
+
+def test_pure_advice_with_filename_is_not_a_false_claim():
+    agent = Agent(Scripted(["You can create config.py by adding these lines:"]), tools=[], verbose=False)
+    final = agent.run("how do I make a config file?")
+    assert not agent.claimed_unapplied_edit
+    assert "Correction:" not in final
