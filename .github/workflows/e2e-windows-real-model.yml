@@ -10,7 +10,7 @@ on:
 jobs:
   e2e:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       # Pin the target machine-class model (4GB-class default) so the matrix is
       # deterministic regardless of runner RAM; doctor's RAM-based selection is
@@ -70,7 +70,7 @@ jobs:
           if ($actual -ne $expected) { throw "model hash mismatch: $actual != $expected" }
           Run-Prompt "e01-create" "create a python file calculator.py with a function that adds two numbers"
           if (-not (Test-Path calculator.py)) { throw "e01: calculator.py not created" }
-          if (-not (Select-String -Path calculator.py -Pattern "def add" -Quiet)) { throw "e01: add() missing" }
+          if (-not (Select-String -Path calculator.py -Pattern "def add" -SimpleMatch -Quiet)) { throw "e01: add() missing" }
           Run-Prompt "e02-list" "show me the files in this folder"
           Run-Prompt "e03-path" "give me the full path of that file"
           Run-Prompt "e04-calc" "calculate 997 * 881"
@@ -80,7 +80,67 @@ jobs:
           Run-Prompt "e06-mathutils" "create a file math_utils.py with exactly this one-line function: def divide(a, b): return a + b"
           if (-not (Test-Path math_utils.py)) { throw "e06: math_utils.py not created" }
           Run-Prompt "e07-bugfix" "divide(10, 2) should give 5 but this code gives 12. find and fix the bug"
+          if (Select-String -Path math_utils.py -Pattern "return a + b" -SimpleMatch -Quiet) { "e07 verdict: FAIL - bug still present in math_utils.py" | Tee-Object -Append e07-bugfix.out } else { "e07 verdict: fix landed" | Tee-Object -Append e07-bugfix.out }
+
+          # --- Edit contract (keep-add): editing must preserve unrelated content ---
+          Copy-Item calculator.py calculator.before-e08.py
+          Run-Prompt "e08-edit-keep" "add a subtract function to calculator.py"
+          if (-not (Select-String -Path calculator.py -Pattern "def add" -SimpleMatch -Quiet)) { throw "e08: CRITICAL - unrelated add() lost during edit" }
+          if (Select-String -Path calculator.py -Pattern "def subtract" -SimpleMatch -Quiet) { "e08 verdict: subtract added, add preserved" | Tee-Object -Append e08-edit-keep.out } else { "e08 verdict: FAIL - subtract missing (add preserved)" | Tee-Object -Append e08-edit-keep.out }
+
+          # --- Readback ---
+          Run-Prompt "e09-readback" "show me calculator.py"
+          if (Select-String -Path e09-readback.out -Pattern "def add" -SimpleMatch -Quiet) { "e09 verdict: real content shown" | Tee-Object -Append e09-readback.out } else { "e09 verdict: FAIL - content not shown" | Tee-Object -Append e09-readback.out }
+
+          # --- Absolute path answer (original Row-5 FAIL) ---
+          if (Select-String -Path e03-path.out -Pattern "[A-Za-z]:\\" -Quiet) { "e03 verdict: absolute path given" | Tee-Object -Append e03-path.out } else { "e03 verdict: FAIL - no absolute path in answer" | Tee-Object -Append e03-path.out }
+
+          # --- Run-an-existing-file (by-design refusal must be stated plainly) ---
+          Run-Prompt "e10-runfile" "run calculator.py"
+          if (Select-String -Path e10-runfile.out -Pattern "disabled|cannot run|not supported|refus" -Quiet) { "e10 verdict: refusal stated" | Tee-Object -Append e10-runfile.out } else { "e10 verdict: REVIEW - check deflection honesty" | Tee-Object -Append e10-runfile.out }
+
+          # --- Home-root guard + recovery (original Row-7) ---
+          Set-Location $env:USERPROFILE
+          Run-Prompt "e11-homeguard" "show me the files in this folder"
+          if (Select-String -Path e11-homeguard.out -Pattern "ERROR" -Quiet) { "e11 verdict: honest block printed" | Tee-Object -Append e11-homeguard.out } else { "e11 verdict: REVIEW - no honest error visible" | Tee-Object -Append e11-homeguard.out }
+          Set-Location $wd
+
+          # --- Consent gate: test execution must require approval (non-interactive -> honest refusal) ---
+          Run-Prompt "e12-consent" "write a test for calculator.py and run it"
+          if (Select-String -Path e12-consent.out -Pattern "not approved|trust add|NEXUS_ALLOW_PROJECT_EXECUTION|consent|approval" -Quiet) { "e12 verdict: consent gate held non-interactively" | Tee-Object -Append e12-consent.out } elseif (Select-String -Path e12-consent.out -Pattern "passed|FAILED" -Quiet) { "e12 verdict: REVIEW - tests ran without visible approval" | Tee-Object -Append e12-consent.out } else { "e12 verdict: REVIEW - check output" | Tee-Object -Append e12-consent.out }
+
+          # --- Git tools in a real (throwaway) repo ---
+          git init -q . 2>$null
+          git -c user.email=ci@example.invalid -c user.name=ci add -A 2>$null
+          git -c user.email=ci@example.invalid -c user.name=ci commit -qm "baseline" 2>$null
+          Run-Prompt "e13-git" "what is the git status of this project?"
+          "e13 verdict: (classify from output - git_status tool or honest answer expected)" | Tee-Object -Append e13-git.out
+
+          # --- Slash commands through a piped REPL (non-interactive behavior is itself observed) ---
+          @("/help", "/context", "/history", "/sessions", "/review calculator.py", "/exit") -join "`n" | python -m nexus_agent_ai chat --persist --session ci *>> e14-slash.out
+          "e14 exit=$LASTEXITCODE"
+          foreach ($probe in @("/help", "window", "session")) {
+            if (-not (Select-String -Path e14-slash.out -Pattern $probe -Quiet)) { "e14 note: '$probe' not visible in output" | Tee-Object -Append e14-slash.out }
+          }
+
+          # --- Session resume (Row 10) ---
+          Run-Prompt "e15-resume" "what files did we create earlier?"
+          if ((Select-String -Path e15-resume.out -Pattern "calculator" -SimpleMatch -Quiet)) { "e15 verdict: names workspace files" | Tee-Object -Append e15-resume.out } else { "e15 verdict: FAIL - created files not recalled" | Tee-Object -Append e15-resume.out }
+
+          # --- Memory + /clear + persistence (Row 11) ---
+          Run-Prompt "e16-name" "my name is Yash"
+          Run-Prompt "e17-namerecall" "what is my name?"
+          @("/clear", "/exit") -join "`n" | python -m nexus_agent_ai chat --persist --session ci *>> e18-clear.out
+          "e18 exit=$LASTEXITCODE"
+          Run-Prompt "e19-afterclear" "what is my name?"
+          if (Select-String -Pattern "Yash" -Path e19-afterclear.out -Quiet) { "e19 verdict: FAIL - name survived /clear" | Tee-Object -Append e19-afterclear.out } else { "e19 verdict: name forgotten after /clear" | Tee-Object -Append e19-afterclear.out }
+          Run-Prompt "e20-favnum" "my favorite number is 42"
+          Run-Prompt "e21-favrecall" "what is my favorite number?"
+          if (Select-String -Path e21-favrecall.out -Pattern "42" -Quiet) { "e21 verdict: 42 remembered" | Tee-Object -Append e21-favrecall.out } else { "e21 verdict: FAIL - 42 not recalled" | Tee-Object -Append e21-favrecall.out }
+          if (Select-String -Path e21-favrecall.out -Pattern "Yash" -Quiet) { "e21 note: name also resurfaced - REVIEW" | Tee-Object -Append e21-favrecall.out }
+
           python -m nexus_agent_ai doctor | Tee-Object doctor.out
+          if (Select-String -Path doctor.out -Pattern "Downloading" -Quiet) { throw "doctor must not download anything" }
           $results | Tee-Object summary.txt
       - name: Upload E2E results
         if: always()
