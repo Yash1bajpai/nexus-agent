@@ -1,6 +1,34 @@
+import json
+
 from typing import Any, Dict, List
 from ..utils.config import MAX_CONVERSATION_MESSAGES
 from ..providers.messages import normalize_messages
+
+SESSION_METADATA_MAX_CHARS = 4096
+SESSION_METADATA_MAX_KEYS = 16
+SESSION_METADATA_VERSION = 1
+
+
+def _session_metadata_key(key):
+    if not isinstance(key, str) or not 1 <= len(key) <= 64:
+        raise ValueError("Session metadata keys must contain 1 to 64 characters.")
+    return key
+
+
+def _session_metadata_json(value):
+    """Validate and serialize a bounded JSON value without coercing arbitrary objects."""
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Session metadata must be JSON-safe.") from exc
+    if len(encoded) > SESSION_METADATA_MAX_CHARS:
+        raise ValueError("Session metadata value exceeds the bounded serialization limit.")
+    return encoded
+
+
+def _session_metadata_copy(value):
+    return json.loads(_session_metadata_json(value))
+
 
 def is_genuine_user_message(msg: Dict[str, Any]) -> bool:
     if msg.get("role") != "user":
@@ -32,6 +60,7 @@ class ConversationMemory:
     def __init__(self, max_messages: int = MAX_CONVERSATION_MESSAGES):
         self.messages: List[Dict[str, Any]] = []
         self.max_messages = max_messages
+        self._session_metadata = {}
 
     def add(self, role: str, content: str):
         """Add a standard user or assistant text message."""
@@ -89,6 +118,20 @@ class ConversationMemory:
         """Replace the whole history (used by /compact)."""
         self.messages = normalize_messages(messages)
 
+    def get_session_metadata(self, key, default=None):
+        """Return an isolated JSON value without modifying history or metadata."""
+        _session_metadata_key(key)
+        return _session_metadata_copy(self._session_metadata.get(key, default))
+
+    def set_session_metadata(self, key, value):
+        """Store bounded session-only metadata independently of conversation pruning."""
+        _session_metadata_key(key)
+        copied = _session_metadata_copy(value)
+        if key not in self._session_metadata and len(self._session_metadata) >= SESSION_METADATA_MAX_KEYS:
+            raise ValueError("Session metadata key limit reached.")
+        self._session_metadata[key] = copied
+
     def clear(self):
         """Clear all messages from memory."""
         self.messages = []
+        self._session_metadata.clear()

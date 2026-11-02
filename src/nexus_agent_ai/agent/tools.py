@@ -5,11 +5,15 @@ import tempfile
 import subprocess
 import ast
 import stat
+import hashlib
+import io
+import tokenize
 from pathlib import Path
 from typing import Any, Dict, List
 from ..providers.base import Tool
 from ..utils.config import CODE_EXECUTION_TIMEOUT
 from ..utils.private_files import copy_file_permissions
+from .refusals import RefusalClass, RefusalText, refusal
 
 def _validate_workspace_path(path: str | Path) -> Path | str:
     """Validate that path is inside the current workspace."""
@@ -28,19 +32,19 @@ def _validate_workspace_path(path: str | Path) -> Path | str:
     for state_dir in state_dirs:
         state_root = state_dir.resolve()
         if p == state_root or state_root in p.parents:
-            return "ERROR: Security Sandbox Access Denied: Nexus state directories are protected."
+            return refusal(RefusalClass.SENSITIVE_PATH, "ERROR: Security Sandbox Access Denied: Nexus state directories are protected.")
 
     # Boundary safeguard: When running in home directory (Global Mode), prevent direct operations
     # on the home root itself or root dotfiles/configuration (e.g. ~/.bashrc, ~/.gitconfig).
     if home and cwd == home:
         if p == home:
-            return (
+            return refusal(RefusalClass.SENSITIVE_PATH,
                 "ERROR: Security Sandbox Access Denied: Direct targeting of the root home directory is forbidden. "
                 "Nexus is running in the home folder, the home root is protected, "
                 "create a project folder (mkdir my-project, cd my-project) and relaunch."
             )
         if p.parent == home and p.name.startswith("."):
-            return f"ERROR: Security Sandbox Access Denied: Root configuration file '{p.name}' in home directory is protected."
+            return refusal(RefusalClass.SENSITIVE_PATH, f"ERROR: Security Sandbox Access Denied: Root configuration file '{p.name}' in home directory is protected.")
 
     try:
         if p.is_relative_to(cwd):
@@ -51,7 +55,7 @@ def _validate_workspace_path(path: str | Path) -> Path | str:
                 return p
         except ValueError:
             pass
-    return f"ERROR: Security Sandbox Access Denied: Path '{path}' is outside the project workspace ({cwd})."
+    return refusal(RefusalClass.SENSITIVE_PATH, f"ERROR: Security Sandbox Access Denied: Path '{path}' is outside the project workspace ({cwd}).")
 
 def _safe_git_run(args: List[str], *, execution: bool = False) -> subprocess.CompletedProcess:
     """Inspect Git without inherited helpers; explicit writes retain normal Git behavior."""
@@ -102,6 +106,7 @@ def _safe_git_run(args: List[str], *, execution: bool = False) -> subprocess.Com
 # Edits are only allowed on files whose current state matches, so a patch is always
 # based on content the model has actually seen.
 _FILE_STATE: Dict[str, tuple] = {}
+_FILE_DIGESTS: Dict[str, bytes] = {}
 _AUTO_READ_FILES: set[str] = set()
 
 # Authority for content-removing overwrites comes ONLY from the user: either an
@@ -231,16 +236,23 @@ def _file_state(p: Path):
         return None
 
 
-def _remember_file(p: Path) -> None:
+def _remember_file(p: Path, source: bytes | None = None) -> None:
     state = _file_state(p)
     if state is not None:
         _FILE_STATE[str(p)] = state
+        try:
+            _FILE_DIGESTS[str(p)] = hashlib.sha256(
+                p.read_bytes() if source is None else source
+            ).digest()
+        except OSError:
+            _FILE_DIGESTS.pop(str(p), None)
 
 
 def reset_file_tracking() -> None:
     """Forget which files were read (used by tests and /clear)."""
     global _USER_INTENT
     _FILE_STATE.clear()
+    _FILE_DIGESTS.clear()
     _AUTO_READ_FILES.clear()
     _USER_INTENT = ""
     _REMOVAL_APPROVED.clear()
@@ -256,7 +268,7 @@ def _check_read_before_edit(p: Path, path: str) -> str | None:
                  "so the edit is based on its current content.")
         key = str(p)
         if key in _AUTO_READ_FILES:
-            return error
+            return refusal(RefusalClass.BLIND_EDIT, error)
         _AUTO_READ_FILES.add(key)
         text = execute_read_file(path)
         # A successful read records state, even when the literal data starts ERROR:.
@@ -278,11 +290,11 @@ def _check_read_before_edit(p: Path, path: str) -> str | None:
         if omitted:
             result += (f"\nTruncated: {omitted} characters omitted. "
                        "Use read_file to read the full file and obtain the rest.")
-        return result
+        return refusal(RefusalClass.BLIND_EDIT, result)
     if known != _file_state(p):
-        return (f"ERROR: '{path}' changed on disk since you last read it. "
+        return refusal(RefusalClass.STALE_STATE,
+                f"ERROR: '{path}' changed on disk since you last read it. "
                 "Read it again with read_file, then retry the edit.")
-    return None
 
 
 def execute_read_file(path: str) -> str:
@@ -295,18 +307,19 @@ def execute_read_file(path: str) -> str:
 
         # Do not let an agent copy common credential/config files into prompts.
         if _is_sensitive_path(p):
-            return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
+            return refusal(RefusalClass.SENSITIVE_PATH, f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted.")
 
-        with open(p, "r", encoding="utf-8", errors="replace", newline="") as f:
-            text = f.read()
-        _remember_file(p)
+        with open(p, "rb") as stream:
+            source = stream.read()
+        text = source.decode("utf-8", errors="replace")
+        _remember_file(p, source)
         return text
     except FileNotFoundError:
-        return f"ERROR: File not found: {path}"
+        return refusal(RefusalClass.NOT_FOUND, f"ERROR: File not found: {path}")
     except PermissionError:
-        return f"ERROR: Permission denied: {path}"
+        return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied: {path}")
     except Exception as e:
-        return f"ERROR: Could not read file: {str(e)}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not read file: {str(e)}")
 
 _SENSITIVE_NAMES = frozenset({
     ".git", ".env", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc",
@@ -335,16 +348,21 @@ def _validate_python_content(path: Path, content: str) -> str | None:
         try:
             ast.parse(content, filename=str(path))
         except SyntaxError as exc:
-            return f"ERROR: Python syntax validation failed at line {exc.lineno}: {exc.msg}. File unchanged."
+            return refusal(RefusalClass.SYNTAX, f"ERROR: Python syntax validation failed at line {exc.lineno}: {exc.msg}. File unchanged.")
     return None
 
-def _atomic_file_update(p: Path, content: str) -> bool:
+def _atomic_file_update(p: Path, content: str, *, preserve_bytes: bool = False,
+                        expected_source: bytes | None = None) -> bool:
     """Prepare both files fully before publishing; never truncate a live inode."""
     old = p.read_bytes() if p.exists() else None
-    if old is not None and b"\r\n" in old and b"\n" not in old.replace(b"\r\n", b""):
-        content = content.replace("\r\n", "\n").replace("\n", "\r\n")
-    elif old is not None and b"\n" in old and b"\r\n" not in old:
-        content = content.replace("\r\n", "\n")
+    if expected_source is not None and old != expected_source:
+        raise _FunctionRefusal(RefusalClass.STALE_STATE,
+                               "ERROR: File changed before publication. Read it again before editing.")
+    if not preserve_bytes:
+        if old is not None and b"\r\n" in old and b"\n" not in old.replace(b"\r\n", b""):
+            content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+        elif old is not None and b"\n" in old and b"\r\n" not in old:
+            content = content.replace("\r\n", "\n")
     encoded = content.encode("utf-8")  # Reject surrogates before touching either file.
     if encoded == old:
         return False
@@ -468,7 +486,7 @@ def execute_write_file(path: str, content: str) -> str:
         p = validated
 
         if _is_sensitive_path(p):
-            return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
+            return refusal(RefusalClass.SENSITIVE_PATH, f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted.")
 
         unread = _check_read_before_edit(p, path)
         if unread:
@@ -484,7 +502,7 @@ def execute_write_file(path: str, content: str) -> str:
             loss, dropped = _describe_content_loss(p.name, old_content, content)
             if loss and not content_removal_approved(p, loss, dropped):
                 hint = _suggest_targeted_patch(old_content, content) or                     "Use patch_file for a targeted edit that keeps the existing content."
-                return (f"ERROR: This overwrite of '{path}' would delete {loss}. "
+                return refusal(RefusalClass.CONTENT_LOSS, f"ERROR: This overwrite of '{path}' would delete {loss}. "
                         "The user has not approved removing it. Ask the user to confirm the replacement. "
                         + hint.replace("{path}", path))
 
@@ -495,9 +513,9 @@ def execute_write_file(path: str, content: str) -> str:
         backup_msg = f" (backup saved to {p.name}.bak)" if existed else ""
         return f"Successfully wrote {len(content)} characters to {path} (absolute path: {p}){backup_msg}"
     except PermissionError:
-        return f"ERROR: Permission denied writing to: {path}"
+        return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied writing to: {path}")
     except Exception as e:
-        return f"ERROR: Could not write file: {str(e)}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not write file: {str(e)}")
 
 def _python_line_signatures(text: str):
     """Ignore horizontal token gaps, never indentation or literal/comment content."""
@@ -566,7 +584,7 @@ def _target_not_found_message(path: str, content: str, target: str) -> str:
            "Ensure the target matches existing file content exactly, including whitespace and line breaks.")
     lines = content.splitlines()
     if len(lines) <= 12 and len(content) <= 1200:
-        return (
+        return refusal(RefusalClass.TARGETING,
             msg + "\nNothing was changed. target must be OLD text already in the file, "
             "not the requested new text. Copy this exact target (JSON):\n"
             + json.dumps({"path": path, "target": content}, ensure_ascii=False)
@@ -590,7 +608,7 @@ def _target_not_found_message(path: str, content: str, target: str) -> str:
         # Nothing similar: show the whole (small) file so the model copies real text instead of inventing it.
         numbered = "\n".join(f"{k + 1}: {ln}" for k, ln in enumerate(lines))
         msg += f"\nThe whole file ({len(lines)} lines):\n{numbered}\nCopy the target from these lines exactly and retry."
-    return msg
+    return refusal(RefusalClass.TARGETING, msg)
 
 
 def execute_patch_file(path: str, target: str, replacement: str, allow_multiple: bool = False) -> str:
@@ -602,14 +620,14 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         p = validated
 
         if _is_sensitive_path(p):
-            return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
+            return refusal(RefusalClass.SENSITIVE_PATH, f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted.")
 
         if not p.exists():
-            return f"ERROR: File not found: {path}"
+            return refusal(RefusalClass.NOT_FOUND, f"ERROR: File not found: {path}")
         if p.is_dir():
-            return f"ERROR: Path is a directory, not a file: {path}"
+            return refusal(RefusalClass.TARGETING, f"ERROR: Path is a directory, not a file: {path}")
         if not target:
-            return "ERROR: Target string to replace cannot be empty."
+            return refusal(RefusalClass.TARGETING, "ERROR: Target string to replace cannot be empty.")
 
         unread = _check_read_before_edit(p, path)
         if unread:
@@ -637,7 +655,7 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
             else:
                 return _target_not_found_message(path, content, target)
         elif count > 1 and not allow_multiple:
-            return (
+            return refusal(RefusalClass.AMBIGUITY,
                 f"ERROR: Target content found {count} times in '{path}'. "
                 f"Provide more surrounding context to make the target unique, or set allow_multiple=True."
             )
@@ -650,7 +668,7 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         loss, dropped = _describe_content_loss(p.name, content, new_content)
         if loss and not content_removal_approved(p, loss, dropped):
             hint = _suggest_targeted_patch(content, new_content) or                 "Choose a target that keeps the existing content."
-            return (f"ERROR: This patch to '{path}' would delete {loss}. "
+            return refusal(RefusalClass.CONTENT_LOSS, f"ERROR: This patch to '{path}' would delete {loss}. "
                     "The user has not approved removing it. Ask the user to confirm the removal. "
                     + hint.replace("{path}", path))
 
@@ -660,9 +678,306 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
         backup_msg = f" (backup saved to {p.name}.bak)"
         return f"Successfully patched '{path}' (absolute path: {p}): replaced {count} occurrence(s){backup_msg}.{note}"
     except PermissionError:
-        return f"ERROR: Permission denied patching: {path}"
+        return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied patching: {path}")
     except Exception as e:
-        return f"ERROR: Could not patch file: {str(e)}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not patch file: {str(e)}")
+
+
+class _FunctionRefusal(Exception):
+    def __init__(self, kind: RefusalClass, message: str):
+        self.result = refusal(kind, message)
+        super().__init__(message)
+
+
+def _function_refuse(kind: RefusalClass, message: str):
+    raise _FunctionRefusal(kind, "ERROR: " + message)
+
+
+_FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _function_tree(source: str, filename: str):
+    try:
+        return ast.parse(source, filename=filename, type_comments=True)
+    except SyntaxError as exc:
+        # Keep Python's own diagnostic verbatim; parsing never evaluates headers.
+        raise _FunctionRefusal(RefusalClass.SYNTAX, f"ERROR: {exc}") from exc
+
+
+def _function_offsets(source: str, node):
+    """AST UTF-8 locations plus token-proven decorator/definition line start."""
+    lines = io.StringIO(source).readlines()
+    if not lines:
+        _function_refuse(RefusalClass.TARGETING, "Unsupported empty definition span.")
+    first = node.lineno
+    line = lines[first - 1]
+    indent = line[:len(line) - len(line.lstrip(" \t"))]
+    expected = "async" if isinstance(node, ast.AsyncFunctionDef) else "def"
+    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    opener = next((t for t in tokens if t.start == (first, len(indent))), None)
+    if opener is None or opener.string != expected:
+        _function_refuse(RefusalClass.AMBIGUITY, "Unsupported definition layout; no unique token span.")
+    if node.decorator_list:
+        expression_line = min(d.lineno for d in node.decorator_list)
+        decorators = [t for t in tokens if t.string == "@"
+                      and t.start[1] == len(indent) and t.start[0] <= expression_line]
+        if not decorators:
+            _function_refuse(RefusalClass.AMBIGUITY, "No proven decorator opener.")
+        first = decorators[-1].start[0]
+    if "\t" in indent:
+        _function_refuse(RefusalClass.AMBIGUITY, "Tab-indented function layouts are unsupported.")
+    start = sum(len(s.encode("utf-8")) for s in lines[:first - 1])
+    end = (sum(len(s.encode("utf-8")) for s in lines[:node.end_lineno - 1])
+           + node.end_col_offset)
+    return start, end, indent
+
+
+def _function_fragment(new_body: str, function_name: str):
+    tree = _function_tree(new_body, "<new_body>")
+    if len(tree.body) != 1 or not isinstance(tree.body[0], _FUNCTION_NODES):
+        _function_refuse(RefusalClass.TARGETING,
+                         "new_body must contain exactly one complete Python function definition.")
+    node = tree.body[0]
+    if any(isinstance(child, (ast.Import, ast.ImportFrom)) for child in ast.walk(node)):
+        _function_refuse(RefusalClass.TARGETING, "Imports are not supported in new_body.")
+    if node.name != function_name:
+        _function_refuse(RefusalClass.TARGETING, "Function name must equal function_name.")
+    start, _, indent = _function_offsets(new_body, node)
+    first = new_body.encode("utf-8")[:start].count(b"\n") + 1
+    if indent or new_body.encode("utf-8")[:start].strip():
+        _function_refuse(RefusalClass.TARGETING, "new_body must be an unindented complete definition.")
+    for token in tokenize.generate_tokens(io.StringIO(new_body).readline):
+        if token.type == tokenize.COMMENT and (
+            token.start[0] < node.lineno or (
+                token.start[0] > node.end_lineno and token.start[1] <= node.col_offset
+            )
+        ):
+            _function_refuse(RefusalClass.TARGETING,
+                             "Comments outside the supplied definition are not allowed.")
+    return node, new_body.encode("utf-8")[start:].decode("utf-8").rstrip("\r\n")
+
+
+def _function_decorators(node, source: str):
+    if not node.decorator_list:
+        return ()
+    start, _, _ = _function_offsets(source, node)
+    raw = source.encode("utf-8")
+    first = raw[:start].count(b"\n") + 1
+    lines = io.StringIO(source).readlines()
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line.encode("utf-8")))
+
+    def offset(position):
+        row, column = position
+        return offsets[row - 1] + len(lines[row - 1][:column].encode("utf-8"))
+
+    expressions = []
+    expression_start = None
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.start[0] < first or token.start[0] >= node.lineno:
+            continue
+        if token.string == "@" and expression_start is None:
+            expression_start = offset(token.end)
+        elif token.type == tokenize.NEWLINE and expression_start is not None:
+            expressions.append(raw[expression_start:offset(token.start)].decode("utf-8"))
+            expression_start = None
+    if expression_start is not None or len(expressions) != len(node.decorator_list):
+        _function_refuse(RefusalClass.AMBIGUITY, "Unsupported decorator token layout.")
+    return tuple(expressions)
+
+
+def _function_header(node, source: str):
+    def dump(value):
+        return ast.dump(value, include_attributes=False) if isinstance(value, ast.AST) else value
+    return (
+        type(node), dump(node.args), dump(node.returns),
+        tuple(dump(p) for p in getattr(node, "type_params", [])),
+        node.type_comment,
+        _function_decorators(node, source),
+    )
+
+
+def _function_scope(tree, function_name: str, class_name: str | None, adding: bool):
+    all_functions = [n for n in ast.walk(tree) if isinstance(n, _FUNCTION_NODES)
+                     and n.name == function_name]
+    if class_name is None:
+        direct = [n for n in tree.body if isinstance(n, _FUNCTION_NODES)
+                  and n.name == function_name]
+        if not adding and (len(all_functions) != 1 or len(direct) != 1):
+            kind = RefusalClass.NOT_FOUND if not all_functions else RefusalClass.AMBIGUITY
+            _function_refuse(kind, "Function target is missing, nested, conditional, or ambiguous; "
+                             "use class_name for a uniquely identified direct method.")
+        scope = tree
+    else:
+        classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
+                   and n.name == class_name]
+        if len(classes) != 1 or classes[0] not in tree.body:
+            kind = RefusalClass.NOT_FOUND if not classes else RefusalClass.AMBIGUITY
+            _function_refuse(kind, "class_name must identify one direct, unconditional module class.")
+        scope = classes[0]
+        direct = [n for n in scope.body if isinstance(n, _FUNCTION_NODES)
+                  and n.name == function_name]
+        # Conditional definitions and duplicate direct definitions are never spans.
+        scoped = [n for n in ast.walk(scope) if isinstance(n, _FUNCTION_NODES)
+                  and n.name == function_name]
+        if not adding and (len(direct) != 1 or len(scoped) != 1):
+            kind = RefusalClass.NOT_FOUND if not scoped else RefusalClass.AMBIGUITY
+            _function_refuse(kind, "Method target is missing, nested, conditional, or ambiguous.")
+    if adding:
+        # Binding inventory is structural, not just direct FunctionDef names.
+        pending = list(scope.body)
+        while pending:
+            node = pending.pop()
+            if ((isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                 and node.name == function_name)
+                    or (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                        and node.id == function_name)
+                    or (isinstance(node, ast.alias)
+                        and (node.asname or node.name.split(".")[0]) == function_name)
+                    or (isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar))
+                        and node.name == function_name)
+                    or (isinstance(node, ast.MatchMapping) and node.rest == function_name)):
+                _function_refuse(RefusalClass.AMBIGUITY,
+                                 "The requested name already exists in the target scope.")
+            if not isinstance(node, (*_FUNCTION_NODES, ast.ClassDef, ast.Lambda)):
+                pending.extend(ast.iter_child_nodes(node))
+        return scope, None
+    return scope, direct[0]
+
+
+def _indent_function(source: str, indent: str) -> str:
+    """Indent code tokens, never physical continuation lines inside string literals."""
+    protected = set()
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.STRING:
+            protected.update(range(token.start[0] + 1, token.end[0] + 1))
+    return "".join(
+        line if row in protected else indent + line
+        for row, line in enumerate(io.StringIO(source).readlines(), 1)
+    )
+
+
+def _execute_function_change(path: str, function_name: str, new_body: str,
+                             class_name: str | None, *, adding: bool,
+                             expected_state=None) -> str:
+    try:
+        validated = _validate_workspace_path(path)
+        if isinstance(validated, str):
+            return validated
+        p = validated
+        if _is_sensitive_path(p):
+            return refusal(RefusalClass.SENSITIVE_PATH,
+                           f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted.")
+        if p.suffix.lower() != ".py":
+            _function_refuse(RefusalClass.TARGETING, "Function tools support existing .py files only.")
+        if not p.exists():
+            return refusal(RefusalClass.NOT_FOUND, f"ERROR: File not found: {path}")
+        if not p.is_file():
+            _function_refuse(RefusalClass.TARGETING, f"Path is not a file: {path}")
+        unread = _check_read_before_edit(p, path)
+        if unread:
+            return unread
+        source_bytes = p.read_bytes()
+        digest = hashlib.sha256(source_bytes).digest()
+        if (
+            not isinstance(expected_state, tuple) or len(expected_state) != 2
+            or expected_state[0] != "file" or not isinstance(expected_state[1], bytes)
+            or len(expected_state[1]) != 32 or expected_state[1] != digest
+        ):
+            _function_refuse(RefusalClass.STALE_STATE, "File differs from the fresh pre-call snapshot; read it again.")
+        if _FILE_DIGESTS.get(str(p)) != digest:
+            _function_refuse(RefusalClass.STALE_STATE,
+                             f"'{path}' changed on disk since you last read it. Read it again with read_file, then retry the edit.")
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(source_bytes).readline)
+        if encoding != "utf-8" or b"\r" in source_bytes.replace(b"\r\n", b""):
+            _function_refuse(RefusalClass.TARGETING, "Only UTF-8 Python with LF/CRLF physical lines is supported.")
+        source = source_bytes.decode("utf-8")
+        tree = _function_tree(source, str(p))
+        replacement_node, fragment = _function_fragment(new_body, function_name)
+        scope, target = _function_scope(tree, function_name, class_name, adding)
+        if adding:
+            if isinstance(scope, ast.Module):
+                start = end = len(source_bytes)
+                indent = ""
+            else:
+                # Inline class suites have no independent method indentation.
+                if scope.body[0].lineno == scope.lineno:
+                    _function_refuse(RefusalClass.AMBIGUITY, "Inline class suites are unsupported.")
+                lines = io.StringIO(source).readlines()
+                first_line = lines[scope.body[0].lineno - 1]
+                indent = first_line[:len(first_line) - len(first_line.lstrip(" \t"))]
+                if not indent or "\t" in indent:
+                    _function_refuse(RefusalClass.AMBIGUITY, "Unsupported class indentation.")
+                # Include the final statement's physical line, not adjacent comments.
+                end_line = scope.end_lineno
+                start = end = sum(len(line.encode("utf-8")) for line in lines[:end_line])
+            replacement = _indent_function(fragment, indent)
+            prefix = "" if not source_bytes[:start] or source_bytes[:start].endswith(b"\n") else "\n"
+            replacement = prefix + replacement + "\n"
+        else:
+            if _function_header(target, source) != _function_header(replacement_node, new_body):
+                _function_refuse(RefusalClass.CONTENT_LOSS,
+                                 "Changing the signature, async kind, type comments, or exact ordered decorators is unsupported. Keep the original header.")
+            start, end, indent = _function_offsets(source, target)
+            replacement = _indent_function(fragment, indent)
+        replacement_bytes = replacement.encode("utf-8")
+        candidate = source_bytes[:start] + replacement_bytes + source_bytes[end:]
+        if (candidate[:start] != source_bytes[:start]
+                or candidate[start + len(replacement_bytes):] != source_bytes[end:]):
+            _function_refuse(RefusalClass.TARGETING, "Bytes outside the function span would change.")
+        content = candidate.decode("utf-8")
+        syntax_error = _validate_python_content(p, content)
+        if syntax_error:
+            return syntax_error
+        candidate_tree = _function_tree(content, str(p))
+        candidate_scope = candidate_tree
+        if class_name is not None:
+            candidate_scope = next(n for n in candidate_tree.body
+                                   if isinstance(n, ast.ClassDef) and n.name == class_name)
+        installed = next(n for n in candidate_scope.body
+                         if isinstance(n, _FUNCTION_NODES) and n.name == function_name)
+        if ast.dump(installed, include_attributes=False) != ast.dump(replacement_node, include_attributes=False):
+            _function_refuse(RefusalClass.AMBIGUITY,
+                             "Reindentation would alter the supplied definition or a literal value.")
+        if not adding and _function_header(installed, content) != _function_header(target, source):
+            _function_refuse(RefusalClass.CONTENT_LOSS,
+                             "Reindentation would change the exact decorator header; layout is unsupported.")
+        loss, dropped = _describe_content_loss(p.name, source, content)
+        if loss and not content_removal_approved(p, loss, dropped):
+            _function_refuse(RefusalClass.CONTENT_LOSS,
+                             f"This function edit would delete {loss}. The user has not approved removing it.")
+        if not _atomic_file_update(p, content, preserve_bytes=True, expected_source=source_bytes):
+            return f"No changes: '{path}' already has the requested content."
+        _remember_file(p, candidate)
+        verb = "added" if adding else "edited"
+        return f"Successfully {verb} function '{function_name}' in '{path}' (absolute path: {p}) (backup saved to {p.name}.bak)"
+    except _FunctionRefusal as exc:
+        return exc.result
+    except FileNotFoundError:
+        return refusal(RefusalClass.NOT_FOUND, f"ERROR: File not found: {path}")
+    except PermissionError:
+        return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied editing function: {path}")
+    except (UnicodeError, LookupError) as exc:
+        return refusal(RefusalClass.TARGETING, f"ERROR: Unsupported Python encoding: {exc}")
+    except (SyntaxError, tokenize.TokenError) as exc:
+        return refusal(RefusalClass.SYNTAX, f"ERROR: {exc}")
+    except Exception as exc:
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not edit function: {exc}")
+
+
+def execute_edit_function(path: str, function_name: str, new_body: str,
+                          class_name: str | None = None, *, expected_state=None) -> str:
+    """Replace one proven function span without changing its header or neighbors."""
+    return _execute_function_change(path, function_name, new_body, class_name,
+                                    adding=False, expected_state=expected_state)
+
+
+def execute_add_function(path: str, function_name: str, new_body: str,
+                         class_name: str | None = None, *, expected_state=None) -> str:
+    """Insert a complete function at the exact end of the requested scope."""
+    return _execute_function_change(path, function_name, new_body, class_name,
+                                    adding=True, expected_state=expected_state)
 
 def execute_list_directory(path: str = ".") -> str:
     """List all files and folders in a directory (up to 2 levels deep)."""
@@ -672,10 +987,10 @@ def execute_list_directory(path: str = ".") -> str:
             return validated
         root_path = validated
         if root_path.exists() and root_path.is_file():
-            return (f"ERROR: '{path}' is a file, not a directory. Use read_file to read it. "
+            return refusal(RefusalClass.TARGETING, f"ERROR: '{path}' is a file, not a directory. Use read_file to read it. "
                     f"Absolute path: {root_path}")
         if not root_path.exists() or not root_path.is_dir():
-            return f"ERROR: Directory not found or not a directory: {path}"
+            return refusal(RefusalClass.NOT_FOUND, f"ERROR: Directory not found or not a directory: {path}")
 
         ignore_dirs = {".git", "__pycache__", "node_modules", "venv", ".env", ".pytest_cache", "dist", "build"}
         output_lines = [f"Directory tree for: {root_path.name} (absolute path: {root_path})"]
@@ -714,9 +1029,9 @@ def execute_list_directory(path: str = ".") -> str:
 
         return "\n".join(output_lines)
     except PermissionError:
-        return f"ERROR: Permission denied: {path}"
+        return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied: {path}")
     except Exception as e:
-        return f"ERROR: Could not list directory: {str(e)}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not list directory: {str(e)}")
 
 # Modules that are too dangerous to allow inside agent-generated run_code snippets.
 # Use read_file / write_file tools for file I/O; use git_status / git_diff for shell work.
@@ -879,7 +1194,7 @@ def _sandbox_check(code: str) -> str | None:
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
-        return f"ERROR: Code has a syntax error: {e}"
+        return refusal(RefusalClass.SYNTAX, f"ERROR: Code has a syntax error: {e}")
 
     violations = []
     allowed_nodes = (
@@ -929,7 +1244,7 @@ def _sandbox_check(code: str) -> str | None:
     violations.extend(_fstring_violations(tree))
     if violations:
         bullet_list = "\n  - ".join(violations)
-        return (
+        return refusal(RefusalClass.PERMISSION,
             f"SANDBOX BLOCK: The following forbidden constructs were detected:\n"
             f"  - {bullet_list}\n\n"
             f"run_code is for pure computation only (math, algorithms, data processing).\n"
@@ -960,7 +1275,7 @@ def _child_rlimits_supported() -> bool:
 def execute_run_code(code: str, language: str = "python") -> str:
     """Run Python code snippet in a sandboxed subprocess with AST analysis + timeout."""
     if language.lower() not in ["python", "py"]:
-        return f"ERROR: Running language '{language}' is not supported yet. Only Python is supported."
+        return refusal(RefusalClass.OTHER, f"ERROR: Running language '{language}' is not supported yet. Only Python is supported.")
 
     # AST sandbox check before any execution
     sandbox_error = _sandbox_check(code)
@@ -1024,11 +1339,12 @@ def execute_run_code(code: str, language: str = "python") -> str:
             output += f"STDERR:\n{err}\n"
         if not output:
             output = "[Code executed successfully with no output]"
-        return output.strip()
+        result = output.strip()
+        return refusal(RefusalClass.OTHER, result) if res.returncode else result
     except subprocess.TimeoutExpired:
-        return f"ERROR: Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds."
+        return refusal(RefusalClass.OTHER, f"ERROR: Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds.")
     except Exception as e:
-        return f"ERROR: Code execution failed: {str(e)}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Code execution failed: {str(e)}")
 
 def execute_search_web(query: str) -> str:
     """Return formatted results (ok), or an ERROR with a stable search category.
@@ -1108,7 +1424,7 @@ def execute_search_web(query: str) -> str:
                 empty_backends.append(backend)
                 continue
             if not _is_relevant(results, effective_query):
-                return (
+                return refusal(RefusalClass.OTHER,
                     f"ERROR: search_web [irrelevant]: Results from {backend} did not pass "
                     f"the relevance check for query: '{query}'."
                 )
@@ -1127,13 +1443,13 @@ def execute_search_web(query: str) -> str:
 
     if empty_backends:
         details = (" " + "; ".join(failures) + ".") if failures else ""
-        return (
+        return refusal(RefusalClass.OTHER,
             f"ERROR: search_web [empty]: Backend(s) {', '.join(empty_backends)} returned no results "
             f"for query: '{query}'." + details + " The underlying cause is unknown."
         )
 
     category = "both_failed" if len(execution_failures) == 2 else "backend_error"
-    return (
+    return refusal(RefusalClass.OTHER,
         f"ERROR: search_web [{category}]: No live search results could be retrieved "
         f"for query: '{query}'. " + "; ".join(failures)
         + ". The underlying cause is unknown."
@@ -1201,9 +1517,9 @@ def execute_git_status() -> str:
             output += "\n[Protected or outside-workspace changes omitted.]"
         return output
     except ValueError as exc:
-        return f"ERROR: Could not get git status: {exc}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not get git status: {exc}")
     except Exception as exc:
-        return f"ERROR: Could not get git status ({type(exc).__name__})."
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not get git status ({type(exc).__name__}).")
 
 
 _GIT_DIFF_FLAGS = [
@@ -1272,17 +1588,17 @@ def execute_git_diff() -> str:
             diff_text += "\n[Protected or outside-workspace changes omitted.]"
         return diff_text
     except ValueError as exc:
-        return f"ERROR: Could not read git diff: {exc}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not read git diff: {exc}")
     except Exception as exc:
-        return f"ERROR: Could not read git diff ({type(exc).__name__})."
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not read git diff ({type(exc).__name__}).")
 
 def execute_git_commit(message: str, approved: bool = False) -> str:
     """Run git commit after explicit command confirmation or opt-in."""
     if not approved and os.environ.get("NEXUS_ALLOW_GIT_COMMIT") != "1":
-        return "ERROR: Git commit is disabled for autonomous tools. Use nexus-agent commit for explicit review."
+        return refusal(RefusalClass.PERMISSION, "ERROR: Git commit is disabled for autonomous tools. Use nexus-agent commit for explicit review.")
     try:
         if not message or not message.strip():
-            return "ERROR: Commit message cannot be empty."
+            return refusal(RefusalClass.TARGETING, "ERROR: Commit message cannot be empty.")
 
         staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
         if not staged_check.stdout.strip():
@@ -1291,15 +1607,15 @@ def execute_git_commit(message: str, approved: bool = False) -> str:
             staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
 
         if not staged_check.stdout.strip():
-            return "ERROR: No staged changes found to commit. Use git_status to review untracked/modified files."
+            return refusal(RefusalClass.OTHER, "ERROR: No staged changes found to commit. Use git_status to review untracked/modified files.")
 
         result = _safe_git_run(["git", "commit", "-m", message], execution=True)
         if result.returncode == 0:
             return f"Committed successfully:\n{result.stdout.strip()}"
         else:
-            return f"ERROR: git commit failed:\n{result.stderr.strip() or result.stdout.strip()}"
+            return refusal(RefusalClass.OTHER, f"ERROR: git commit failed:\n{result.stderr.strip() or result.stdout.strip()}")
     except Exception as e:
-        return f"ERROR: Could not commit: {str(e)}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Could not commit: {str(e)}")
 
 READ_FILE_TOOL = Tool(
     name="read_file",
@@ -1371,6 +1687,35 @@ PATCH_FILE_TOOL = Tool(
         "required": ["path", "target", "replacement"],
     },
     execute=execute_patch_file,
+)
+
+_FUNCTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string", "description": "Existing UTF-8 .py file, read before editing."},
+        "function_name": {"type": "string", "description": "Exact function or direct method name."},
+        "new_body": {
+            "type": "string",
+            "description": "Exactly one complete unindented def/async def, including its unchanged signature and decorators for edits. Not just body statements.",
+        },
+        "class_name": {"type": "string", "description": "Optional exact name of one direct module class for a method."},
+    },
+    "required": ["path", "function_name", "new_body"],
+    "additionalProperties": False,
+}
+
+EDIT_FUNCTION_TOOL = Tool(
+    name="edit_function",
+    description="Replace one uniquely identified Python function or direct method; preserve its complete header and every byte outside its proven span.",
+    input_schema=_FUNCTION_SCHEMA,
+    execute=execute_edit_function,
+)
+
+ADD_FUNCTION_TOOL = Tool(
+    name="add_function",
+    description="Add one complete Python function to the end of an existing module or exact class without changing existing bytes. Refuse existing names.",
+    input_schema=_FUNCTION_SCHEMA,
+    execute=execute_add_function,
 )
 
 LIST_DIRECTORY_TOOL = Tool(
@@ -1463,7 +1808,7 @@ GIT_COMMIT_TOOL = Tool(
 
 def execute_run_file(path: str) -> str:
     """Reject unrestricted script execution."""
-    return (
+    return refusal(RefusalClass.PERMISSION,
         f"ERROR: Executing existing files ('{path}') is disabled for safety. "
         "Explain this limit plainly to the user instead of deflecting or confirming execution; "
         "offer run_code for pure computation or run_tests for project tests."
@@ -1490,11 +1835,11 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
     from .consent import execution_allowed
     allowed, why = execution_allowed()
     if not allowed:
-        return ("ERROR: Project test execution is not approved. Pytest imports arbitrary project code "
+        return refusal(RefusalClass.PERMISSION, "ERROR: Project test execution is not approved. Pytest imports arbitrary project code "
                 "with your user permissions; it is NOT sandboxed. " + why)
     import importlib.util
     if importlib.util.find_spec("pytest") is None:
-        return (f"ERROR: pytest is not installed for the Python Nexus runs on. Install it with: "
+        return refusal(RefusalClass.OTHER, f"ERROR: pytest is not installed for the Python Nexus runs on. Install it with: "
                 f"\"{sys.executable}\" -m pip install pytest")
     cmd = [sys.executable, "-m", "pytest", "-o", "addopts="]
 
@@ -1506,7 +1851,7 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
             return validated
         p = validated
         if not p.exists():
-            return f"ERROR: Target test path does not exist: {clean_path}"
+            return refusal(RefusalClass.NOT_FOUND, f"ERROR: Target test path does not exist: {clean_path}")
         cmd.append(str(p))
 
     # Safe args whitelist
@@ -1530,30 +1875,30 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
                 if re.match(r'^[a-zA-Z0-9_\s\(\)]+$', k_val):
                     cmd.extend(["-k", k_val])
                 else:
-                    return f"ERROR: Invalid or unsafe -k filter expression: '{k_val}'"
+                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid or unsafe -k filter expression: '{k_val}'")
                 i += 2
             elif token.startswith("-k="):
                 if re.match(r'^-k=[a-zA-Z0-9_\s\(\)]+$', token):
                     cmd.append(token)
                 else:
-                    return f"ERROR: Invalid or unsafe -k filter expression: '{token}'"
+                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid or unsafe -k filter expression: '{token}'")
                 i += 1
             elif token.startswith("--maxfail="):
                 val = token.split("=", 1)[1]
                 if val.isdigit() and int(val) > 0:
                     cmd.append(token)
                 else:
-                    return f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer."
+                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer.")
                 i += 1
             elif token == "--maxfail" and i + 1 < len(tokens):
                 val = tokens[i + 1]
                 if val.isdigit() and int(val) > 0:
                     cmd.extend(["--maxfail", val])
                 else:
-                    return f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer."
+                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer.")
                 i += 2
             else:
-                return f"ERROR: Unsupported or unsafe pytest argument: '{token}'. Allowed flags: -v, -q, -x, -s, -k <expr>, --disable-warnings, --tb=short, --maxfail=N."
+                return refusal(RefusalClass.TARGETING, f"ERROR: Unsupported or unsafe pytest argument: '{token}'. Allowed flags: -v, -q, -x, -s, -k <expr>, --disable-warnings, --tb=short, --maxfail=N.")
 
     try:
         proc = subprocess.run(
@@ -1583,11 +1928,12 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
             full_output = full_output[:1500] + "\n\n... [truncated] ...\n\n" + full_output[-1500:]
 
         status_str = "PASSED" if exit_code == 0 else f"FAILED (exit code {exit_code})"
-        return f"=== Pytest Results: {status_str} ===\n{full_output}"
+        result = f"=== Pytest Results: {status_str} ===\n{full_output}"
+        return refusal(RefusalClass.OTHER, result) if exit_code else result
     except subprocess.TimeoutExpired:
-        return "ERROR: Pytest execution timed out after 45 seconds."
+        return refusal(RefusalClass.OTHER, "ERROR: Pytest execution timed out after 45 seconds.")
     except Exception as e:
-        return f"ERROR: Failed to run pytest: {str(e)}"
+        return refusal(RefusalClass.OTHER, f"ERROR: Failed to run pytest: {str(e)}")
 
 RUN_TESTS_TOOL = Tool(
     name="run_tests",
@@ -1614,6 +1960,8 @@ def get_all_tools() -> List[Tool]:
         READ_FILE_TOOL,
         WRITE_FILE_TOOL,
         PATCH_FILE_TOOL,
+        EDIT_FUNCTION_TOOL,
+        ADD_FUNCTION_TOOL,
         LIST_DIRECTORY_TOOL,
         RUN_CODE_TOOL,
         SEARCH_WEB_TOOL,
@@ -1637,14 +1985,25 @@ def get_readonly_tools() -> List[Tool]:
         GIT_DIFF_TOOL,
     ]
 
-def execute_tool(name: str, args: Dict[str, Any]) -> str:
-    """Execute a tool by name with given arguments."""
+def execute_tool(name: str, args: Dict[str, Any], *, gated_reason=None,
+                 expected_state=None) -> str:
+    """Execute with caller-owned private gate/snapshot state, never model arguments."""
+    if name == "run_code" and gated_reason is not None:
+        if not isinstance(gated_reason, RefusalClass):
+            return refusal(RefusalClass.OTHER, "ERROR: Invalid private run_code gate.")
+        return refusal(gated_reason, "ERROR: run_code is gated for this turn after an edit refusal "
+                       f"({gated_reason.value}); use the permitted inspection/edit tools or finish honestly.")
+    if any(key in args for key in ("expected_state", "gated_reason")):
+        return refusal(RefusalClass.TARGETING,
+                       f"ERROR: Invalid arguments for tool '{name}': private dispatch state is not a tool argument")
     for t in get_all_tools():
         if t.name == name:
             try:
+                if name in ("edit_function", "add_function"):
+                    return t.execute(**args, expected_state=expected_state)
                 return t.execute(**args)
             except TypeError as e:
-                return f"ERROR: Invalid arguments for tool '{name}': {str(e)}"
+                return refusal(RefusalClass.TARGETING, f"ERROR: Invalid arguments for tool '{name}': {str(e)}")
             except Exception as e:
-                return f"ERROR: Execution failed for tool '{name}': {str(e)}"
-    return f"ERROR: Unknown tool '{name}'"
+                return refusal(RefusalClass.OTHER, f"ERROR: Execution failed for tool '{name}': {str(e)}")
+    return refusal(RefusalClass.TARGETING, f"ERROR: Unknown tool '{name}'")

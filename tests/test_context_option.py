@@ -182,8 +182,15 @@ def test_local_default_budget_finishes_short_edit_without_overcommitting_output(
         assert not agent.unresolved_errors
         assert not agent.edit_not_applied and not agent.response_incomplete
     for request in requests:
+        # Gating changes the offered schema set within a turn; use this request's tools.
+        offered = [
+            SimpleNamespace(name=item["function"]["name"],
+                            description=item["function"]["description"],
+                            input_schema=item["function"]["parameters"])
+            for item in request.get("tools", [])
+        ]
         input_tokens = (context.estimate_tokens(request["messages"][0]["content"])
-                        + context.tools_tokens(agent.tools)
+                        + context.tools_tokens(offered)
                         + context.history_tokens(request["messages"][1:]))
         assert input_tokens + request["max_tokens"] <= 4096
         assert request["max_tokens"] > 0

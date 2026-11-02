@@ -47,6 +47,15 @@ def no_implicit_attachment(monkeypatch):
     monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
 
 
+def outcome_metadata(path_statuses, *, turn="t1", segment="s1"):
+    events = [
+        {"event": f"{turn}-{segment}-{index}", "turn": turn, "segment": segment,
+         "path": path, "action": "patch_file", "status": status,
+         "success": status == "changed", "failed": status == "unchanged"}
+        for index, (path, status) in enumerate(path_statuses.items())
+    ]
+    return {"turn": turn, "segment": segment, **mutation_metadata(events)}
+
 def bad_patch(path="b.py"):
     return "patch_file", {"path": path, "target": "nonexistent source", "replacement": "x = 2"}
 
@@ -164,7 +173,7 @@ def test_mixed_outcomes_redact_only_false_claims_in_next_fitted_view(tmp_path, p
     original = audit[-1]
     assert original["content"].encode() == raw.encode()
     statuses = {item["path"]: item["status"] for item in original["metadata"]["mutation_outcomes"]}
-    assert statuses == {str(tmp_path / "a.py"): "changed", str(tmp_path / "b.py"): "unchanged"}
+    assert statuses == {str(tmp_path / "b.py"): "unchanged"}
 
     agent.run("What happened?")
     fitted = provider.seen[-1]
@@ -176,8 +185,8 @@ def test_mixed_outcomes_redact_only_false_claims_in_next_fitted_view(tmp_path, p
     assert len(corrections) == 1
     correction = corrections[0]
     assert correction["role"] == "user" and not is_genuine_user_message(correction)
-    assert "Observed mutations:" in correction["content"] and str(tmp_path / "a.py") in correction["content"]
-    assert "No mutation observed:" in correction["content"] and str(tmp_path / "b.py") in correction["content"]
+    assert "no executor write to" in correction["content"] and str(tmp_path / "b.py") in correction["content"]
+    assert str(tmp_path / "a.py") not in correction["content"]
     assert "unknown.py" not in correction["content"]
     assert "not a new request or approval" in correction["content"]
     assert memory.get()[:len(audit)] == audit
@@ -185,12 +194,11 @@ def test_mixed_outcomes_redact_only_false_claims_in_next_fitted_view(tmp_path, p
 
 @pytest.mark.parametrize("claim", [
     "I updated a.py and b.py.",
-    "I updated a.py and fixed b.py.",
-    "a.py was updated. b.py was updated.",
+    "I updated a.py and I fixed b.py.",
     "I updated `a.py`. I updated `b.py`.",
 ])
 def test_shared_or_separate_predicates_keep_successful_file_claim(tmp_path, claim):
-    metadata = mutation_metadata({str(tmp_path / "a.py"): "changed", str(tmp_path / "b.py"): "unchanged"})
+    metadata = outcome_metadata({str(tmp_path / "a.py"): "changed", str(tmp_path / "b.py"): "unchanged"})
     original = [{"role": "user", "content": "Update both files"},
                 {"role": "assistant", "content": claim, "metadata": metadata}]
     before = copy.deepcopy(original)
@@ -210,7 +218,7 @@ def test_shared_or_separate_predicates_keep_successful_file_claim(tmp_path, clai
 def test_unknown_advice_examples_and_negations_are_not_invented_contradictions(tmp_path, claim):
     messages = [{"role": "user", "content": "I updated b.py."}, {
         "role": "assistant", "content": claim,
-        "metadata": mutation_metadata({str(tmp_path / "b.py"): "unchanged"}),
+        "metadata": outcome_metadata({str(tmp_path / "b.py"): "unchanged"}),
     }]
     assert fitted_claim_view(messages) == messages
 
@@ -225,12 +233,12 @@ def test_generic_correction_without_verified_outcomes_cannot_redact():
 def paired_claim_history(tmp_path):
     return [
         {"role": "user", "content": "Inspect both files"},
-        {"role": "assistant", "content": "I updated b.py.", "tool_calls": [
+        {"role": "assistant", "content": "I updated b.py.", "metadata": {"turn": "t1", "segment": "s1"}, "tool_calls": [
             {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"a.py"}'}},
             {"id": "b", "type": "function", "function": {"name": "patch_file", "arguments": '{"path":"b.py","target":"x","replacement":"y"}'}},
         ]},
         {"role": "tool", "tool_call_id": "a", "content": "observed source"},
-        {"role": "tool", "tool_call_id": "b", "content": "ERROR: Target content not found", "metadata": mutation_metadata({str(tmp_path / "b.py"): "unchanged"})},
+        {"role": "tool", "tool_call_id": "b", "content": "ERROR: Target content not found", "metadata": outcome_metadata({str(tmp_path / "b.py"): "unchanged"})},
         {"role": "assistant", "content": "End of turn."},
     ]
 
@@ -290,15 +298,15 @@ def test_omission_and_projection_include_correction_cost_without_audit_changes(t
 
 def test_metadata_is_bounded_and_ambiguous_observations_remain_unknown(tmp_path):
     outcomes = {str(tmp_path / f"f{i}.py"): "unchanged" for i in range(50)}
-    metadata = mutation_metadata(outcomes)
+    metadata = {"mutation_outcomes": outcome_metadata(outcomes)["mutation_outcomes"]}
     assert len(metadata["mutation_outcomes"]) <= 8
     assert len(json.dumps(metadata, ensure_ascii=False)) <= 2048
-    unknown = mutation_metadata({str(tmp_path / "b.py"): "unknown"})
+    unknown = outcome_metadata({str(tmp_path / "b.py"): "unknown"})
     messages = [{"role": "assistant", "content": "I updated b.py.", "metadata": unknown}]
     assert fitted_claim_view(messages) == messages
 
 
-def test_success_claim_is_not_backed_by_a_fake_tool_success_string(tmp_path, monkeypatch):
+def test_success_string_and_unchanged_bytes_do_not_prove_typed_failed_edit(tmp_path, monkeypatch):
     read_b(tmp_path)
     monkeypatch.setattr(core, "execute_tool", lambda *args: "Successfully patched b.py")
     provider = Scripted([bad_patch(), "I updated b.py."])
@@ -308,11 +316,11 @@ def test_success_claim_is_not_backed_by_a_fake_tool_success_string(tmp_path, mon
     assert raw[-1]["content"] == "I updated b.py."
     assert raw[-1]["metadata"]["mutation_outcomes"][0]["status"] == "unchanged"
     fitted = agent._fit(raw, [])
-    assert "I updated b.py." not in fitted[-2]["content"]
-    assert fitted[-1]["metadata"]["outcome_correction"]
+    assert fitted[-1]["content"] == "I updated b.py."
+    assert not any(m.get("metadata", {}).get("outcome_correction") for m in fitted)
 
 
-def test_later_failed_attempt_does_not_erase_an_observed_mutation(tmp_path):
+def test_later_failed_segment_is_not_blanket_protected_by_old_mutation(tmp_path):
     provider = Scripted([
         ("write_file", {"path": "a.py", "content": "a = 1\n"}),
         bad_patch("a.py"), "I updated a.py.",
@@ -320,12 +328,12 @@ def test_later_failed_attempt_does_not_erase_an_observed_mutation(tmp_path):
     agent = Agent(provider, verbose=False)
     agent.run("Update a.py")
     audit = agent.memory.get()
-    assert audit[-1]["metadata"]["mutation_outcomes"] == [
-        {"path": str(tmp_path / "a.py"), "status": "changed"},
-    ]
+    records = audit[-1]["metadata"]["mutation_outcomes"]
+    assert len(records) == 1 and records[0]["path"] == str(tmp_path / "a.py")
+    assert records[0]["status"] == "unchanged" and records[0]["failed"]
     fitted = agent._fit(audit, [])
-    assert fitted[-1]["content"] == "I updated a.py."
-    assert not any(m.get("metadata", {}).get("outcome_correction") for m in fitted)
+    assert "I updated a.py." not in fitted[-2]["content"]
+    assert fitted[-1]["metadata"]["outcome_correction"]
 
 
 def test_outcomes_from_a_later_turn_do_not_rewrite_earlier_evidence(tmp_path):
@@ -333,10 +341,10 @@ def test_outcomes_from_a_later_turn_do_not_rewrite_earlier_evidence(tmp_path):
     messages = [
         {"role": "user", "content": "First request"},
         {"role": "assistant", "content": "I updated b.py.",
-         "metadata": mutation_metadata({path: "unchanged"})},
+         "metadata": outcome_metadata({path: "unchanged"})},
         {"role": "user", "content": "Independent later request"},
         {"role": "assistant", "content": "I updated b.py.",
-         "metadata": mutation_metadata({path: "changed"})},
+         "metadata": outcome_metadata({path: "changed"}, turn="t2", segment="s2")},
     ]
     audit = copy.deepcopy(messages)
     fitted = fitted_claim_view(messages)

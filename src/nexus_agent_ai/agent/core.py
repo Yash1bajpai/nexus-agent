@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 from ..providers.base import BaseProvider, RateLimitError, ProviderResponse
@@ -17,13 +18,14 @@ from .guardrails import (
 from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
-from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata
+from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata, current_claim_correction
+from .refusals import RefusalClass, refusal
 
 RULES_PROMPT = """RULES:
 1. Always use read_file tool before answering questions about a specific file.
    Never guess or assume file contents.
-2. When creating new files, use write_file. When modifying existing files, always use patch_file
-   to replace only the specific targeted code blocks and preserve file integrity.
+2. When creating new files, use write_file. For existing files, use patch_file for literal
+   changes or edit_function/add_function for targeted Python function changes.
    Read the file with read_file first; edits to unread or changed files are refused.
    patch_file.target is OLD text already in the file; replacement is the desired NEW text.
    If the target was not found, copy the exact target JSON from the error and retry once.
@@ -59,7 +61,7 @@ This applies to every single tool call in every iteration."""
 # Keywords/patterns that indicate a query NEEDS tool access
 _TOOL_PATTERNS = [
     # Explicit capability requests must not depend on underscores being word boundaries.
-    r'\b(?:read_file|write_file|patch_file|list_directory|run_code|run_tests|search_web|git_status|git_diff|git_commit)\b',
+    r'\b(?:read_file|write_file|patch_file|edit_function|add_function|list_directory|run_code|run_tests|search_web|git_status|git_diff|git_commit)\b',
     r'\b(?:calculate|compute|calculation|arithmetic)\b',
     r'\b\d[\d,]*(?:\.\d+)?\s*(?:[+*/%−-]|plus\b|minus\b|times\b|divided by\b|multiplied by\b)\s*[-+]?\d',
     # File operations
@@ -98,7 +100,12 @@ def _is_local_provider(provider: BaseProvider) -> bool:
             hasattr(provider, '_server_proc'))
 
 _EDIT_INTENT = re.compile(r"\b(fix|change|edit|modify|update|replace|rewrite|refactor|patch|rename|implement|add|remove|delete)\b", re.IGNORECASE)
-_WRITE_TOOLS = ("patch_file", "write_file")
+_WRITE_TOOLS = ("patch_file", "write_file", "edit_function", "add_function")
+_GATING_EDIT_TOOLS = ("patch_file", "edit_function", "add_function")
+_EDIT_REFUSAL_GATES = frozenset({
+    RefusalClass.TARGETING, RefusalClass.SYNTAX, RefusalClass.CONTENT_LOSS,
+    RefusalClass.AMBIGUITY, RefusalClass.BLIND_EDIT,
+})
 _VERBS = r"(?:fixed|updated|changed|modified|patched|applied|corrected|replaced|rewrote|rewritten|edited|implemented|added|removed|renamed|resolved)"
 # The model says it changed something ("I've fixed...", "the bug has been fixed", "I fixed the bug").
 _CHANGE_CLAIM = re.compile(r"\b(?:i(?:'ve|\s+have)?\s+(?:now\s+|successfully\s+)?" + _VERBS + r"|(?:has|have|was|were|is|are)\s+(?:now\s+|successfully\s+)?(?:been\s+)?" + _VERBS + r")\b", re.IGNORECASE)
@@ -163,7 +170,7 @@ def _edit_path(args) -> Optional[Path]:
 
 def _target_snapshot(name, args):
     """Hash only permitted file targets; unknown/denied states are never evidence."""
-    if name not in ("read_file", "patch_file", "write_file"):
+    if name != "read_file" and name not in _WRITE_TOOLS:
         return None, ("no-target", None)
     from . import tools
     path = _edit_path(args)
@@ -349,7 +356,13 @@ class Agent:
         self.changed_files: set[str] = set()
         self.requirements_incomplete: List[str] = []
         self._identical_failures = IdenticalFailureTracker()
-        self._mutation_outcomes: Dict[str, str] = {}
+        self._mutation_outcomes: Dict[str, Dict[str, Any]] = {}
+        self._mutation_segment = ""
+        self._segment_complete = True
+        self._turn_id = "initial"
+        self._turn_mutation_attempted = False
+        self._run_code_gate = None
+        self._audit_seen = set()
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -397,9 +410,74 @@ class Agent:
     def _remember_assistant(self, text, tool_calls=()):
         """Keep original model bytes; attach only executor-observed mutation evidence."""
         message = assistant_message(text, tool_calls)
-        if self._mutation_outcomes:
-            message["metadata"] = mutation_metadata(self._mutation_outcomes)
+        if self._mutation_segment:
+            message["metadata"] = self._outcome_metadata()
         self.memory.add_raw(message)
+
+    def _outcome_metadata(self):
+        return {
+            "turn": self._turn_id, "segment": self._mutation_segment,
+            **mutation_metadata(list(self._mutation_outcomes.values())),
+        }
+
+    def _audit(self, event_type, facts):
+        """Bounded factual events only; projections never invoke this method."""
+        if event_type == "tool_gated":
+            if self.event_callback:
+                self.event_callback({"type": event_type, **facts})
+            return
+        key = (event_type, json.dumps(facts, sort_keys=True))
+        if key not in self._audit_seen:
+            self._audit_seen.add(key)
+            if self.event_callback:
+                self.event_callback({"type": event_type, **facts})
+
+    def _record_fit(self, stats):
+        record = stats.get("session_record")
+        if stats.get("dropped_turns", 0) and record is not None:
+            self.memory.set_session_metadata("SESSION_RECORD", record)
+        if stats.get("omission_tokens", 0):
+            # A historical record is not evidence of present files or successful retention.
+            self._audit("session_record_injected", {
+                "turn": self._turn_id, "fields_included": stats.get("fields_included", {}),
+            })
+        for facts in stats.get("claim_redactions", []):
+            self._audit("claim_redacted", facts)
+
+    def _record_mutation(self, path, tool_name, before, after, result, event_id):
+        self._turn_mutation_attempted = True
+        if path is None:
+            return
+        refusal_class = getattr(result, "refusal_class", None)
+        changed = (before is not None and after is not None and before != after
+                   and refusal_class is None and not str(result).startswith(("ERROR:", "No changes:")))
+        status = ("changed" if changed else
+                  "unchanged" if before is not None and before == after else "unknown")
+        path_key = str(path)
+        previous = self._mutation_outcomes.get(path_key, {})
+        event = {
+            "event": event_id, "turn": self._turn_id, "segment": self._mutation_segment,
+            "path": path_key, "action": tool_name, "status": status, "success": changed,
+            "failed": refusal_class is not None,
+            "segment_mutated": changed or previous.get("segment_mutated", False),
+            "segment_complete": self._segment_complete and previous.get("segment_complete", True) and status != "unknown",
+            "segment_failed_only": (
+                refusal_class is not None and status == "unchanged"
+                and previous.get("segment_failed_only", True)
+            ),
+        }
+        self._mutation_outcomes.pop(path_key, None)
+        self._mutation_outcomes[path_key] = event
+        if len(self._mutation_outcomes) > MAX_OUTCOME_FILES:
+            del self._mutation_outcomes[next(iter(self._mutation_outcomes))]
+            self._segment_complete = False
+            for entry in self._mutation_outcomes.values():
+                entry["segment_complete"] = False
+        ledger = self.memory.get_session_metadata("MUTATION_RECORD", [])
+        if not isinstance(ledger, list):
+            ledger = []
+        bounded = mutation_metadata(ledger + [event])["mutation_outcomes"]
+        self.memory.set_session_metadata("MUTATION_RECORD", bounded)
 
     def _stream_correction(self, text: str):
         if not text:
@@ -434,7 +512,9 @@ class Agent:
                         f"({overhead + reserve} tokens). Adjust the configured context/output budgets within "
                         "the endpoint's documented capacity, or use fewer tools."
                     )
-                fitted, stats = context.fit_messages(messages, budget)
+                fitted, stats = context.fit_messages(
+                    messages, budget, session_record=self.memory.get_session_metadata("SESSION_RECORD"),
+                )
                 break
             except context.ContextBudgetError:
                 if not adaptive or reserve <= minimum_output:
@@ -446,13 +526,26 @@ class Agent:
     def _fit(self, messages, tools, scale: float = 1.0):
         """Trim only the sent view; retain the exact newest user request and stored history."""
         if not self.context_window:
-            return fitted_claim_view(messages)
+            record = self.memory.get_session_metadata("SESSION_RECORD")
+            view = fitted_claim_view(messages)
+            if record is not None:
+                view, stats = context.fit_messages(
+                    messages, context.history_tokens(view) + context.OMISSION_MAX_TOKENS,
+                    session_record=record,
+                )
+                self._record_fit(stats)
+            else:
+                for message in view:
+                    for facts in message.get("metadata", {}).get("claim_redactions", []):
+                        self._audit("claim_redacted", facts)
+            return view
         active = getattr(self.provider, "active_provider", self.provider)
         adaptive = _is_local_provider(active) and getattr(active, "_supports_output_budget", False)
         boost = getattr(self, "_output_boost", None) if adaptive else None
         if boost:
             self._output_boost = None
         fitted, stats = self._plan_fit(messages, tools, scale, boost=boost)
+        self._record_fit(stats)
         configured = self.output_reserve
         reserve = stats["reserve"]
         if adaptive:
@@ -535,6 +628,12 @@ class Agent:
         tools_module.set_user_intent(user_input or "")
         self._identical_failures.begin_turn()
         self._mutation_outcomes = {}
+        self._mutation_segment = ""
+        self._segment_complete = True
+        self._turn_id = uuid.uuid4().hex
+        self._turn_mutation_attempted = False
+        self._run_code_gate = None
+        self._audit_seen = set()
         routing_input = _routing_request(user_input, self.memory.get())
         requires_search = bool(_LIVE_SEARCH_REQUEST.search(routing_input))
         wants_edit = require_edit or (
@@ -671,6 +770,10 @@ class Agent:
                         continue
 
                 if response.has_tool_calls:
+                    if any(call.name in _WRITE_TOOLS for call in response.tool_calls):
+                        self._mutation_segment = f"{self._turn_id}:{iteration}"
+                        self._mutation_outcomes = {}
+                        self._segment_complete = True
                     self._remember_assistant(response.text, response.tool_calls)
 
                     # Show THINKING trace: the LLM's reasoning text before tool call
@@ -682,7 +785,7 @@ class Agent:
                             status = None
                             display.print_thinking(response.text)
 
-                    for tool_call in response.tool_calls:
+                    for call_index, tool_call in enumerate(response.tool_calls):
                         changed = False
                         # Build status display with full argument visibility (up to 150 chars)
                         args_preview = ", ".join(
@@ -709,9 +812,14 @@ class Agent:
                         
                         allowed_names = {tool.name for tool in use_tools}
                         if repeated_failure_stop:
-                            result = "ERROR: Not executed: turn stopped after repeated identical failure."
+                            result = refusal(RefusalClass.OTHER, "ERROR: Not executed: turn stopped after repeated identical failure.")
+                        elif tool_call.name == "run_code" and self._run_code_gate is not None:
+                            result = execute_tool("run_code", tool_call.args, gated_reason=self._run_code_gate)
+                            self._audit("tool_gated", {
+                                "reason": self._run_code_gate.value, "tool": "run_code", "enforced_at": "dispatch",
+                            })
                         elif tool_call.name not in allowed_names:
-                            result = f"ERROR: Tool '{tool_call.name}' is not allowed in this session."
+                            result = refusal(RefusalClass.PERMISSION, f"ERROR: Tool '{tool_call.name}' is not allowed in this session.")
                         elif tool_sig in executed_tools:
                             duplicate_counts[tool_sig] = duplicate_counts.get(tool_sig, 0) + 1
                             reread_while_editing = (tool_call.name == "read_file" and not wrote_ok and wants_edit
@@ -734,7 +842,19 @@ class Agent:
                             edit_path = target_path if tool_call.name in _WRITE_TOOLS else None
                             before_edit = before_state if edit_path is not None else None
                             tool_executed = True
-                            result = execute_tool(tool_call.name, tool_call.args)
+                            if tool_call.name in ("edit_function", "add_function"):
+                                result = execute_tool(tool_call.name, tool_call.args, expected_state=before_state)
+                            else:
+                                result = execute_tool(tool_call.name, tool_call.args)
+                            refusal_class = getattr(result, "refusal_class", None)
+                            if tool_call.name in _GATING_EDIT_TOOLS and refusal_class in _EDIT_REFUSAL_GATES:
+                                if self._run_code_gate is None:
+                                    self._run_code_gate = refusal_class
+                                if any(tool.name == "run_code" for tool in use_tools):
+                                    use_tools = [tool for tool in use_tools if tool.name != "run_code"]
+                                    self._audit("tool_gated", {
+                                        "reason": refusal_class.value, "tool": "run_code", "enforced_at": "offered",
+                                    })
                             _, after_state = _target_snapshot(tool_call.name, tool_call.args)
                             if self._identical_failures.observe(
                                     tool_call.name, tool_call.args, str(result), before_state, after_state):
@@ -758,15 +878,11 @@ class Agent:
                                        and not str(result).startswith(("ERROR:", "No changes:")))
                             if changed:
                                 self.changed_files.add(str(edit_path))
-                            if edit_path is not None:
-                                path_key = str(edit_path)
-                                outcome = ("changed" if changed else
-                                           "unchanged" if before_edit is not None and after_state == before_edit else "unknown")
-                                if self._mutation_outcomes.get(path_key) != "changed":
-                                    self._mutation_outcomes.pop(path_key, None)
-                                    self._mutation_outcomes[path_key] = outcome
-                                    if len(self._mutation_outcomes) > MAX_OUTCOME_FILES:
-                                        del self._mutation_outcomes[next(iter(self._mutation_outcomes))]
+                            if tool_call.name in _WRITE_TOOLS:
+                                self._record_mutation(
+                                    edit_path, tool_call.name, before_edit, after_state, result,
+                                    f"{self._mutation_segment}:{call_index}",
+                                )
                             if guard:
                                 result = guard.after_tool(tool_call.name, tool_call.args, result)
 
@@ -807,8 +923,8 @@ class Agent:
                             display.print_tool_result(result, duration, tool_call.name)
 
                         result_message = {"role": "tool", "tool_call_id": tool_call.id, "content": str(result)}
-                        if self._mutation_outcomes:
-                            result_message["metadata"] = mutation_metadata(self._mutation_outcomes)
+                        if self._mutation_segment:
+                            result_message["metadata"] = self._outcome_metadata()
                         self.memory.add_raw(result_message)
 
                     if repeated_failure_stop:
@@ -894,9 +1010,9 @@ class Agent:
                         if not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
                             self.edit_not_applied = True
                         if _CHANGE_CLAIM.search(final_text.split("\n\nWarning: no file was changed")[0]) and not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
-                            # Not just "nothing to change": the model claimed an edit that never happened.
+                            # The requested executor action is unverified; do not infer semantic absence.
                             self.claimed_unapplied_edit = True
-                            final_text += "\nThe claim above that the code was changed is false: the files were not modified."
+                            final_text += "\nExecutor record: no successful file mutation was observed in this turn."
                     if not wrote_ok and not self.claimed_unapplied_edit:
                         _claim = _FILE_CLAIM.search(final_text or "")
                         if _claim and not _NO_CHANGE_OK.search(final_text or ""):
@@ -908,13 +1024,17 @@ class Agent:
                                     # Fail clean: correct the record, mark the turn not cleanly
                                     # finished, no automatic repair retry.
                                     self.claimed_unapplied_edit = True
-                                    final_text += ("\n\nCorrection: the statement above that a file was created or "
-                                                   "changed is not true - no file tool modified any file in this run, "
-                                                   "so nothing was written to disk.")
-                                else:
-                                    # Uncertain intent: honest advisory, not a failure mark.
-                                    final_text += ("\n\nNote: no file was written to disk in this run; "
-                                                   "any code above exists only in this reply.")
+                                    final_text += ("\n\nExecutor record: no file tool modified any file in this run. "
+                                                   "This does not establish whether any described content existed earlier.")
+                    if not self._turn_mutation_attempted:
+                        suffix, facts = current_claim_correction(
+                            response.text, self.memory.get(),
+                            session_events=self.memory.get_session_metadata("MUTATION_RECORD", []),
+                        )
+                        if suffix:
+                            final_text += suffix
+                            for fact in facts:
+                                self._audit("claim_corrected", fact)
                     self.requirements_incomplete = (
                         requirement_scope_errors + check_function_requirements(function_requirements)
                         + check_literal_assignment_requirement(literal_assignment_requirement)

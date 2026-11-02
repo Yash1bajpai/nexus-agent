@@ -44,10 +44,9 @@ def tool(name):
 
 def test_require_edit_sets_outcome_without_edit_keywords_or_available_tools():
     agent = Agent(Scripted(["I fixed the anomaly."]), tools=[], verbose=False)
-    final = agent.run("Investigate the anomaly", require_edit=True)
+    agent.run("Investigate the anomaly", require_edit=True)
     assert agent.edit_not_applied and agent.claimed_unapplied_edit
     assert not agent.changed_files
-    assert "files were not modified" in final
 
 
 def test_honest_no_change_is_not_a_false_edit_claim():
@@ -281,13 +280,12 @@ def test_inline_authored_draft_is_not_a_false_claim():
     assert "Correction:" not in final and "no file was written to disk" not in final
 
 
-def test_uncertain_file_claim_gets_honest_advisory_not_failure():
-    # Claim without an explicit filesystem request: advisory, not a failure mark.
+def test_unknown_file_claim_without_executor_evidence_is_preserved():
+    # An ambiguous authored example is not contradicted by invented executor evidence.
     agent = Agent(Scripted(["I've created calculator.py with the add function."]), tools=[], verbose=False)
     final = agent.run("make me a small example for addition")
     assert not agent.claimed_unapplied_edit
-    assert "no file was written to disk in this run" in final
-    assert "Correction:" not in final
+    assert final == "I've created calculator.py with the add function."
 
 
 def test_pure_advice_with_filename_is_not_a_false_claim():

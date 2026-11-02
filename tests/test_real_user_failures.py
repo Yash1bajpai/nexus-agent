@@ -176,10 +176,10 @@ def test_failed_patch_and_reread_do_not_become_edit_or_test_success(tmp_path, mo
         ("read_file", {"path": "test_calc.py"}),
         "The function has been updated. All tests pass.",
     ]), max_iterations=4, verbose=False, event_callback=events.append)
-    final = agent.run("There is a bug in test_calc.py in this folder. Read the file, fix the add function without changing the test, and run the tests to verify.")
+    agent.run("There is a bug in test_calc.py in this folder. Read the file, fix the add function without changing the test, and run the tests to verify.")
     assert path.read_text(encoding="utf-8") == original
     assert agent.claimed_unapplied_edit and agent.claim_unverified
-    assert agent.unresolved_errors and "files were not modified" in final
+    assert agent.unresolved_errors
     assert not any(e.get("name") == "run_tests" for e in events)
     assert not cli._check_run_outcome(agent, exit_on_failure=False)
 

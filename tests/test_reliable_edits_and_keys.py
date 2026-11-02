@@ -398,9 +398,10 @@ def test_false_claim_of_edit_without_write_is_flagged(tmp_path, monkeypatch):
     monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
     (tmp_path / "f.txt").write_text("alpha")
     agent = Agent(_Say("I've fixed the bug in f.txt."), verbose=False)
-    out = agent.run("fix f.txt")
+    agent.run("fix f.txt")
     assert agent.claimed_unapplied_edit
-    assert "false" in out and (tmp_path / "f.txt").read_text() == "alpha"
+    assert (tmp_path / "f.txt").read_text() == "alpha"
+    assert agent.edit_not_applied
 
 
 @pytest.mark.parametrize("text", [

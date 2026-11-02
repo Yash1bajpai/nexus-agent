@@ -26,6 +26,7 @@ _OMISSION_ACK = "Session record acknowledged; details outside this record remain
 _HISTORICAL_TOOLS = frozenset({
     "read_file", "write_file", "patch_file", "list_directory", "run_code",
     "search_web", "git_status", "git_diff", "git_commit", "run_tests",
+    "edit_function", "add_function",
 })
 _HISTORICAL_TOPICS = (
     ("testing", r"\b(?:test|tests|testing|pytest|unittest)\b"),
@@ -40,6 +41,47 @@ _UNSAFE_PATH_WORDS = frozenset({
     "ignore", "override", "obey", "instructions", "instruction", "system",
     "approval", "approved", "execute", "delete", "remove",
 })
+SESSION_RECORD_VERSION = 1
+_RECORD_LIMITS = {"files": 32, "topics": len(_HISTORICAL_TOPICS), "tools": 10}
+
+
+def _valid_record_path(value):
+    return (isinstance(value, str) and _METADATA_PATH.fullmatch(value) is not None
+            and not (_UNSAFE_PATH_WORDS & set(re.findall(r"[a-z]+", value.lower()))))
+
+
+def _remember_field(items, value, limit):
+    if value in items:
+        items.remove(value)
+    items.append(value)
+    del items[:-limit]
+
+
+def _validated_session_record(value):
+    """Accept only bounded historical fields, never note prose or other authority."""
+    if (not isinstance(value, dict) or type(value.get("version")) is not int
+            or value["version"] != SESSION_RECORD_VERSION
+            or set(value) != {"version", "files", "topics", "tools"}):
+        return None
+    record = {"version": SESSION_RECORD_VERSION}
+    allowed_topics = {topic for topic, _ in _HISTORICAL_TOPICS}
+    for key, limit in _RECORD_LIMITS.items():
+        items = value.get(key)
+        if not isinstance(items, list) or len(items) > limit:
+            return None
+        clean = []
+        for item in items:
+            if key == "files":
+                valid = _valid_record_path(item)
+            else:
+                valid = isinstance(item, str) and item in (
+                    allowed_topics if key == "topics" else _HISTORICAL_TOOLS
+                )
+            if not valid:
+                return None
+            _remember_field(clean, item, limit)
+        record[key] = clean
+    return record
 
 _OVERFLOW_PATTERNS = (
     "exceed_context_size", "exceeds the available context", "context size", "context length",
@@ -141,14 +183,18 @@ def _omission_pair(files=(), topics=(), tools=()):
     ]
 
 
-def _historical_omission(messages, budget_tokens):
-    """Only passive, constrained metadata; never replay untrusted request/result text."""
-    files, topics, tools = [], [], []
+def _collect_omission_fields(messages, session_record=None):
+    """Collect only the existing omission builder's sources, bounded as we go."""
+    record = _validated_session_record(session_record) or {
+        "version": SESSION_RECORD_VERSION, "files": [], "topics": [], "tools": [],
+    }
+    files, topics, tools = (record[key] for key in ("files", "topics", "tools"))
 
     def remember(items, value):
-        if value in items:
-            items.remove(value)
-        items.append(value)
+        limit = _RECORD_LIMITS["files"] if items is files else (
+            _RECORD_LIMITS["topics"] if items is topics else _RECORD_LIMITS["tools"]
+        )
+        _remember_field(items, value, limit)
 
     def collect_call(name, arguments):
         if not isinstance(name, str) or name not in _HISTORICAL_TOOLS:
@@ -163,8 +209,7 @@ def _historical_omission(messages, budget_tokens):
             return
         for key in ("path", "file_path", "filepath", "filename"):
             value = arguments.get(key)
-            if (isinstance(value, str) and _METADATA_PATH.fullmatch(value)
-                    and not (_UNSAFE_PATH_WORDS & set(re.findall(r"[a-z]+", value.lower())))):
+            if _valid_record_path(value):
                 remember(files, value)
 
     for message in messages:
@@ -189,6 +234,14 @@ def _historical_omission(messages, budget_tokens):
             if isinstance(function, dict):
                 collect_call(function.get("name"), function.get("args", {}))
 
+    return record
+
+
+def _fit_omission_fields(record, budget_tokens):
+    """Expose exactly the retained fields after tools/topics/files shedding."""
+    record = {key: list(value) if isinstance(value, list) else value
+              for key, value in record.items()}
+    files, topics, tools = (record[key] for key in ("files", "topics", "tools"))
     cap = min(OMISSION_MAX_TOKENS, budget_tokens)
     pair = _omission_pair(files, topics, tools)
     # Tool names are least valuable, then older topics, then older file references.
@@ -202,27 +255,48 @@ def _historical_omission(messages, budget_tokens):
             "cannot fit alongside the current request and tool bindings. No over-budget "
             "request was sent; ask the user to shorten input or adjust configured budgets."
         )
-    return pair
+    return pair, record
 
 
-def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Fit whole turns plus a bounded historical note; never alter the newest user request."""
+def fit_messages(
+    messages: List[Dict[str, Any]], budget_tokens: int, *, session_record=None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Pure fitting with bounded historical metadata; never alter the newest request."""
+    record = _validated_session_record(session_record)
     stats = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0,
-             "omission_tokens": 0}
-    view = fitted_claim_view(messages)
+             "omission_tokens": 0, "session_record": None,
+             "fields_included": {"files": 0, "topics": 0, "tools": 0},
+             "claim_redactions": []}
+    view = []
+    for message in fitted_claim_view(messages):
+        # Executor ledgers are audit evidence, not provider input. Consume them
+        # for claim handling first, then omit only these private fields in the
+        # disposable view; persisted records and genuine user bytes stay intact.
+        metadata = message.get("metadata", {})
+        if not is_genuine_user_message(message) and any(
+                key in metadata for key in ("mutation_outcomes", "turn", "segment")):
+            message = dict(message)
+            retained = {key: value for key, value in metadata.items()
+                        if key not in ("mutation_outcomes", "turn", "segment")}
+            if retained:
+                message["metadata"] = retained
+            else:
+                message.pop("metadata", None)
+        view.append(message)
     msgs = list(view)
     starts = [i for i, m in enumerate(msgs) if is_genuine_user_message(m)]
     stats["turns_before"] = stats["turns_after"] = len(starts)
     total = history_tokens(msgs)
     anchor_tokens = history_tokens(_omission_pair())
-    while len(starts) > 1 and total + (anchor_tokens if stats["dropped_messages"] else 0) > budget_tokens:
+    while len(starts) > 1 and total + (anchor_tokens if record is not None or stats["dropped_messages"] else 0) > budget_tokens:
         cut = starts[1]
         stats["dropped_messages"] += cut
         msgs = msgs[cut:]
         starts = [i - cut for i in starts[1:]]
         total = history_tokens(msgs)
 
-    payload_budget = budget_tokens - (anchor_tokens if stats["dropped_messages"] else 0)
+    needs_record = record is not None or bool(stats["dropped_messages"])
+    payload_budget = budget_tokens - (anchor_tokens if needs_record else 0)
     newest_user = starts[-1] if starts else None
     if total > payload_budget:
         # Neither tool-call arguments nor the newest genuine user message may change.
@@ -245,9 +319,9 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
             limit = max(200, int(limit * 0.6))
     if total > payload_budget:
         gap = ("Historical omission coverage gap: the omission anchor cannot fit with the current turn. "
-               if stats["dropped_messages"] else "")
+               if needs_record else "")
         raise ContextBudgetError(
-            gap + f"Current conversation needs at least {total + (anchor_tokens if stats['dropped_messages'] else 0)} "
+            gap + f"Current conversation needs at least {total + (anchor_tokens if needs_record else 0)} "
             f"estimated tokens but only {budget_tokens} are available in the configured request budget. "
             "The newest user request, tool arguments and call/result bindings were preserved; "
             "no over-budget request was sent. Shorten input or adjust configured budgets "
@@ -255,10 +329,27 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
         )
     stats["turns_after"] = len(starts)
     stats["dropped_turns"] = stats["turns_before"] - stats["turns_after"]
-    if stats["dropped_messages"]:
-        note = _historical_omission(view[:stats["dropped_messages"]], budget_tokens - total)
+    if needs_record:
+        collected = _collect_omission_fields(view[:stats["dropped_messages"]], record)
+        note, retained = _fit_omission_fields(collected, budget_tokens - total)
+        # Stop rule: if real e28 E2E still asserts false absence with this record,
+        # retire this candidate and report retention STILL UNSUPPORTED/NOT FIXED;
+        # historical metadata must never become stronger claims or new authority.
+        stats["session_record"] = retained
+        stats["fields_included"] = {key: len(retained[key]) for key in _RECORD_LIMITS}
         stats["omission_tokens"] = history_tokens(note)
         msgs = note + msgs
+    redactions = []
+    for message in msgs:
+        if message.get("role") not in ("assistant", "model"):
+            continue
+        for fact in message.get("metadata", {}).get("claim_redactions", []):
+            if (isinstance(fact, dict) and set(fact) == {"turn", "file", "trigger"}
+                    and all(isinstance(value, str) for value in fact.values())
+                    and fact not in redactions):
+                redactions.append(dict(fact))
+                del redactions[:-128]
+    stats["claim_redactions"] = redactions
     stats["correction_tokens"] = sum(
         message_tokens(m) for m in msgs if m.get("metadata", {}).get("outcome_correction")
     )

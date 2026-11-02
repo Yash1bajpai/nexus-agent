@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Optional
 from ..providers.messages import normalize_messages
 from ..utils.config import MAX_CONVERSATION_MESSAGES
 from ..utils.private_files import restrict_permissions
+from .memory import (
+    SESSION_METADATA_MAX_CHARS, SESSION_METADATA_MAX_KEYS, SESSION_METADATA_VERSION,
+    _session_metadata_copy, _session_metadata_json, _session_metadata_key,
+)
 
 
 def get_workspace_session_id(cwd: Optional[Path] = None) -> str:
@@ -46,15 +50,26 @@ class SQLiteMemory:
         )
     """
 
+    _METADATA_SCHEMA_SQL = """
+        CREATE TABLE IF NOT EXISTS session_metadata (
+            session_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            value_json TEXT NOT NULL,
+            PRIMARY KEY (session_id, key)
+        )
+    """
+
     def _init_db(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
-            conn.execute(self._SCHEMA_SQL)
+            self._ensure_schema(conn)
 
     @classmethod
     def _ensure_schema(cls, conn):
         # Classmethods open their own handle; an interrupted run can leave an
         # existing db file without the table, so never assume it is there.
         conn.execute(cls._SCHEMA_SQL)
+        conn.execute(cls._METADATA_SCHEMA_SQL)
 
     def add(self, role: str, content: str):
         self.add_raw({"role": role, "content": content})
@@ -96,9 +111,46 @@ class SQLiteMemory:
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             self._replace(conn, messages)
 
+    def get_session_metadata(self, key, default=None):
+        """Read session metadata with SELECT only; never normalize or rewrite audit history."""
+        _session_metadata_key(key)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT version, value_json FROM session_metadata WHERE session_id = ? AND key = ?",
+                (self.session_id, key),
+            ).fetchone()
+        if row is None or row[0] != SESSION_METADATA_VERSION or len(row[1]) > SESSION_METADATA_MAX_CHARS:
+            return _session_metadata_copy(default)
+        try:
+            return _session_metadata_copy(json.loads(row[1]))
+        except (ValueError, TypeError):
+            return _session_metadata_copy(default)
+
+    def set_session_metadata(self, key, value):
+        """Write one bounded versioned JSON value without touching conversation rows."""
+        _session_metadata_key(key)
+        encoded = _session_metadata_json(value)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            exists = conn.execute(
+                "SELECT 1 FROM session_metadata WHERE session_id = ? AND key = ?",
+                (self.session_id, key),
+            ).fetchone()
+            if exists is None:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM session_metadata WHERE session_id = ?", (self.session_id,),
+                ).fetchone()[0]
+                if count >= SESSION_METADATA_MAX_KEYS:
+                    raise ValueError("Session metadata key limit reached.")
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, key, version, value_json) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id, key) DO UPDATE SET version = excluded.version, value_json = excluded.value_json",
+                (self.session_id, key, SESSION_METADATA_VERSION, encoded),
+            )
+
     def clear(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (self.session_id,))
+            conn.execute("DELETE FROM session_metadata WHERE session_id = ?", (self.session_id,))
 
     @classmethod
     def list_sessions(cls, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -125,3 +177,4 @@ class SQLiteMemory:
         with closing(sqlite3.connect(db_path)) as conn, conn:
             cls._ensure_schema(conn)
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_metadata WHERE session_id = ?", (session_id,))

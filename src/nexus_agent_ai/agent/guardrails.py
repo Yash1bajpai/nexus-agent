@@ -17,6 +17,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from .refusals import RefusalText, refusal
 
 MAX_TEST_RETRIES = 2
 
@@ -56,7 +57,7 @@ _NEGATION_OR_PROPOSAL = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_PATH_ARG_TOOLS = ("read_file", "patch_file", "write_file")
+_PATH_ARG_TOOLS = ("read_file", "patch_file", "write_file", "edit_function", "add_function")
 
 
 _FAILURE_CLASSES = (
@@ -222,7 +223,7 @@ def claims_file_verification(text: str) -> bool:
     return False
 
 
-_TOOL_ACTION = r"(?:run_code|search_web|read_file|run_tests|patch_file|write_file|list_directory|git_status|git_diff)"
+_TOOL_ACTION = r"(?:run_code|search_web|read_file|run_tests|patch_file|write_file|edit_function|add_function|list_directory|git_status|git_diff)"
 _ACTION_PROMISE = re.compile(
     r"\bi(?:'ll|\s+will|\s+am\s+going\s+to)\s+(?:now\s+)?"
     r"(?:verify|run(?!\s+through\b)|execute|search|check|read|patch|edit|test|"
@@ -632,7 +633,7 @@ class LoopGuard:
         elif name == "run_code" and not text.startswith("ERROR:"):
             self.ran_code_success = True
             self.edited_since_code = False
-        elif name in ("patch_file", "write_file") and not text.startswith(("ERROR:", "No changes:")):
+        elif name in ("patch_file", "write_file", "edit_function", "add_function") and not text.startswith(("ERROR:", "No changes:")):
             self.edited_since_tests = True
             self.edited_since_code = True
             raw_path = str(args.get("path", "")).strip()
@@ -651,8 +652,8 @@ class LoopGuard:
             self.git_outputs.append(text)
 
         if name in _PATH_ARG_TOOLS and text.startswith("ERROR: File not found"):
-            return text + self._missing_file_help(str(args.get("path", "")))
-        return text
+            text += self._missing_file_help(str(args.get("path", "")))
+        return refusal(result.refusal_class, text) if isinstance(result, RefusalText) else text
 
     def _missing_file_help(self, path: str) -> str:
         parent = str(Path(path).parent) if path else "."
