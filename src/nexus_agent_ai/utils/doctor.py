@@ -13,7 +13,7 @@ from .model_download import models_dir
 Check = Tuple[str, str, str]  # (status "ok" | "warn" | "fail" | "info", label, detail)
 
 
-def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Check]:
+def run_checks(context_size: int = 8192, probe_network: bool = True) -> List[Check]:
     checks: List[Check] = []
 
     v = sys.version_info
@@ -35,7 +35,7 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
     else:
         total_txt = f" of {total} GB" if total else ""
         status = "ok" if avail >= 3 else "warn"
-        checks.append((status, "RAM", f"{avail} GB free{total_txt}"))
+        checks.append((status, "RAM", f"{avail} GB free{total_txt} (larger context windows use more RAM)"))
 
     disk = model_select.free_disk_gb()
     if disk is None:
@@ -58,6 +58,24 @@ def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Che
         checks.append(("ok" if found else "info", "Inference engine", "installed" if found else "not installed yet (downloads ~50 MB on first local run)"))
     except Exception:
         checks.append(("info", "Inference engine", "status unknown"))
+    if sys.platform == "win32" or os.name == "nt":
+        windir = os.environ.get("SystemRoot", "C:\\Windows")
+        sys32 = Path(windir) / "System32"
+        has_vcruntime = (sys32 / "vcruntime140.dll").is_file()
+        has_msvcp = (sys32 / "msvcp140.dll").is_file()
+        if has_vcruntime and has_msvcp:
+            checks.append(("ok", "MSVC Runtime", "vcruntime140.dll and msvcp140.dll present"))
+        else:
+            missing = []
+            if not has_vcruntime:
+                missing.append("vcruntime140.dll")
+            if not has_msvcp:
+                missing.append("msvcp140.dll")
+            checks.append((
+                "warn",
+                "MSVC Runtime",
+                f"Missing {', '.join(missing)}. Install Microsoft Visual C++ Redistributable x64: https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            ))
 
     if probe_network:
         speed = model_select.probe_speed_mbps(choice["repo"], choice["filename"])

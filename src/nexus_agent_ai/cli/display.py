@@ -58,15 +58,24 @@ def print_tool_call(tool_name: str, args: Dict[str, Any]):
         )
         console.print(f"\n  [bold yellow][ACTION][/bold yellow] {tool_name}({args_str})")
 
+def _tool_status_label(result: str) -> str:
+    stripped = (result or "").strip()
+    if stripped.startswith("SANDBOX BLOCK"):
+        return "[bold yellow]Blocked[/bold yellow]"
+    if stripped.startswith("ERROR") or "ERROR:" in stripped or stripped.startswith("[ERROR]"):
+        return "[bold red]Failed[/bold red]"
+    return "[bold green]Done[/bold green]"
+
 def print_tool_result(result: str, duration: float, tool_name: str = ""):
     """Print tool execution completion and duration. Shows multi-line preview for run_code."""
+    label = _tool_status_label(result)
     if tool_name == "run_code":
         lines = result.strip().split("\n")
         preview_lines = lines[:15]
         preview = "\n".join(preview_lines)
         if len(lines) > 15:
             preview += f"\n  [dim]... ({len(lines) - 15} more lines)[/dim]"
-        console.print(f"  [bold green][OBSERVE][/bold green] Done ({duration:.1f}s)")
+        console.print(f"  [bold green][OBSERVE][/bold green] {label} ({duration:.1f}s)")
         console.print(f"  [dim]{preview}[/dim]")
     else:
         lines = result.strip().split("\n")
@@ -77,7 +86,7 @@ def print_tool_result(result: str, duration: float, tool_name: str = ""):
             preview = preview[:117] + "..."
         if len(lines) > 3:
             preview += f" ... (+{len(lines)-3} lines)"
-        console.print(f"  [bold green][OBSERVE][/bold green] Done ({duration:.1f}s) -> [dim]{preview}[/dim]")
+        console.print(f"  [bold green][OBSERVE][/bold green] {label} ({duration:.1f}s) -> [dim]{preview}[/dim]")
 
 
 def print_thinking(text: str):

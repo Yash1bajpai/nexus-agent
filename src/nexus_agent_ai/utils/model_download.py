@@ -9,11 +9,34 @@ import hashlib
 import os
 import sys
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Optional
+
+
+def is_cert_verify_error(err: BaseException) -> bool:
+    if isinstance(err, ssl.SSLCertVerificationError):
+        return True
+    reason = getattr(err, "reason", None)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    err_str = f"{type(err).__name__}: {err}"
+    if reason is not None:
+        err_str += f" ({reason})"
+    return "CERTIFICATE_VERIFY_FAILED" in err_str or "certificate verify failed" in err_str.lower()
+
+
+def get_ssl_context(cafile: Optional[str] = None) -> ssl.SSLContext:
+    if cafile:
+        return ssl.create_default_context(cafile=cafile)
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 HF_BASE = os.environ.get("NEXUS_AGENT_HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 CHUNK = 1024 * 256
@@ -102,8 +125,12 @@ class _KeepAuthOnlyOnSameHost(urllib.request.HTTPRedirectHandler):
         return new
 
 
-def _opener():
-    return urllib.request.build_opener(_KeepAuthOnlyOnSameHost)
+def _opener(context: Optional[ssl.SSLContext] = None):
+    ctx = context if context is not None else get_ssl_context()
+    return urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        _KeepAuthOnlyOnSameHost,
+    )
 
 
 def _auth_headers(url: str) -> dict:
@@ -127,7 +154,10 @@ def expected_digest(url: str, timeout: float = 15.0) -> "tuple[Optional[int], Op
     size or digest headers, download integrity remains best-effort.
     """
     try:
-        opener = urllib.request.build_opener(_NoRedirect)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=get_ssl_context()),
+            _NoRedirect,
+        )
         req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "nexus-agent-ai", **_auth_headers(url)})
         try:
             resp = opener.open(req, timeout=timeout)
@@ -204,13 +234,15 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
         final.unlink()
     final.parent.mkdir(parents=True, exist_ok=True)
     last_err: Optional[Exception] = None
+    ssl_ctx = get_ssl_context()
+    certifi_retried = False
     for attempt in range(1, retries + 1):
         have = part.stat().st_size if part.exists() else 0
         req = urllib.request.Request(url, headers={"User-Agent": "nexus-agent-ai", **_auth_headers(url)})
         if have:
             req.add_header("Range", f"bytes={have}-")
         try:
-            with _opener().open(req, timeout=timeout) as resp:
+            with _opener(context=ssl_ctx).open(req, timeout=timeout) as resp:
                 if have and getattr(resp, "status", 200) != 206:
                     have = 0  # server ignored Range; restart
                 total, body_size = _response_sizes(resp, have)
@@ -264,7 +296,21 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
             part.unlink(missing_ok=True)  # malformed ranges must restart, not append
             have = 0
             last_err = e
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+        except Exception as e:
+            if is_cert_verify_error(e):
+                if not certifi_retried:
+                    certifi_retried = True
+                    try:
+                        import certifi
+                        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                        continue
+                    except Exception:
+                        pass
+                part.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"SSL certificate verification failed downloading {url}. "
+                    "Install certifi ('pip install certifi') or set SSL_CERT_FILE to a valid CA bundle."
+                ) from e
             last_err = e
         if attempt < retries:
             print(f"Download interrupted ({last_err}); resuming from {have // 1_000_000} MB "

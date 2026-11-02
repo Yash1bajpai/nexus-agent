@@ -463,8 +463,8 @@ def _step_system_specs():
     else:
         print(f"  RAM:       {ram_display}")
         print(f"  CPU Cores: {cores or 'Unknown'}")
-        _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.[/dim]" if console else
-               "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models.")
+        _print("  [dim]Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models (larger context windows use more RAM).[/dim]" if console else
+               "  Note: These are conservative estimates. Closing browsers/IDEs frees RAM for larger models (larger context windows use more RAM).")
     _print("  [dim]Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. A native llama-server is required on ARM.[/dim]" if console else
            "  Local provider uses LiquidAI/LFM2.5-2.6B-GGUF. A native llama-server is required on ARM.")
 

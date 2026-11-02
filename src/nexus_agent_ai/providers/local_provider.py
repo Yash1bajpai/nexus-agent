@@ -299,16 +299,43 @@ class LocalProvider(BaseProvider):
         if not zip_path.is_file():
             print(f"⬇️  Downloading llama-server (~50 MB) for CPU inference...")
             import urllib.request
+            import ssl
+            tmp_zip = zip_path.with_name(zip_path.name + ".part")
             try:
-                # Download to a temp name and rename only when complete, so an interrupted
-                # download can never be mistaken for the finished file on the next run.
-                tmp_zip = zip_path.with_name(zip_path.name + ".part")
-                urllib.request.urlretrieve(bin_url, str(tmp_zip))
+                from ..utils.model_download import is_cert_verify_error, get_ssl_context
+
+                def _fetch_file(context):
+                    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+                    with opener.open(bin_url, timeout=60.0) as resp, open(tmp_zip, "wb") as f:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+
+                ctx = get_ssl_context()
+                try:
+                    _fetch_file(ctx)
+                except Exception as first_err:
+                    if is_cert_verify_error(first_err):
+                        import certifi
+                        cert_ctx = ssl.create_default_context(cafile=certifi.where())
+                        _fetch_file(cert_ctx)
+                    else:
+                        raise
                 os.replace(tmp_zip, zip_path)
             except Exception as dl_err:
                 # Clean up partial download
                 zip_path.unlink(missing_ok=True)
                 zip_path.with_name(zip_path.name + ".part").unlink(missing_ok=True)
+                from ..utils.model_download import is_cert_verify_error
+                if is_cert_verify_error(dl_err):
+                    raise RuntimeError(
+                        f"Failed to download llama-server from:\n  {bin_url}\n"
+                        f"Error: {dl_err}\n\n"
+                        "SSL certificate verification failed. "
+                        "Install certifi ('pip install certifi') or set SSL_CERT_FILE to a valid CA bundle."
+                    ) from dl_err
                 raise RuntimeError(
                     f"Failed to download llama-server from:\n  {bin_url}\n"
                     f"Error: {dl_err}\n\n"
@@ -424,9 +451,22 @@ class LocalProvider(BaseProvider):
                             log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-800:]
                     except Exception:
                         pass
+                    exit_code = self._server_proc.returncode
+                    msvc_hint = ""
+                    is_missing_dll = exit_code in (3221225781, -1073741515, 0xC0000135)
+                    if not is_missing_dll and sys.platform == "win32":
+                        sys32 = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32"
+                        if not (sys32 / "vcruntime140.dll").is_file() and not (sys32 / "msvcp140.dll").is_file():
+                            is_missing_dll = True
+                    if is_missing_dll:
+                        msvc_hint = (
+                            "\n\nMissing MSVC runtime library (0xC0000135).\n"
+                            "Install Microsoft Visual C++ Redistributable x64: "
+                            "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+                        )
                     raise RuntimeError(
-                        f"llama-server exited immediately (exit code {self._server_proc.returncode}).\n"
-                        f"Server log:\n{log_tail.strip()}"
+                        f"llama-server exited immediately (exit code {exit_code}).\n"
+                        f"Server log:\n{log_tail.strip()}{msvc_hint}"
                     )
             raise RuntimeError(
                 f"llama-server did not become ready within {timeout_s} seconds.\n"

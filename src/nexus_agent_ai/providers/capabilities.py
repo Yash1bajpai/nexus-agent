@@ -53,7 +53,7 @@ _MODEL_LIMITS: dict[tuple[str, str], ModelLimits] = {
 }
 
 _CLOUD_FALLBACK = ModelLimits(32_768, 16_384)
-_LOCAL_DEFAULTS = ModelLimits(4_096, 2_048)
+_LOCAL_DEFAULTS = ModelLimits(8_192, 2_048)
 
 
 def model_capabilities(provider_name: str, model: str) -> ModelLimits | None:

@@ -67,6 +67,19 @@ def test_run_code_success():
     assert "STDOUT:" in res
     assert "42" in res
 
+
+def test_run_code_fstring_allowed_and_escapes_blocked():
+    res = execute_tool("run_code", {"code": 'print(f"{2+2}")'})
+    assert "STDOUT:" in res
+    assert "4" in res
+
+    for bad in [
+        'print(f"{__import__(\'os\')}")',
+        'print(f"{open(\'foo\')}")',
+        'print(f"{eval(\'1+1\')}")',
+    ]:
+        res_bad = execute_tool("run_code", {"code": bad})
+        assert "SANDBOX BLOCK" in res_bad
 def test_git_status_tool(tmp_path):
     import subprocess
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)

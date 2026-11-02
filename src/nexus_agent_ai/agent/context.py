@@ -223,7 +223,7 @@ def compact_messages(messages: List[Dict[str, Any]], keep_turns: int = 2) -> Tup
     return [note, ack] + recent, {"removed_messages": len(old), "turns_summarized": len(asks)}
 
 
-def meter(used_tokens: int, window: Optional[int]) -> str:
+def meter(used_tokens: int, window: Optional[int], breakdown: Optional[Dict[str, int]] = None) -> str:
     if not window:
         return f"context: ~{used_tokens} tokens"
     pct = min(999, int(used_tokens * 100 / window))
@@ -234,4 +234,10 @@ def meter(used_tokens: int, window: Optional[int]) -> str:
         hint = "  - nearly full, run /compact"
     elif pct >= 70:
         hint = "  - getting full"
-    return f"context: [{'#' * filled}{'.' * (bar_len - filled)}] {pct}% (~{used_tokens}/{window} tokens){hint}"
+    result = f"context: [{'#' * filled}{'.' * (bar_len - filled)}] {pct}% (~{used_tokens}/{window} tokens){hint}"
+    if breakdown:
+        overhead = breakdown.get("overhead", breakdown.get("system", 0) + breakdown.get("tools", 0))
+        history = breakdown.get("history", 0)
+        reserve = breakdown.get("reserve", 0)
+        result += f"\n  breakdown: overhead ~{overhead} (system+tools), history ~{history}, reserve ~{reserve}, window {window}"
+    return result

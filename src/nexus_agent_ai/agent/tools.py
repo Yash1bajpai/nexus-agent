@@ -34,7 +34,11 @@ def _validate_workspace_path(path: str | Path) -> Path | str:
     # on the home root itself or root dotfiles/configuration (e.g. ~/.bashrc, ~/.gitconfig).
     if home and cwd == home:
         if p == home:
-            return f"ERROR: Security Sandbox Access Denied: Direct targeting of the root home directory is forbidden."
+            return (
+                "ERROR: Security Sandbox Access Denied: Direct targeting of the root home directory is forbidden. "
+                "Nexus is running in the home folder, the home root is protected, "
+                "create a project folder (mkdir my-project, cd my-project) and relaunch."
+            )
         if p.parent == home and p.name.startswith("."):
             return f"ERROR: Security Sandbox Access Denied: Root configuration file '{p.name}' in home directory is protected."
 
@@ -549,7 +553,7 @@ def _sandbox_check(code: str) -> str | None:
         ast.Compare, ast.If, ast.For, ast.While, ast.Break, ast.Continue, ast.Pass,
         ast.Return, ast.FunctionDef, ast.arguments, ast.arg, ast.Call, ast.keyword,
         ast.IfExp, ast.Subscript, ast.Slice, ast.Index, ast.Assert, ast.Lambda,
-        ast.Attribute,
+        ast.Attribute, ast.JoinedStr, ast.FormattedValue,
         ast.operator, ast.unaryop, ast.boolop, ast.cmpop,
     )
     blocked_names = {"__import__", "eval", "exec", "compile", "open", "getattr", "setattr",
@@ -1058,8 +1062,9 @@ GIT_COMMIT_TOOL = Tool(
 def execute_run_file(path: str) -> str:
     """Reject unrestricted script execution."""
     return (
-        "ERROR: Running existing files is disabled because it would execute arbitrary code "
-        "with the user's permissions. Use run_code for pure computation instead."
+        f"ERROR: Executing existing files ('{path}') is disabled for safety. "
+        "Explain this limit plainly to the user instead of deflecting or confirming execution; "
+        "offer run_code for pure computation or run_tests for project tests."
     )
 
 RUN_FILE_TOOL = Tool(

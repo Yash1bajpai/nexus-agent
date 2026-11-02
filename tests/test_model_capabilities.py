@@ -151,8 +151,8 @@ def test_integer_strings_and_small_cloud_limits():
 
 def test_local_defaults_and_unverified_maxima():
     assert model_capabilities("local", "LiquidAI/LFM2.5-2.6B-GGUF") is None
-    assert resolve_limits("local", "LiquidAI/LFM2.5-2.6B-GGUF", local=True) == ModelLimits(4096, 2048)
-    assert resolve_limits("local", "custom.gguf") == ModelLimits(4096, 2048)
+    assert resolve_limits("local", "LiquidAI/LFM2.5-2.6B-GGUF", local=True) == ModelLimits(8192, 2048)
+    assert resolve_limits("local", "custom.gguf") == ModelLimits(8192, 2048)
     # A local model bearing a cloud ID still has user-controlled limits.
     assert resolve_limits("openai", "gpt-4o-mini", 256_000, 32_768, local=True) == ModelLimits(256_000, 32_768)
     assert resolve_limits("local", "custom.gguf", 512, 1, local=True) == ModelLimits(512, 1)

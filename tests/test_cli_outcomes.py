@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -232,3 +233,57 @@ def test_accepting_smaller_download_does_not_load_oversized_cached_model(monkeyp
     selected = cli._fit_local_model(LocalProvider(), None, {})
     assert selected.filename == model_select.SMALL_MODEL["filename"]
     assert model_select.required_ram_gb(model_select.SMALL_MODEL) <= 2.6
+
+
+def test_home_root_guard_contains_recovery_guidance(monkeypatch):
+    from nexus_agent_ai.agent.tools import _validate_workspace_path
+    home = Path.home().resolve()
+    monkeypatch.chdir(home)
+    err = _validate_workspace_path(home)
+    assert isinstance(err, str)
+    assert "create a project folder (mkdir my-project, cd my-project) and relaunch" in err
+
+
+def test_chat_startup_home_notice_only_in_global_mode(tmp_path, monkeypatch):
+    home = Path.home().resolve()
+    monkeypatch.setattr(cli, "get_provider_instance", lambda *a, **k: (ScriptedProvider(text="Answer"), "stub"))
+    runner = CliRunner()
+
+    # Global mode: cwd == home
+    monkeypatch.chdir(home)
+    res_global = runner.invoke(cli.app, ["chat", "hello", "--no-stream"])
+    out_global = " ".join(res_global.output.split())
+    assert "create a project folder (mkdir my-project, cd my-project) and relaunch" in out_global
+
+    # Project mode: cwd has .git
+    proj = tmp_path / "project"
+    proj.mkdir()
+    (proj / ".git").mkdir()
+    monkeypatch.chdir(proj)
+    res_proj = runner.invoke(cli.app, ["chat", "hello", "--no-stream"])
+    out_proj = " ".join(res_proj.output.split())
+    assert "create a project folder (mkdir my-project, cd my-project) and relaunch" not in out_proj
+
+
+def test_banner_resume_instruction_and_root_continue_passthrough(monkeypatch):
+    home = Path.home().resolve()
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(cli, "get_provider_instance", lambda *a, **k: (ScriptedProvider(text="Answer"), "stub"))
+    runner = CliRunner()
+
+    # Check banner text in repl (sent /exit)
+    res_repl = runner.invoke(cli.app, ["repl"], input="/exit\n")
+    out_repl = " ".join(res_repl.output.split())
+    assert "Resume later with: nexus-agent-ai chat --continue" in out_repl
+
+    # Check root command --continue / -c routes to chat --continue
+    invoked = []
+    monkeypatch.setattr(cli, "chat", lambda *a, **k: invoked.append(k))
+    r_long = runner.invoke(cli.app, ["--continue"])
+    assert r_long.exit_code == 0
+    assert invoked and invoked[-1].get("continue_last") is True
+
+    invoked.clear()
+    r_short = runner.invoke(cli.app, ["-c"])
+    assert r_short.exit_code == 0
+    assert invoked and invoked[-1].get("continue_last") is True

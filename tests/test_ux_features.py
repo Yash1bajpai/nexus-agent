@@ -105,6 +105,33 @@ def test_display_print_info():
     # Should execute without error
     print_info("Testing info output")
 
+def test_tool_result_status_label_branches(monkeypatch):
+    from nexus_agent_ai.cli.display import _tool_status_label, print_tool_result
+
+    assert "Blocked" in _tool_status_label("SANDBOX BLOCK: forbidden import")
+    assert "yellow" in _tool_status_label("SANDBOX BLOCK: forbidden import")
+
+    assert "Failed" in _tool_status_label("ERROR: File not found")
+    assert "red" in _tool_status_label("ERROR: File not found")
+    assert "Failed" in _tool_status_label("[ERROR] target not found")
+
+    assert "Done" in _tool_status_label("Successfully wrote 10 bytes")
+    assert "green" in _tool_status_label("Successfully wrote 10 bytes")
+
+    printed = []
+    monkeypatch.setattr(display.console, "print", printed.append)
+
+    print_tool_result("SANDBOX BLOCK: call blocked", 0.1, "run_code")
+    assert any("Blocked" in str(p) for p in printed)
+
+    printed.clear()
+    print_tool_result("ERROR: File not found", 0.2, "read_file")
+    assert any("Failed" in str(p) for p in printed)
+
+    printed.clear()
+    print_tool_result("Success output", 0.3, "write_file")
+    assert any("Done" in str(p) for p in printed)
+
 def test_repl_slash_commands_loop(monkeypatch):
     from typer.testing import CliRunner
     from nexus_agent_ai.cli.app import app as cli_app

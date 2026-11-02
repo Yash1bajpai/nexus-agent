@@ -39,8 +39,10 @@ RULES_PROMPT = """RULES:
 11. Be direct. Skip unnecessary preamble.
 12. STOP using tools once you have enough information to answer. Give your final
     answer as plain text. Do NOT keep calling the same tool repeatedly.
-13. Use run_code for arithmetic. Answer conceptual questions directly when no tools are needed.
-14. If a duplicate tool call warning appears, immediately synthesize your final
+13. When tools are offered and the request involves arithmetic or calculation, call run_code instead of computing mentally. Never answer calculations inline when tools are available.
+14. Executing existing files or scripts is disabled for safety. When asked to run a file, state this limit plainly rather than deflecting or confirming an edit; offer run_code for pure computation or run_tests for project tests.
+15. The user is the person typing; never claim the user's name, identity, or personal facts as your own.
+16. If a duplicate tool call warning appears, immediately synthesize your final
     answer from the results you already have. Do NOT call any more tools.
 
 THINKING PROTOCOL (MANDATORY):
@@ -79,8 +81,10 @@ _TOOL_PATTERNS = [
     r'\b(review|audit|analyze|check|inspect|scan)\b.*\b(code|file|project|repo)',
     # File path references
     r'[\w./\\]+\.\w{1,5}\b',  # anything that looks like a file path
+    # Path and location questions
+    r'\b(?:path\s+of|(?:full|absolute|relative|exact|real)\s+path)\b',
+    r'\bwhere\s+(?:is|was|are|were|did\s+you)\b.*\b(?:save|saved|creat|writ|put|stor|generat|file|it|this|that)\b',
 ]
-
 def _is_local_provider(provider: BaseProvider) -> bool:
     """Check if the provider is a local model (needs smart tool routing)."""
     model = getattr(provider, 'model', '') or ''
@@ -306,14 +310,20 @@ class Agent:
         has_pyproject = os.path.exists(os.path.join(cwd, "pyproject.toml"))
         has_package_json = os.path.exists(os.path.join(cwd, "package.json"))
 
+        resolved_cwd = str(Path(cwd).resolve())
         if has_git or has_pyproject or has_package_json:
             project_name = os.path.basename(cwd) or "Unknown Project"
             self.mode_str = f"Project Mode ({project_name})"
-            mode_prompt = f"You are Nexus-Agent, currently working inside the project directory: {project_name}."
+            mode_prompt = (
+                f"You are Nexus-Agent, currently working inside the project directory: {project_name}.\n"
+                f"Working directory: {resolved_cwd}"
+            )
         else:
             self.mode_str = "Global Mode"
-            mode_prompt = "You are Nexus-Agent, an expert coding agent running in a CLI terminal in Global Mode."
-
+            mode_prompt = (
+                f"You are Nexus-Agent, an expert coding agent running in a CLI terminal in Global Mode.\n"
+                f"Working directory: {resolved_cwd}"
+            )
         self.system = f"{mode_prompt}\nYou help developers write, debug, review, and understand code.\n\n{RULES_PROMPT}"
 
     @property
@@ -394,6 +404,24 @@ class Agent:
         self._sync_context_window()
         return (context.history_tokens(self.memory.get()) + context.estimate_tokens(self.system)
                 + context.tools_tokens(self.tools) + self.output_reserve)
+    def context_breakdown(self) -> Dict[str, int]:
+        """Return token breakdown: system+tools overhead, history, output reserve, window."""
+        self._sync_context_window()
+        sys_tok = context.estimate_tokens(self.system)
+        tool_tok = context.tools_tokens(self.tools)
+        overhead = sys_tok + tool_tok
+        hist_tok = context.history_tokens(self.memory.get())
+        reserve = self.output_reserve
+        total = overhead + hist_tok + reserve
+        return {
+            "overhead": overhead,
+            "system": sys_tok,
+            "tools": tool_tok,
+            "history": hist_tok,
+            "reserve": reserve,
+            "total": total,
+            "window": self.context_window or 0,
+        }
 
     def compact(self, keep_turns: int = 2):
         """Shrink stored history; returns (before_tokens, after_tokens, info)."""

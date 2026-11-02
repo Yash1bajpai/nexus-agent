@@ -218,6 +218,16 @@ def get_provider_instance(provider_name: Any, context_size: Optional[int] = None
         return _make_local_provider(**kwargs)
 
 
+def _print_home_root_notice_if_global(agent: Agent) -> None:
+    try:
+        if getattr(agent, "mode_str", "") == "Global Mode" and Path.cwd().resolve() == Path.home().resolve():
+            display.print_info(
+                "Nexus is running in the home folder, the home root is protected, "
+                "create a project folder (mkdir my-project, cd my-project) and relaunch."
+            )
+    except Exception:
+        pass
+
 @app.command()
 def chat(
     query: Optional[str] = typer.Argument(None, help="The coding question or instruction. Leave it out to open the interactive REPL."),
@@ -270,6 +280,7 @@ def chat(
 
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
+        _print_home_root_notice_if_global(agent)
 
         start_time = time.time()
         response_text = agent.run(query, stream=not no_stream)
@@ -395,7 +406,7 @@ def repl(
                 if earlier:
                     display.print_info(f"Resumed session '{memory.session_id}' ({earlier} messages). /clear starts fresh; --no-persist skips saving.")
                 else:
-                    display.print_info(f"New session '{memory.session_id}', saved to ~/.nexus-agent/history.db. Resume later with --continue.")
+                    display.print_info(f"New session '{memory.session_id}', saved to ~/.nexus-agent/history.db. Resume later with: nexus-agent-ai chat --continue.")
             except Exception as e:
                 display.print_warn(f"SQLite persistence unavailable ({e}), falling back to in-memory.")
                 memory = ConversationMemory()
@@ -405,6 +416,7 @@ def repl(
 
         model_display = getattr(prov, "model", getattr(prov, "model_id", "liquid-lfm"))
         display.print_header(resolved_name, model_display, mode=getattr(agent, "mode_str", ""))
+        _print_home_root_notice_if_global(agent)
         typer.echo("Type /help for available commands, or /exit to quit.\n")
 
         session = None
@@ -452,14 +464,17 @@ def repl(
                     if window is None:
                         display.print_info("This provider does not expose a context budget.")
                     else:
+                        bk = agent.context_breakdown()
                         display.print_info(
                             f"Configured context budget: {window} tokens; configured output ceiling: {agent.output_reserve} tokens. "
-                            "Restart with --context-size / --max-output-tokens to change the budgets. Larger local windows use more RAM. "
+                            "Restart with --context-size / --max-output-tokens to change the budgets. Larger local windows use more RAM.\n"
+                            f"Breakdown: system+tools overhead ~{bk['overhead']} tokens, "
+                            f"history ~{bk['history']} tokens, output reserve ~{bk['reserve']} tokens, total ~{bk['total']}/{window} tokens.\n"
                             "Old turns are dropped and big items cut automatically when a request would not fit; "
                             "/compact shrinks stored history, /clear clears it (including a persistent session)."
                         )
                         from ..agent import context as _ctx
-                        display.print_info(_ctx.meter(agent.context_used(), window))
+                        display.print_info(_ctx.meter(agent.context_used(), window, breakdown=bk))
                     continue
                 elif lower_input == "/compact":
                     before, after, info = agent.compact()
@@ -1024,7 +1039,8 @@ def trust_revoke(path: str = typer.Argument(".", help="Folder to remove."),
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    version: bool = typer.Option(False, "--version", help="Show version information.")
+    version: bool = typer.Option(False, "--version", help="Show version information."),
+    continue_last: bool = typer.Option(False, "--continue", "-c", help="Resume the most recent session.")
 ):
     decline_token = _local_downloads_declined.set(False)
     ctx.call_on_close(lambda: _local_downloads_declined.reset(decline_token))
@@ -1051,8 +1067,10 @@ def main(
         raise typer.Exit(code=1) from error
 
     if ctx.invoked_subcommand is None:
-        ctx.invoke(repl)
-
+        if continue_last:
+            ctx.invoke(chat, continue_last=True)
+        else:
+            ctx.invoke(repl)
 
 if __name__ == "__main__":
     app()

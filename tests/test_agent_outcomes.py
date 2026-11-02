@@ -224,3 +224,33 @@ def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch):
     assert agent.output_reserve == provider.max_output_tokens == 2048
     assert len(primary.seen[1]) > len(local.seen[0])
     assert provider.before_request is None
+
+
+@pytest.mark.parametrize("query", [
+    "give me the full path of that file",
+    "where is the file you created",
+    "where did you save the script",
+    "where did you write that",
+    "what is the path of this file",
+    "what is the absolute path",
+])
+def test_path_location_queries_route_to_tools(query):
+    assert core._query_needs_tools(query)
+
+
+def test_system_prompt_contains_resolved_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    agent = Agent(Scripted([]), tools=[], verbose=False)
+    assert f"Working directory: {tmp_path.resolve()}" in agent.system
+
+
+def test_system_prompt_rules_run_file_arithmetic_speaker_identity():
+    agent = Agent(Scripted([]), tools=[], verbose=False)
+    system = agent.system
+    # Rule 14: run_file honest limit
+    assert "Executing existing files or scripts is disabled for safety" in system
+    assert "offer run_code for pure computation or run_tests for project tests" in system
+    # Rule 13: arithmetic run_code
+    assert "call run_code instead of computing mentally" in system
+    # Rule 15: speaker identity
+    assert "The user is the person typing; never claim the user's name" in system

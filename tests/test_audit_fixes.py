@@ -118,7 +118,8 @@ def test_execute_run_file_is_disabled():
     """Existing files must not execute with the user's full OS permissions."""
     res = execute_run_file("anything.py")
     assert "disabled" in res.lower()
-
+    assert "deflect" in res.lower()
+    assert "run_code" in res and "run_tests" in res
 
 def test_sandbox_blocks_dynamic_attribute_escape():
     """Dynamic getattr/subclass tricks must be rejected by the allowlist."""
