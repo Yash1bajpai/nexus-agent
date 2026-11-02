@@ -224,6 +224,8 @@ Default tools: `read_file`, `write_file`, `patch_file`, `list_directory`, `run_c
 
 Python writes and patches are syntax-checked before changing the file. This detects malformed Python, not logical mistakes.
 
+For `patch_file`, copy the literal old source character-for-character into `target`, not an instruction, symbol name, or paraphrase; put the new text in `replacement`. On a mismatch, copy the exact target JSON from the error.
+
 `patch_file` requires a unique target unless multiple replacements are explicitly requested. Writes and patches encode and validate content before modifying files, save a backup, and atomically replace the destination. Backup symlinks/hardlinks are refused; backup failures abort the edit. Unchanged content is a no-op, not evidence of an applied edit. Workspace path checks are not OS-level isolation or protection against concurrent filesystem changes.
 
 **Edit safety.** Existing files must have been read in the current process and remain unchanged on disk before writing or patching. Matching tolerates CRLF and trailing-whitespace differences and provides nearby text on a miss. Atomic replacements and backups preserve the original file's permission bits and Windows DACL, rather than inheriting broader parent-directory access. All one-shot agent commands check unresolved tool errors, iteration exhaustion, unapplied edit claims and unverified test claims. `generate` verifies that this run actually changed its requested output, reporting creation versus update accurately. `debug` explicitly requests an applied fix when needed; read-only review and informational questions such as "How do I add a function?" do not require an edit. The REPL reports the same failures without ending the session.

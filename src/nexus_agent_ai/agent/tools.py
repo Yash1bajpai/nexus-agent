@@ -1323,7 +1323,13 @@ PATCH_FILE_TOOL = Tool(
             },
             "target": {
                 "type": "string",
-                "description": "OLD text copied from the current file before the change. Never put the desired new text here. On a mismatch, copy the exact target JSON from the error.",
+                "description": (
+                    "MUST be literal source copied character-for-character from the current file, "
+                    "not a description, instruction, symbol name or paraphrase. "
+                    "Never put the desired new text here. "
+                    "On a mismatch, copy the exact target JSON from the error. "
+                    "Example: target='x = 1', replacement='x = 2'."
+                ),
             },
             "replacement": {
                 "type": "string",

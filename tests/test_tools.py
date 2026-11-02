@@ -105,6 +105,17 @@ def test_get_readonly_tools():
     assert "run_tests" not in names
     assert "git_commit" not in names
 
+def test_patch_file_schema_requires_literal_old_source():
+    from nexus_agent_ai.agent.tools import PATCH_FILE_TOOL
+
+    description = PATCH_FILE_TOOL.input_schema["properties"]["target"]["description"]
+    assert "MUST be literal source copied character-for-character from the current file" in description
+    assert "not a description, instruction, symbol name or paraphrase" in description
+    assert "Never put the desired new text here" in description
+    assert "On a mismatch, copy the exact target JSON from the error" in description
+    assert "Example: target='x = 1', replacement='x = 2'." in description
+
+
 def test_patch_file_success(tmp_path: Path):
     target = tmp_path / "mod.py"
     target.write_text("def hello():\n    print('old')\n", encoding="utf-8")
@@ -136,6 +147,29 @@ def test_patch_file_target_not_found(tmp_path: Path):
         "replacement": "y = 30"
     })
     assert "ERROR: Target content not found" in res
+
+def test_patch_file_semantic_target_rejected_with_literal_recovery(tmp_path: Path):
+    import json
+
+    target = tmp_path / "calc.py"
+    original = b"def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a - b\n"
+    target.write_bytes(original)
+    execute_tool("read_file", {"path": str(target)})
+
+    result = execute_tool("patch_file", {
+        "path": str(target),
+        "target": "fix multiply to return a * b",
+        "replacement": "return a * b",
+    })
+
+    assert result.startswith("ERROR: Target content not found")
+    assert "Nothing was changed" in result
+    assert "target must be OLD text already in the file" in result
+    recovery = json.loads(next(line for line in result.splitlines() if line.startswith("{")))
+    assert recovery == {"path": str(target), "target": original.decode("utf-8")}
+    assert target.read_bytes() == original
+    assert not target.with_name("calc.py.bak").exists()
+
 
 def test_patch_file_multiple_occurrences(tmp_path: Path):
     target = tmp_path / "multi.txt"
