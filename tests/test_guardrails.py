@@ -242,3 +242,24 @@ def test_test_claims_backed_by_run_tests_or_run_code():
     guard3.after_tool("run_tests", {}, "Pytest Results: PASSED\n1 passed")
     verdict, reviewed = guard3.review_final("I verified the changes and ran a test to confirm the fix.")
     assert not guard3.claim_unverified
+
+
+def test_assertions_passed_phrasing_counts_as_test_claim():
+    from nexus_agent_ai.agent.guardrails import claims_tests_pass
+
+    # Real confabulation observed in the Windows real-model matrix (e12): this
+    # phrasing previously evaded every alternative in _TEST_CLAIM.
+    assert claims_tests_pass(
+        "The test for calculator.py ran without errors. All assertions passed, "
+        "and the script completed successfully."
+    )
+    assert claims_tests_pass("All assertions passed.")
+    assert claims_tests_pass("The tests completed successfully.")
+
+
+def test_assertions_claim_negations_and_proposals_still_excluded():
+    from nexus_agent_ai.agent.guardrails import claims_tests_pass
+
+    assert not claims_tests_pass("I cannot say whether all assertions passed.")
+    assert not claims_tests_pass("Let me check if all assertions passed.")
+    assert not claims_tests_pass("The tests did not complete successfully.")

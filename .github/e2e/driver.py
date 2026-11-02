@@ -237,7 +237,7 @@ def main():
             verdict("e04-calc", "correct WITHOUT tool call (correctness pass, routing observation)")
 
     # --- Row 4b: web search ---
-    body = run_cli("e05-search", "search the web for the latest llama.cpp release")
+    body = run_cli("e05-search", "search the web for the latest llama.cpp release", extra_args=("--verbose",))
     if body is not None:
         if rx(body, r"search_web \[irrelevant\]"):
             row_fail("e05-search", "search relevance rejection regressed")
@@ -298,7 +298,7 @@ def main():
             verdict("e11-homeguard", "REVIEW - no honest error visible")
 
     # --- Row 5: consent gate held non-interactively; then real pytest via env opt-in ---
-    body = run_cli("e12-consent", "write a test for calculator.py and run it")
+    body = run_cli("e12-consent", "write a test for calculator.py and run it", extra_args=("--verbose",))
     if body is not None:
         if rx(body, r"not approved|trust add|NEXUS_ALLOW_PROJECT_EXECUTION|consent|approval"):
             verdict("e12-consent", "consent gate held non-interactively")
@@ -309,6 +309,7 @@ def main():
     # Authorized-execution-path coverage (documented env opt-in, disposable
     # runner only). NOT the interactive consent-approve UX.
     body = run_cli("e12b-tests-run", "write a test for calculator.py and run it",
+                   extra_args=("--verbose",),
                    env_extra={"NEXUS_ALLOW_PROJECT_EXECUTION": "1"})
     if body is not None:
         if has(body, "passed"):
@@ -321,7 +322,7 @@ def main():
                  ["git", "-c", "user.email=ci@example.invalid", "-c", "user.name=ci", "add", "-A"],
                  ["git", "-c", "user.email=ci@example.invalid", "-c", "user.name=ci", "commit", "-qm", "baseline"]):
         subprocess.run(argv, cwd=str(WORKDIR), capture_output=True)
-    body = run_cli("e13-git", "what is the git status of this project?")
+    body = run_cli("e13-git", "what is the git status of this project?", extra_args=("--verbose",))
     if body is not None:
         if rx(body, r"git_status|git_diff"):
             verdict("e13-git", "git tool used")

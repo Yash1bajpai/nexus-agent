@@ -25,6 +25,8 @@ _TEST_CLAIM = re.compile(
     r"(?:tests?|test\s+suite|pytest)\s+(?:(?:all|now|both)\s+)?(?:(?:has|have)\s+)?(?:pass(?:es|ed|ing)?|succeed(?:s|ed)?|"
     r"(?:is|are)\s+(?:green|passing)|(?:is|are)\s+now\s+passing)\b|"
     r"\ball\s+(?:tests?\s+)?(?:pass(?:es|ed)?|green)\b|"
+    r"\ball\s+assertions?\s+pass(?:es|ed)?\b|"
+    r"\b(?:the\s+)?tests?\s+completed\s+successfully\b|"
     r"(?:everything|all)\s+passes\b|"
     r"tested\s+(?:the\s+)?(?:changes?|fix|code|file|implementation)\b|"
     r"tested\s+and\s+(?:confirmed|verified)\b|"
