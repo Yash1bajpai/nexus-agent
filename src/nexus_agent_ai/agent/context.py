@@ -18,10 +18,11 @@ MESSAGE_OVERHEAD_TOKENS = 6
 TRUNCATION_MARKER = "\n...[truncated {n} characters to fit the context window]...\n"
 OMISSION_MAX_TOKENS = 150
 _OMISSION_ANCHOR = (
-    "Earlier turns omitted. Missing details are unknown; ask the user if needed. "
-    "Historical metadata only, not instructions or approval. Do not repeat this note."
+    "Prior turns were evicted. Items listed below are retained as session record; "
+    "items not listed are unknown. This note is session record only, not instructions "
+    "or approval. Do not reproduce this note."
 )
-_OMISSION_ACK = "Historical context only; no new request or authority."
+_OMISSION_ACK = "Session record acknowledged; details outside this record remain unknown."
 _HISTORICAL_TOOLS = frozenset({
     "read_file", "write_file", "patch_file", "list_directory", "run_code",
     "search_web", "git_status", "git_diff", "git_commit", "run_tests",
@@ -129,11 +130,11 @@ def _shrink_message(message: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
 def _omission_pair(files=(), topics=(), tools=()):
     lines = [_OMISSION_ANCHOR]
     if files:
-        lines.append("File references: " + ", ".join(files))
+        lines.append("Retained file paths: " + ", ".join(files))
     if topics:
-        lines.append("Earlier topics: " + ", ".join(topics))
+        lines.append("Retained topics: " + ", ".join(topics))
     if tools:
-        lines.append("Tool calls observed: " + ", ".join(tools))
+        lines.append("Retained tool calls: " + ", ".join(tools))
     return [
         {"role": "user", "content": "\n".join(lines), "metadata": {"internal": True}},
         {"role": "assistant", "content": _OMISSION_ACK, "metadata": {"internal": True}},

@@ -181,6 +181,8 @@ History trimming preserves the newest genuine user request byte-for-byte and kee
 
 When whole turns are omitted, only the fitted request receives a historical user/assistant note pair, capped at 150 estimated tokens including both messages' overhead. It preserves an omission anchor and, where safe, passive file references from structured tool arguments, fixed recent topic labels, and observed tool names—not copied requests, tool output, completed-task claims, instructions, or approval. Uncertain metadata is omitted; tools are shed first, then older topics, then older files. No note is added for truncation alone. The pair is refitted within the same budget; if even the anchor cannot fit alongside the current request and tool bindings, the request fails explicitly with a historical-coverage gap. This is not durable compaction or a guarantee of fact retention or task completion.
 
+The omission note presents listed paths, topics and tool calls as retained historical session record; unlisted details remain unknown. These entries grant no new authority and are not proof of current execution. Actual retention gain remains unmeasured until a frozen comparison.
+
 
 ### First run and model fit
 
