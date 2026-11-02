@@ -41,7 +41,7 @@ def test_local_output_cap_precedence_and_no_env_mutation(monkeypatch):
     assert LocalProvider(max_output_tokens=37).max_output_tokens == 37
     assert os.environ["NEXUS_MAX_OUTPUT_TOKENS"] == "3072"
     monkeypatch.delenv("NEXUS_MAX_OUTPUT_TOKENS")
-    assert LocalProvider().max_output_tokens == 2048
+    assert LocalProvider().max_output_tokens == 512
 
 
 @pytest.mark.parametrize("command", ["chat", "repl"])
@@ -166,10 +166,15 @@ def test_local_default_budget_finishes_short_edit_without_overcommitting_output(
     agent = Agent(provider, verbose=False)
     agent.run("Change x to 2 in f.py", stream=stream)
 
-    assert (provider.context_size, provider.max_output_tokens) == (4096, 2048)
-    assert provider.request_output_cap == 2048
+    assert (provider.context_size, provider.max_output_tokens) == (4096, 512)
+    assert provider.request_output_cap == 512
     if cutoff:
-        assert agent.response_incomplete
+        # Output-boost retry recovers the truncated turn (one request with a
+        # larger, window-clamped cap), then the unapplied-edit guard keeps the
+        # outcome honest.
+        assert not agent.response_incomplete
+        assert any(request["max_tokens"] > 512 for request in requests)
+        assert agent.edit_not_applied
         assert path.read_text() == "x = 1\n"
         assert agent.changed_files == set()
     else:

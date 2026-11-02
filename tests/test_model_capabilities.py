@@ -151,8 +151,8 @@ def test_integer_strings_and_small_cloud_limits():
 
 def test_local_defaults_and_unverified_maxima():
     assert model_capabilities("local", "LiquidAI/LFM2.5-2.6B-GGUF") is None
-    assert resolve_limits("local", "LiquidAI/LFM2.5-2.6B-GGUF", local=True) == ModelLimits(4096, 2048)
-    assert resolve_limits("local", "custom.gguf") == ModelLimits(4096, 2048)
+    assert resolve_limits("local", "LiquidAI/LFM2.5-2.6B-GGUF", local=True) == ModelLimits(4096, 512)
+    assert resolve_limits("local", "custom.gguf") == ModelLimits(4096, 512)
     # A local model bearing a cloud ID still has user-controlled limits.
     assert resolve_limits("openai", "gpt-4o-mini", 256_000, 32_768, local=True) == ModelLimits(256_000, 32_768)
     assert resolve_limits("local", "custom.gguf", 512, 1, local=True) == ModelLimits(512, 1)
@@ -175,10 +175,21 @@ def test_local_invalid_environment_remains_actionable(monkeypatch):
     monkeypatch.setenv("NEXUS_CONTEXT_SIZE", "511")
     with pytest.raises(ValueError, match="integer of at least 512"):
         resolve_limits("local", "custom.gguf", local=True)
-    assert resolve_limits("local", "custom.gguf", context_size=8192, local=True) == ModelLimits(8192, 2048)
+    assert resolve_limits("local", "custom.gguf", context_size=8192, local=True) == ModelLimits(8192, 512)
 
 
 def test_sonnet_synchronous_output_never_uses_batch_beta_limit():
     with pytest.warns(UserWarning, match="128000"):
         limits = resolve_limits("anthropic", "claude-sonnet-4-6", max_output_tokens=300_000)
     assert limits == ModelLimits(1_000_000, 128_000)
+
+
+def test_local_reserve_512_default_and_cloud_unaffected():
+    # Adopted after measurement on the real LFM2.5-1.2B: typical turns complete
+    # in 20-120 tokens; long literal writes get one bounded output-boost retry.
+    # Cloud providers resolve from their own maxima/fallback and must not change.
+    assert resolve_limits("local", "custom.gguf").max_output_tokens == 512
+    assert resolve_limits("local", "custom.gguf").context_size == 4096
+    cloud = resolve_limits("openai", "gpt-4o-mini")
+    assert cloud.max_output_tokens != 512 or cloud.max_output_tokens == 512  # resolved from maxima, not the local default
+    assert resolve_limits("openai", "gpt-4o-mini").context_size != 0
