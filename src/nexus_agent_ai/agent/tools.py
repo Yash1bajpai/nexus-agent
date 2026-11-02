@@ -103,6 +103,53 @@ def _safe_git_run(args: List[str], *, execution: bool = False) -> subprocess.Com
 # based on content the model has actually seen.
 _FILE_STATE: Dict[str, tuple] = {}
 
+# Authority for content-removing overwrites comes ONLY from the user: either an
+# explicit deletion/rewrite instruction in their current message, or an approved
+# interactive consent prompt. The model can never grant this to itself.
+_USER_INTENT: str = ""
+_REMOVAL_APPROVED: set = set()
+_removal_ask = None  # test hook; defaults to input
+
+_DELETION_INTENT = re.compile(
+    r"\b(rewrite|re-write|recreate|re-create|overwrite|replace|start over|from scratch|"
+    r"redo|scrap|delete|remove|drop|empty|wipe|get rid of|throw away)\b", re.IGNORECASE)
+
+
+def set_user_intent(text: str) -> None:
+    """Record the current user instruction; the sole source of removal authority besides consent."""
+    global _USER_INTENT
+    _USER_INTENT = text or ""
+
+
+def user_requests_removal() -> bool:
+    return bool(_DELETION_INTENT.search(_USER_INTENT))
+
+
+def content_removal_approved(p: Path, what: str) -> bool:
+    """Ask the user before an overwrite that deletes existing content. Per-file, this session."""
+    if user_requests_removal():
+        return True
+    key = str(p)
+    if key in _REMOVAL_APPROVED:
+        return True
+    try:
+        from ..utils.interactive import stdin_is_interactive
+        if not stdin_is_interactive():
+            return False
+    except Exception:
+        return False
+    ask = _removal_ask or input
+    print(f"\nNexus wants to overwrite {p.name}, deleting existing content: {what}.\n"
+          "  [y] allow this once   [N] refuse")
+    try:
+        ans = ask("Allow? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    if ans in ("y", "yes"):
+        _REMOVAL_APPROVED.add(key)
+        return True
+    return False
+
 
 def _file_state(p: Path):
     try:
@@ -120,7 +167,10 @@ def _remember_file(p: Path) -> None:
 
 def reset_file_tracking() -> None:
     """Forget which files were read (used by tests and /clear)."""
+    global _USER_INTENT
     _FILE_STATE.clear()
+    _USER_INTENT = ""
+    _REMOVAL_APPROVED.clear()
 
 
 def _check_read_before_edit(p: Path, path: str) -> str | None:
@@ -254,20 +304,16 @@ def _dropped_python_symbols(old: str, new: str):
     return [n for n in top_level(old_tree) if n not in new_names]
 
 
-def _check_content_loss(name: str, old: str, new: str, allow_removal: bool) -> str | None:
-    """Block overwrites that silently drop existing content; the model can retry
-    with patch_file, the full preserved content, or an explicit override."""
-    if allow_removal or not old.strip():
+def _describe_content_loss(name: str, old: str, new: str) -> str | None:
+    """Describe what an overwrite would silently delete; None when nothing load-bearing is lost."""
+    if not old.strip():
         return None
-    guidance = ("Use patch_file for a targeted edit, or include ALL of the existing content you want to keep. "
-                "If replacing the whole file is intended, retry with allow_content_removal=True.")
     if not new.strip():
-        return f"ERROR: This overwrite would empty '{name}' (all existing content deleted). {guidance}"
+        return f"all existing content ({len(old.splitlines())} line(s))"
     if name.endswith(".py"):
         dropped = _dropped_python_symbols(old, new)
         if dropped:
-            return (f"ERROR: This overwrite would delete existing top-level definition(s) from '{name}': "
-                    f"{', '.join(dropped)}. {guidance}")
+            return "top-level definition(s): " + ", ".join(dropped)
         if dropped is not None:
             return None
     old_lines = [l for l in old.splitlines() if l.strip()]
@@ -276,12 +322,11 @@ def _check_content_loss(name: str, old: str, new: str, allow_removal: bool) -> s
     new_lines = {l.strip() for l in new.splitlines() if l.strip()}
     removed = [l for l in old_lines if l.strip() not in new_lines]
     if len(removed) > max(2, len(old_lines) // 2):
-        return (f"ERROR: This overwrite would delete {len(removed)} of {len(old_lines)} existing lines "
-                f"from '{name}'. {guidance}")
+        return f"{len(removed)} of {len(old_lines)} existing line(s)"
     return None
 
 
-def execute_write_file(path: str, content: str, allow_content_removal: bool = False) -> str:
+def execute_write_file(path: str, content: str) -> str:
     """Write string content to a file (creating parent directories if needed)."""
     try:
         validated = _validate_workspace_path(path)
@@ -303,9 +348,11 @@ def execute_write_file(path: str, content: str, allow_content_removal: bool = Fa
         if p.exists():
             with open(p, "r", encoding="utf-8", errors="replace") as f:
                 old_content = f.read()
-            loss = _check_content_loss(p.name, old_content, content, allow_content_removal)
-            if loss:
-                return loss
+            loss = _describe_content_loss(p.name, old_content, content)
+            if loss and not content_removal_approved(p, loss):
+                return (f"ERROR: This overwrite of '{path}' would delete {loss}. "
+                        "The user has not approved removing it. Ask the user to confirm the replacement, "
+                        "or use patch_file for a targeted edit that keeps the existing content.")
 
         existed = p.exists()
         if not _atomic_file_update(p, content):
@@ -1007,8 +1054,8 @@ READ_FILE_TOOL = Tool(
 WRITE_FILE_TOOL = Tool(
     name="write_file",
     description=("Write or overwrite contents of a file on disk. Use this when creating new code files. "
-                 "For existing files, prefer patch_file; an overwrite that deletes existing content is "
-                 "rejected unless allow_content_removal=True."),
+                 "For existing files, prefer patch_file; an overwrite that deletes existing content needs "
+                 "the user's explicit approval."),
     input_schema={
         "type": "object",
         "properties": {
@@ -1019,11 +1066,6 @@ WRITE_FILE_TOOL = Tool(
             "content": {
                 "type": "string",
                 "description": "The full text content to write into the file.",
-            },
-            "allow_content_removal": {
-                "type": "boolean",
-                "description": "Set true only when intentionally replacing or emptying the whole file, deleting existing content.",
-                "default": False,
             }
         },
         "required": ["path", "content"],

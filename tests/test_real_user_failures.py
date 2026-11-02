@@ -822,15 +822,18 @@ def test_bugfix_overwrite_cannot_silently_drop_unrelated_function(tmp_path, prom
     assert cli._check_run_outcome(agent, exit_on_failure=False)
 
 
-def test_write_file_rejects_emptying_existing_file_without_override(tmp_path):
+def test_write_file_rejects_emptying_existing_file_without_user_approval(tmp_path):
     path = tmp_path / "notes.txt"
     path.write_text("important notes\nsecond line\n")
-    from nexus_agent_ai.agent.tools import execute_write_file, execute_read_file
-    execute_read_file(str(path))
-    result = execute_write_file(str(path), "")
-    assert result.startswith("ERROR:") and "empty" in result
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    result = tools_module.execute_write_file(str(path), "")
+    assert result.startswith("ERROR:") and "not approved" in result
+    assert "allow_content_removal" not in result  # no self-authorize hint
     assert path.read_text() == "important notes\nsecond line\n"
-    result = execute_write_file(str(path), "", allow_content_removal=True)
+    # Explicit user instruction is removal authority.
+    tools_module.set_user_intent("empty notes.txt, I want it blank")
+    result = tools_module.execute_write_file(str(path), "")
     assert result.startswith("Successfully")
     assert path.read_text() == ""
 
@@ -849,12 +852,47 @@ def test_write_file_line_heuristic_blocks_mass_deletion_non_python(tmp_path):
     assert result.startswith("Successfully")
 
 
-def test_write_file_full_rewrite_allowed_with_explicit_override(tmp_path):
+def test_write_file_full_rewrite_needs_user_authority(tmp_path):
     path = tmp_path / "calc.py"
     path.write_text(CALC_WITH_ADD)
-    from nexus_agent_ai.agent.tools import execute_write_file, execute_read_file
-    execute_read_file(str(path))
-    result = execute_write_file(str(path), "def multiply(a, b):\n    return a * b\n", allow_content_removal=True)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    # No user deletion intent, no consent: refused, with no self-authorize escape.
+    result = tools_module.execute_write_file(str(path), "def multiply(a, b):\n    return a * b\n")
+    assert result.startswith("ERROR:") and "add" in result
+    assert "allow_content_removal" not in result
+    assert "def add(" in path.read_text()
+    # Explicit user instruction authorizes the same rewrite.
+    tools_module.set_user_intent("rewrite calc.py from scratch with just a multiply function")
+    result = tools_module.execute_write_file(str(path), "def multiply(a, b):\n    return a * b\n")
+    assert result.startswith("Successfully")
+    assert "multiply" in path.read_text()
+
+
+def test_model_cannot_self_authorize_removal_via_tool_arg(tmp_path):
+    # Negative: a provider retrying with a self-granted removal flag must still be refused.
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    provider = Transcript([
+        ("read_file", {"path": "calc.py"}),
+        ("write_file", {"path": "calc.py", "content": "def multiply(a, b):\n    return a * b\n"}),
+        ("write_file", {"path": "calc.py", "content": "def multiply(a, b):\n    return a * b\n",
+                        "allow_content_removal": True}),  # self-authorization attempt
+        "I could not replace the file without your approval.",
+    ])
+    agent = Agent(provider, max_iterations=4, verbose=False)
+    agent.run("fix the bug in calc.py where divide crashes when b is zero")
+    assert path.read_text() == CALC_WITH_ADD  # never overwritten
+
+
+def test_content_removal_consent_prompt_grants_when_user_approves(tmp_path, monkeypatch):
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    monkeypatch.setattr(tools_module, "_removal_ask", lambda prompt: "y")
+    monkeypatch.setattr("nexus_agent_ai.utils.interactive.stdin_is_interactive", lambda: True)
+    result = tools_module.execute_write_file(str(path), "def multiply(a, b):\n    return a * b\n")
     assert result.startswith("Successfully")
     assert "multiply" in path.read_text()
 

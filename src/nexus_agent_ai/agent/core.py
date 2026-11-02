@@ -475,6 +475,8 @@ class Agent:
 
     def run(self, user_input: str, stream: bool = False, require_edit: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
+        from . import tools as tools_module
+        tools_module.set_user_intent(user_input or "")
         routing_input = _routing_request(user_input, self.memory.get())
         requires_search = bool(_LIVE_SEARCH_REQUEST.search(routing_input))
         wants_edit = require_edit or (
