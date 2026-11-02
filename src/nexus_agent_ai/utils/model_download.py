@@ -30,13 +30,15 @@ def is_cert_verify_error(err: BaseException) -> bool:
 
 
 def get_ssl_context(cafile: Optional[str] = None) -> ssl.SSLContext:
+    """Default TLS context: the platform trust store ( honours SSL_CERT_FILE ).
+
+    certifi is used only as an explicit opt-in (cafile argument), so custom
+    institutional roots in the system store keep working; the download retry
+    path passes certifi.where() after a CERTIFICATE_VERIFY_FAILED.
+    """
     if cafile:
         return ssl.create_default_context(cafile=cafile)
-    try:
-        import certifi
-        return ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        return ssl.create_default_context()
+    return ssl.create_default_context()
 
 HF_BASE = os.environ.get("NEXUS_AGENT_HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 CHUNK = 1024 * 256
@@ -236,6 +238,29 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
     last_err: Optional[Exception] = None
     ssl_ctx = get_ssl_context()
     certifi_retried = False
+
+    def _cert_retry_or_raise(e: BaseException) -> bool:
+        """CERTIFICATE_VERIFY_FAILED: retry once with the certifi bundle, else raise.
+
+        Returns True when the caller should retry the attempt. SSLCertVerificationError
+        subclasses ValueError, so every except clause that can see it must route here.
+        """
+        nonlocal ssl_ctx, certifi_retried
+        if not is_cert_verify_error(e):
+            return False
+        if not certifi_retried:
+            certifi_retried = True
+            try:
+                import certifi
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                return True
+            except Exception:
+                pass
+        part.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"SSL certificate verification failed downloading {url}. "
+            "Install certifi ('pip install certifi') or set SSL_CERT_FILE to a valid CA bundle."
+        ) from e
     for attempt in range(1, retries + 1):
         have = part.stat().st_size if part.exists() else 0
         req = urllib.request.Request(url, headers={"User-Agent": "nexus-agent-ai", **_auth_headers(url)})
@@ -293,24 +318,15 @@ def download(repo: str, filename: str, retries: int = 8, timeout: float = 30.0,
                 last_err = e
             e.close()
         except ValueError as e:
+            # SSLCertVerificationError is a ValueError subclass: it lands here first.
+            if _cert_retry_or_raise(e):
+                continue
             part.unlink(missing_ok=True)  # malformed ranges must restart, not append
             have = 0
             last_err = e
         except Exception as e:
-            if is_cert_verify_error(e):
-                if not certifi_retried:
-                    certifi_retried = True
-                    try:
-                        import certifi
-                        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-                        continue
-                    except Exception:
-                        pass
-                part.unlink(missing_ok=True)
-                raise RuntimeError(
-                    f"SSL certificate verification failed downloading {url}. "
-                    "Install certifi ('pip install certifi') or set SSL_CERT_FILE to a valid CA bundle."
-                ) from e
+            if _cert_retry_or_raise(e):
+                continue
             last_err = e
         if attempt < retries:
             print(f"Download interrupted ({last_err}); resuming from {have // 1_000_000} MB "

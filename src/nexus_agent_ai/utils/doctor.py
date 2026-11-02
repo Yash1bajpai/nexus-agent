@@ -13,7 +13,7 @@ from .model_download import models_dir
 Check = Tuple[str, str, str]  # (status "ok" | "warn" | "fail" | "info", label, detail)
 
 
-def run_checks(context_size: int = 8192, probe_network: bool = True) -> List[Check]:
+def run_checks(context_size: int = 4096, probe_network: bool = True) -> List[Check]:
     checks: List[Check] = []
 
     v = sys.version_info

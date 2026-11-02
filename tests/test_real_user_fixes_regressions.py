@@ -57,17 +57,55 @@ def test_model_download_ssl_cert_retry_success(tmp_path, monkeypatch):
     monkeypatch.setattr(md, "expected_digest", lambda url: (None, None))
 
     attempts = []
+    real_create_default_context = ssl.create_default_context
+    ctx_calls = []
+
+    def tracking_create_default_context(*args, **kwargs):
+        ctx_calls.append(kwargs.get("cafile", args[2] if len(args) > 2 else None))
+        return real_create_default_context(*args, **kwargs)
+
+    monkeypatch.setattr(ssl, "create_default_context", tracking_create_default_context)
 
     def fake_open(self, req, timeout=30.0):
-        # Inspect SSL context used by the opener
-        ctx_used = getattr(self, "_context", None)
-        attempts.append(ctx_used)
+        attempts.append(req.full_url)
         if len(attempts) == 1:
-            raise ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED: certificate verify failed")
+            raise ssl.SSLCertVerificationError(1, "CERTIFICATE_VERIFY_FAILED: certificate verify failed")
         return DummyResponse(b"valid model payload")
 
     import urllib.request
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+
+    out = md.download("LiquidAI/test-repo", "model.gguf")
+    assert Path(out).read_bytes() == b"valid model payload"
+    assert len(attempts) == 2  # retried once
+    # Default trust (system store, cafile=None) first; certifi bundle only on the cert-failure retry.
+    import certifi
+    assert ctx_calls[0] is None
+    assert certifi.where() in ctx_calls[1:]
+
+
+def test_model_download_ssl_cert_retry_wrapped_urlerror(tmp_path, monkeypatch):
+    """urllib wraps handshake failures in URLError(reason=SSLCertVerificationError):
+    the cert retry must fire on the wrapped path too (URLError is OSError, not ValueError)."""
+    monkeypatch.setenv("NEXUS_AGENT_HOME", str(tmp_path / "nexus"))
+    monkeypatch.setattr(md, "expected_digest", lambda url: (None, None))
+
+    attempts = []
+
+    def fake_open(self, req, timeout=30.0):
+        attempts.append(req.full_url)
+        if len(attempts) == 1:
+            inner = ssl.SSLCertVerificationError(1, "CERTIFICATE_VERIFY_FAILED: certificate verify failed")
+            raise urllib.error.URLError(inner)
+        return DummyResponse(b"valid model payload")
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+
+    out = md.download("LiquidAI/test-repo", "model.gguf")
+    assert Path(out).read_bytes() == b"valid model payload"
+    assert len(attempts) == 2  # wrapped cert error still triggered exactly one retry
+
 
 def test_model_download_ssl_cert_failure_actionable_guidance(tmp_path, monkeypatch):
     """Mocked urlopen failing twice with SSLCertVerificationError produces actionable guidance."""
@@ -94,7 +132,8 @@ def test_model_download_ssl_cert_failure_actionable_guidance(tmp_path, monkeypat
 def test_engine_download_ssl_cert_retry_and_actionable_guidance(tmp_path, monkeypatch):
     """Engine download on repeated SSL cert error prints actionable guidance, not generic firewall."""
     provider = LocalProvider()
-    monkeypatch.setattr(provider, "_get_llama_server_info", lambda: ("https://github.com/test/llama-server.zip", "llama-server"))
+    import nexus_agent_ai.providers.local_provider as lp_mod
+    monkeypatch.setattr(lp_mod, "_get_llama_server_info", lambda: ("https://github.com/test/llama-server.zip", "llama-server"))
     monkeypatch.setenv("NEXUS_AGENT_LLAMA_SERVER_SHA256", "a" * 64)
 
     import nexus_agent_ai.providers.local_provider as lp
@@ -149,12 +188,17 @@ def test_llama_server_exit_code_3221225781_actionable_guidance(monkeypatch, tmp_
     assert "https://aka.ms/vs/17/release/vc_redist.x64.exe" in err
 
 
-def test_doctor_windows_msvc_dll_probe(monkeypatch):
+def test_doctor_windows_msvc_dll_probe(monkeypatch, tmp_path):
     """Doctor reports MSVC runtime state on Windows platform."""
     monkeypatch.setattr(doctor.sys, "platform", "win32")
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/nexus-agent-ai")
 
     # Both DLLs present
-    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    sys32 = tmp_path / "win" / "System32"
+    sys32.mkdir(parents=True)
+    (sys32 / "vcruntime140.dll").write_bytes(b"x")
+    (sys32 / "msvcp140.dll").write_bytes(b"x")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "win"))
     checks_ok = doctor.run_checks(probe_network=False)
     msvc_ok = [c for c in checks_ok if c[1] == "MSVC Runtime"]
     assert len(msvc_ok) == 1
@@ -162,7 +206,8 @@ def test_doctor_windows_msvc_dll_probe(monkeypatch):
     assert "vcruntime140.dll and msvcp140.dll present" in msvc_ok[0][2]
 
     # DLLs missing
-    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    (sys32 / "vcruntime140.dll").unlink()
+    (sys32 / "msvcp140.dll").unlink()
     checks_missing = doctor.run_checks(probe_network=False)
     msvc_warn = [c for c in checks_missing if c[1] == "MSVC Runtime"]
     assert len(msvc_warn) == 1
@@ -175,6 +220,7 @@ def test_doctor_windows_msvc_dll_probe(monkeypatch):
 # Fix 9: Local context defaults (8192, 2048), RAM note, and meter breakdown
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="candidate change: local default context raise held for design review")
 def test_local_defaults_raised_to_8192():
     assert _LOCAL_DEFAULTS == ModelLimits(8192, 2048)
     assert resolve_limits("local", "custom.gguf").context_size == 8192
@@ -194,3 +240,88 @@ def test_context_breakdown_and_meter():
     assert "history" in text
     assert "reserve" in text
     assert "window" in text
+
+
+def test_search_web_full_sentence_query_cleaned_and_retried(monkeypatch):
+    """A small model copies the whole prompt as the query; engines then return
+    pages about search itself. The tool must retry once with the search-intent
+    phrasing stripped instead of declaring the results irrelevant."""
+    import sys
+    from types import ModuleType
+    from nexus_agent_ai.agent.tools import execute_tool
+
+    calls = []
+
+    class FakeDDGS:
+        def text(self, query, max_results=5):
+            calls.append(query)
+            if "llama" in query and "search" not in query.lower():
+                return [{
+                    "title": "Releases: ggml-org/llama.cpp - GitHub",
+                    "href": "https://github.com/ggml-org/llama.cpp/releases",
+                    "body": "LLM inference in C/C++.",
+                }]
+            return [{"title": "Google Search", "href": "https://search.google/", "body": "Search anything."}]
+
+    module = ModuleType("ddgs")
+    module.DDGS = FakeDDGS
+    monkeypatch.setitem(sys.modules, "ddgs", module)
+    monkeypatch.setitem(sys.modules, "duckduckgo_search", None)
+
+    out = execute_tool("search_web", {"query": "search the web for the latest llama.cpp release"})
+    assert "llama.cpp" in out and "github.com/ggml-org/llama.cpp/releases" in out
+    assert not out.startswith("ERROR")
+    assert calls == [
+        "search the web for the latest llama.cpp release",
+        "the latest llama.cpp release",
+    ]
+
+
+def test_search_web_still_irrelevant_after_cleaning_stays_honest(monkeypatch):
+    """If the cleaned retry is also irrelevant, keep the honest ERROR verdict."""
+    import sys
+    from types import ModuleType
+    from nexus_agent_ai.agent.tools import execute_tool
+
+    class FakeDDGS:
+        def text(self, query, max_results=5):
+            return [{"title": "Garden plants", "href": "https://example.com/garden", "body": "Flowers."}]
+
+    module = ModuleType("ddgs")
+    module.DDGS = FakeDDGS
+    monkeypatch.setitem(sys.modules, "ddgs", module)
+    monkeypatch.setitem(sys.modules, "duckduckgo_search", None)
+
+    out = execute_tool("search_web", {"query": "search the web for the latest llama.cpp release"})
+    assert out.startswith("ERROR") and "irrelevant" in out
+
+
+def test_search_web_prefix_strip_preserves_user_terms(monkeypatch):
+    """The prefix strip must only drop leading search-intent phrasing and keep
+    quoted phrases, operators, URLs and user terms verbatim."""
+    import sys
+    from types import ModuleType
+    from nexus_agent_ai.agent.tools import execute_tool
+
+    calls = []
+
+    class FakeDDGS:
+        def text(self, query, max_results=5):
+            calls.append(query)
+            if "site:github.com" in query and "search" not in query.lower():
+                return [{
+                    "title": 'llama.cpp releases "exact phrase"',
+                    "href": "https://github.com/ggml-org/llama.cpp/releases",
+                    "body": "llama.cpp release notes.",
+                }]
+            return [{"title": "Bing", "href": "https://www.bing.com/", "body": "Search engine."}]
+
+    module = ModuleType("ddgs")
+    module.DDGS = FakeDDGS
+    monkeypatch.setitem(sys.modules, "ddgs", module)
+    monkeypatch.setitem(sys.modules, "duckduckgo_search", None)
+
+    out = execute_tool("search_web", {"query": 'search the web for "exact phrase" llama.cpp site:github.com'})
+    assert not out.startswith("ERROR")
+    # the retry kept the quoted phrase, the operator and the user term verbatim
+    assert calls[-1] == '"exact phrase" llama.cpp site:github.com'

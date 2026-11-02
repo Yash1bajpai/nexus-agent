@@ -27,15 +27,34 @@ def test_interrupted_engine_download_leaves_nothing_and_next_run_recovers(tmp_pa
     monkeypatch.setenv("NEXUS_AGENT_LLAMA_SERVER_SHA256", hashlib.sha256(data).hexdigest())
     calls = {"n": 0}
 
-    def fake_retrieve(url, filename):
-        calls["n"] += 1
-        with open(filename, "wb") as f:
-            if calls["n"] == 1:
-                f.write(data[: len(data) // 2])
-                raise KeyboardInterrupt  # hard stop (Ctrl+C / killed): no cleanup code runs for it
-            f.write(data)
+    class _FakeResp:
+        def __init__(self, payload, fail_after=None):
+            self._io = io.BytesIO(payload)
+            self._fail_after = fail_after
+            self._read = 0
 
-    monkeypatch.setattr(urllib.request, "urlretrieve", fake_retrieve)
+        def read(self, amt=-1):
+            if self._fail_after is not None:
+                if self._read >= self._fail_after:
+                    raise KeyboardInterrupt  # hard stop mid-stream: no cleanup code runs for it
+                amt = min(amt if amt and amt > 0 else self._fail_after, self._fail_after - self._read)
+            chunk = self._io.read(amt)
+            self._read += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_open(self, req, timeout=60.0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeResp(data, fail_after=len(data) // 2)
+        return _FakeResp(data)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
     prov = lp.LocalProvider()
     with pytest.raises(KeyboardInterrupt):
         prov._download_llama_server()

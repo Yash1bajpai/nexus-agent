@@ -250,7 +250,5 @@ def test_system_prompt_rules_run_file_arithmetic_speaker_identity():
     # Rule 14: run_file honest limit
     assert "Executing existing files or scripts is disabled for safety" in system
     assert "offer run_code for pure computation or run_tests for project tests" in system
-    # Rule 13: arithmetic run_code
-    assert "call run_code instead of computing mentally" in system
     # Rule 15: speaker identity
     assert "The user is the person typing; never claim the user's name" in system

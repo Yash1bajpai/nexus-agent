@@ -108,15 +108,10 @@ def test_display_print_info():
 def test_tool_result_status_label_branches(monkeypatch):
     from nexus_agent_ai.cli.display import _tool_status_label, print_tool_result
 
-    assert "Blocked" in _tool_status_label("SANDBOX BLOCK: forbidden import")
-    assert "yellow" in _tool_status_label("SANDBOX BLOCK: forbidden import")
-
-    assert "Failed" in _tool_status_label("ERROR: File not found")
-    assert "red" in _tool_status_label("ERROR: File not found")
-    assert "Failed" in _tool_status_label("[ERROR] target not found")
-
-    assert "Done" in _tool_status_label("Successfully wrote 10 bytes")
-    assert "green" in _tool_status_label("Successfully wrote 10 bytes")
+    assert _tool_status_label("SANDBOX BLOCK: forbidden import") == ("bold yellow", "Blocked")
+    assert _tool_status_label("ERROR: File not found") == ("bold red", "Failed")
+    assert _tool_status_label("[ERROR] target not found") == ("bold red", "Failed")
+    assert _tool_status_label("Successfully wrote 10 bytes") == ("bold green", "Done")
 
     printed = []
     monkeypatch.setattr(display.console, "print", printed.append)

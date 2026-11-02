@@ -145,9 +145,9 @@ def test_cloud_context_fits_full_input_plus_actual_output_cap(monkeypatch, kind,
 @pytest.mark.parametrize("base_url,local,context_size,max_output", [
     (None, False, 128000, 16384),
     ("https://api.openai.com/v1", False, 128000, 16384),
-    ("http://localhost:1234/v1", True, 8192, 2048),
-    ("http://127.0.0.2:8000/v1", True, 8192, 2048),
-    ("http://[::1]:8000/v1", True, 8192, 2048),
+    ("http://localhost:1234/v1", True, 4096, 2048),
+    ("http://127.0.0.2:8000/v1", True, 4096, 2048),
+    ("http://[::1]:8000/v1", True, 4096, 2048),
     ("https://compatible.example/v1", False, 128000, 16384),
 ])
 @pytest.mark.parametrize("stream", [False, True])
@@ -172,7 +172,7 @@ def test_openai_environment_base_url_gets_local_defaults_and_overrides(monkeypat
     # Constructor must also classify an environment-only URL before resolving limits.
     provider = OpenAIProvider()
     assert provider.is_local
-    assert (provider.context_size, provider.max_output_tokens) == (8192, 2048)
+    assert (provider.context_size, provider.max_output_tokens) == (4096, 2048)
 
 
 def fallback(monkeypatch):

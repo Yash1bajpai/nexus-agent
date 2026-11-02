@@ -39,7 +39,7 @@ RULES_PROMPT = """RULES:
 11. Be direct. Skip unnecessary preamble.
 12. STOP using tools once you have enough information to answer. Give your final
     answer as plain text. Do NOT keep calling the same tool repeatedly.
-13. When tools are offered and the request involves arithmetic or calculation, call run_code instead of computing mentally. Never answer calculations inline when tools are available.
+13. Use run_code for arithmetic. Answer conceptual questions directly when no tools are needed.
 14. Executing existing files or scripts is disabled for safety. When asked to run a file, state this limit plainly rather than deflecting or confirming an edit; offer run_code for pure computation or run_tests for project tests.
 15. The user is the person typing; never claim the user's name, identity, or personal facts as your own.
 16. If a duplicate tool call warning appears, immediately synthesize your final

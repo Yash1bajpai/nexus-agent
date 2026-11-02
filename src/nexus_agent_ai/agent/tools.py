@@ -685,6 +685,8 @@ def execute_search_web(query: str) -> str:
             "find", "for", "from", "in", "is", "latest", "notes", "of", "official", "on", "please",
             "release", "releases", "search", "stable", "that", "the", "this", "to", "version", "versions",
             "web", "what", "when", "where", "which", "with",
+            # URL noise: every href contains these, so they match anything.
+            "com", "org", "net", "io", "www", "http", "https", "html",
         }
         subjects = query_keywords - modifiers
         keywords = subjects or query_keywords
@@ -698,6 +700,20 @@ def execute_search_web(query: str) -> str:
 
     from importlib import import_module
 
+    def _strip_search_prefix(text: str) -> str:
+        """Drop leading search-intent phrasing a small model copies from the prompt.
+
+        'search the web for the latest llama.cpp release' makes engines return
+        pages about search itself; the useful query is 'the latest llama.cpp release'.
+        """
+        cleaned = re.sub(
+            r"^\s*(?:please\s+)?(?:(?:search|look)\s+(?:the\s+(?:web|internet|net)\s+)?(?:for|up|about)\s+|(?:google|bing|browse)\s+(?:for\s+)?)",
+            "",
+            text,
+            flags=re.I,
+        )
+        return cleaned.strip() or text
+
     failures = []
     execution_failures = []
     empty_backends = []
@@ -710,16 +726,30 @@ def execute_search_web(query: str) -> str:
 
         try:
             results = DDGS().text(query, max_results=5)
+            if results and not _is_relevant(results, query):
+                # Retry once with the search-intent phrasing stripped.
+                cleaned = _strip_search_prefix(query)
+                if cleaned != query:
+                    retry = DDGS().text(cleaned, max_results=5)
+                    if retry and _is_relevant(retry, cleaned):
+                        results, effective_query = retry, cleaned
+                    else:
+                        results = retry or results
+                        effective_query = query
+                else:
+                    effective_query = query
+            else:
+                effective_query = query
             if not results:
                 empty_backends.append(backend)
                 continue
-            if not _is_relevant(results, query):
+            if not _is_relevant(results, effective_query):
                 return (
                     f"ERROR: search_web [irrelevant]: Results from {backend} did not pass "
                     f"the relevance check for query: '{query}'."
                 )
 
-            formatted = [f"Search results for: '{query}'\n"]
+            formatted = [f"Search results for: '{effective_query}'\n"]
             for idx, r in enumerate(results, 1):
                 title = r.get("title", "No Title")
                 href = r.get("href", "")
