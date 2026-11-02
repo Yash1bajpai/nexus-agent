@@ -1019,3 +1019,51 @@ def test_refused_lossy_overwrite_includes_ready_targeted_patch(tmp_path):
     # Deletions are never suggested.
     result2 = tools_module.execute_write_file(str(path), "def add(a, b):\n    return a + b\n")
     assert "exact arguments" not in result2
+
+
+def test_golden_add_function_preserving_existing_faces_no_guard(tmp_path):
+    # Golden path: model appends a new function while keeping everything ->
+    # no loss detected, write proceeds with no refusal and no hint noise.
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    new_content = CALC_WITH_ADD + "\ndef multiply(a, b):\n    return a * b\n"
+    result = tools_module.execute_write_file(str(path), new_content)
+    assert result.startswith("Successfully")
+    assert "not approved" not in result and "exact arguments" not in result
+    assert path.read_text() == new_content
+
+
+def test_golden_targeted_patch_modification_faces_no_guard(tmp_path):
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    result = tools_module.execute_patch_file(
+        str(path), "def divide(a, b):\n    return a / b\n",
+        "def divide(a, b):\n    if b == 0:\n        raise ValueError('division by zero')\n    return a / b\n")
+    assert result.startswith("Successfully")
+    assert "def add(" in path.read_text() and "ValueError" in path.read_text()
+
+
+def test_recovery_hint_describes_candidate_only_no_deletion_no_authority(tmp_path):
+    # The hint is derived from the model's proposed content (never user intent),
+    # suggests no deletions, executes nothing, and grants no authority.
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    result = tools_module.execute_write_file(str(path), "def divide(a, b):\n    return a / b if b else 0\n")
+    assert "patch_file with these exact arguments" in result
+    # The suggested replacement contains only the intended modification...
+    assert "return a / b if b else 0" in result
+    # ...and never suggests deleting the dropped function.
+    import json as _json
+    hint_json = result[result.index('{"path":'):result.rindex("}") + 1]
+    args = _json.loads(hint_json)
+    assert "def add(" not in args["replacement"] or "def add(" in args["target"]
+    assert path.read_text() == CALC_WITH_ADD  # nothing executed
+    # A second attempt at the same lossy write is still refused (no authority leaked).
+    result2 = tools_module.execute_write_file(str(path), "def divide(a, b):\n    return a / b if b else 0\n")
+    assert result2.startswith("ERROR:")
