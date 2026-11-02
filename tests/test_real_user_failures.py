@@ -916,9 +916,10 @@ def test_write_file_new_file_unaffected_by_content_loss_guard(tmp_path):
     # file+symbol pairs bind to that symbol only
     ("remove the add function from calc.py", ["add"], True),
     ("remove the add function from calc.py", ["divide"], False),
-    # whole-file and bare rewrite intents authorize replacement
+    # a whole-file verb with a named file authorizes replacing that file
     ("rewrite calc.py from scratch", ["add"], True),
-    ("rewrite it completely", ["add"], True),
+    # a bare "rewrite it" resolves no referent: not authority, consent decides
+    ("rewrite it completely", ["add"], False),
     # a plain fix request authorizes no removal
     ("fix the bug in calc.py where divide crashes when b is zero", ["add"], False),
 ])

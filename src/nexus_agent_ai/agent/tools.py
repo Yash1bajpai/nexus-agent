@@ -162,6 +162,8 @@ def _parse_removal_intent(text: str):
                 grants.add(("symbol", sym))
         elif _WHOLE_FILE_VERB.search(clause):
             whole = True
+    # A bare "rewrite it" names no file or symbol: the referent is ambiguous, so it
+    # grants nothing by itself - the consent prompt decides instead.
     return grants, protected, whole
 
 
@@ -176,8 +178,6 @@ def _removal_authorized(p: Path, dropped_symbols) -> bool:
     if lowered and all(
             ("symbol", sym) in grants or ("filesymbol", name, sym) in grants
             for sym in lowered):
-        return True
-    if whole:
         return True
     return False
 
