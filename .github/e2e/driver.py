@@ -222,7 +222,7 @@ def main():
 
     body = run_cli("e03-path", "give me the full path of that file")
     if body is not None:
-        if rx(body, r"[A-Za-z]:\\\\") or rx(body, r"/[A-Za-z0-9_.-]+/"):
+        if rx(body, r"[A-Za-z]:\\") or rx(body, r"/[A-Za-z0-9_.-]+/"):
             verdict("e03-path", "absolute path given")
         else:
             row_fail("e03-path", "no absolute path in answer (original Row-5 FAIL)")
@@ -425,7 +425,8 @@ def main():
     run_cli("e24a-retry-seed", "calculate 123 * 456")
     body = run_cli("e24-retry", "try again")
     if body is not None:
-        if has(body, "56088"):
+        digits = re.sub(r"[,\s]", "", body)
+        if "56088" in digits:
             verdict("e24-retry", "TASK-PASS - prior arithmetic request inherited and answered")
         else:
             row_fail("e24-retry", "TASK-FAIL - prior request context not inherited (no 56088)")
