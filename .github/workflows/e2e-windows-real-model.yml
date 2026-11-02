@@ -22,6 +22,20 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build --wheel
           python -m pip install (Get-Item dist\*.whl).FullName
+      - name: Qualify build provenance (commit, wheel hash, import path)
+        shell: pwsh
+        run: |
+          $head = git rev-parse HEAD
+          if ($head -ne $env:GITHUB_SHA) { throw "checkout HEAD $head != GITHUB_SHA $env:GITHUB_SHA" }
+          "commit=$head"
+          $whl = (Get-Item dist\*.whl).FullName
+          $whlhash = (Get-FileHash $whl -Algorithm SHA256).Hash
+          "wheel=$whl"
+          "wheel_sha256=$whlhash"
+          $mod = python -c "import nexus_agent_ai; print(nexus_agent_ai.__file__)"
+          "module=$mod"
+          if ($mod -notmatch "site-packages") { throw "import path is not the installed wheel: $mod" }
+          python -m pip show nexus-agent-ai | Select-String "Version"
       - name: Mark initialized (skip interactive wizard in CI)
         shell: pwsh
         run: |
@@ -38,6 +52,16 @@ jobs:
             python -m nexus_agent_ai chat $prompt --persist --session ci *>> "$name.out"
             $results += "$name exit=$LASTEXITCODE"
           }
+          # Model provenance: the exact GGUF bytes under test (sandbox-qualified copy,
+          # digest-header validated on download from Hugging Face).
+          $expected = "2ea801949d760cdf1a2cc04a54262c22c3c0c54f0769d57760c9adeb0e59233f"
+          "warmup: first run downloads the model" | Tee-Object warmup.out
+          python -m nexus_agent_ai chat "say ok" *>> warmup.out
+          $gguf = "$env:USERPROFILE\.nexus-agent\models\LiquidAI--LFM2.5-1.2B-Instruct-GGUF\LFM2.5-1.2B-Instruct-Q4_0.gguf"
+          if (-not (Test-Path $gguf)) { throw "model not downloaded at $gguf" }
+          $actual = (Get-FileHash $gguf -Algorithm SHA256).Hash.ToLower()
+          "model_sha256=$actual"
+          if ($actual -ne $expected) { throw "model hash mismatch: $actual != $expected" }
           Run-Prompt "e01-create" "create a python file calculator.py with a function that adds two numbers"
           if (-not (Test-Path calculator.py)) { throw "e01: calculator.py not created" }
           if (-not (Select-String -Path calculator.py -Pattern "def add" -Quiet)) { throw "e01: add() missing" }
@@ -58,7 +82,7 @@ jobs:
         with:
           name: windows-e2e-results
           path: |
-            C:\Users\RUNNER~1\AppData\Local\Temp\nexus-e2e\*.out
-            C:\Users\RUNNER~1\AppData\Local\Temp\nexus-e2e\*.txt
-            C:\Users\RUNNER~1\AppData\Local\Temp\nexus-e2e\*.py
+            ${{ runner.temp }}\nexus-e2e\*.out
+            ${{ runner.temp }}\nexus-e2e\*.txt
+            ${{ runner.temp }}\nexus-e2e\*.py
           if-no-files-found: warn
