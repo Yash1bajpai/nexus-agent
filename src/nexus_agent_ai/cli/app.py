@@ -822,8 +822,14 @@ def commit(
         if diff_text.startswith("ERROR:"):
             display.print_error(diff_text)
             raise typer.Exit(code=1)
-        if not diff_text or "No changes" in diff_text:
-            display.print_error("No staged or unstaged changes found to commit.")
+        untracked_only = diff_text.startswith("Untracked files exist")
+        if not diff_text or "No changes" in diff_text or untracked_only:
+            if untracked_only:
+                display.print_error(
+                    "Only untracked files found; nothing committable. "
+                    "Stage or modify tracked files first (untracked files are never auto-added).")
+            else:
+                display.print_error("No staged or unstaged changes found to commit.")
             raise typer.Exit(code=1)
 
         prov, resolved_name = get_provider_instance(provider, **_limit_kwargs(context_size, max_output_tokens))

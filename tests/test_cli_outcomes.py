@@ -287,3 +287,59 @@ def test_banner_resume_instruction_and_root_continue_passthrough(monkeypatch):
     r_short = runner.invoke(cli.app, ["-c"])
     assert r_short.exit_code == 0
     assert invoked and invoked[-1].get("continue_last") is True
+
+
+def _git_repo(tmp_path, track_calc=True):
+    import subprocess
+    def g(*args):
+        return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True)
+    g("init", "-q")
+    if track_calc and (tmp_path / "calc.py").is_file():
+        g("add", "calc.py")
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "chore: add calc")
+    else:
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "chore: init")
+    return g
+
+
+def test_commit_subcommand_decline_does_not_commit(prepare, tmp_path):
+    g = _git_repo(tmp_path)
+    (tmp_path / "calc.py").write_text("def multiply(a, b):\n    return a * b * 2\n", encoding="utf-8")
+    provider = ScriptedProvider(text="fix: correct multiply implementation")
+    result = prepare(provider).invoke(cli.app, ["commit", "--no-stream"], input="n\n")
+    assert result.exit_code == 0, result.output
+    assert "Commit aborted" in result.output
+    log = g("log", "--oneline").stdout
+    assert "correct multiply" not in log
+
+
+def test_commit_subcommand_confirm_commits_with_generated_message(prepare, tmp_path):
+    g = _git_repo(tmp_path)
+    (tmp_path / "calc.py").write_text("def multiply(a, b):\n    return a * b * 2\n", encoding="utf-8")
+    provider = ScriptedProvider(text="fix: correct multiply implementation")
+    result = prepare(provider).invoke(cli.app, ["commit", "--no-stream"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert "fix: correct multiply implementation" in g("log", "--oneline").stdout
+
+
+def test_commit_subcommand_no_changes_exits_nonzero(prepare, tmp_path):
+    _git_repo(tmp_path)
+    result = prepare(ScriptedProvider(text="unused")).invoke(cli.app, ["commit", "--no-stream"])
+    assert result.exit_code == 1, result.output
+    assert "No staged or unstaged changes" in result.output
+
+
+def test_commit_subcommand_untracked_only_fails_fast_without_generating(prepare, tmp_path):
+    _git_repo(tmp_path, track_calc=False)
+    provider = ScriptedProvider(text="unused")
+    result = prepare(provider).invoke(cli.app, ["commit", "--no-stream"], input="y\n")
+    assert result.exit_code == 1, result.output
+    assert "Only untracked files" in result.output
+    assert "Commit with this message" not in result.output
+    assert provider.counter == 0
+
+
+def test_commit_subcommand_outside_repo_exits_nonzero(prepare, tmp_path):
+    result = prepare(ScriptedProvider(text="unused")).invoke(cli.app, ["commit", "--no-stream"])
+    assert result.exit_code == 1, result.output
+    assert "Not inside a git repository" in result.output
