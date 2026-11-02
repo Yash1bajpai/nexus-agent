@@ -117,3 +117,56 @@ def test_context_reports_stored_demand_fitted_projection_and_free_input(monkeypa
     assert "not tokenizer counts or proof of an actual sent request" in output
     assert len(agents[0].memory.get()) == 3
     assert agents[0].last_trim["dropped_messages"] == 0
+
+
+def test_post_turn_display_does_not_treat_stored_demand_as_sent_usage(monkeypatch):
+    from nexus_agent_ai.agent import context
+    from nexus_agent_ai.agent.core import Agent
+
+    class RecordingProvider(MsgProvider):
+        context_size = 1024
+        max_output_tokens = 128
+
+        def __init__(self):
+            self.requests = []
+
+        def complete(self, messages, tools, system):
+            self.requests.append((messages, tools, system))
+            return ProviderResponse(text="Please supply the missing details.")
+
+    provider = RecordingProvider()
+    monkeypatch.setattr(cli, "get_provider_instance", lambda *a, **k: (provider, "local"))
+    monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
+    agents = []
+
+    def seeded_agent(**kwargs):
+        kwargs["tools"] = []
+        agent = Agent(**kwargs)
+        agent.system = "Test system."
+        agent.memory.replace([
+            {"role": "user", "content": "Earlier discussion " + "x" * 10000},
+            {"role": "assistant", "content": "Earlier response " + "y" * 10000},
+        ])
+        agents.append(agent)
+        return agent
+
+    monkeypatch.setattr(cli, "Agent", seeded_agent)
+    result = CliRunner().invoke(
+        cli.app, ["repl", "--no-persist", "--no-verbose"],
+        input="What remains?\n/context\n/exit\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert len(provider.requests) == 1
+    messages, tools, system = provider.requests[0]
+    fitted_usage = (context.estimate_tokens(system) + context.tools_tokens(tools)
+                    + context.history_tokens(messages) + provider.max_output_tokens)
+    assert fitted_usage <= provider.context_size
+    assert agents[0].context_used() > provider.context_size
+    assert agents[0].last_trim["dropped_turns"] > 0
+    output = " ".join(result.output.split())
+    assert "Context estimates: /context" in output
+    assert "OVER BUDGET" not in output and "OVERBUDGET" not in output
+    assert "context: [" not in output
+    assert "Stored demand:" in output
+    assert "Next request projection:" in output
+    assert "Free for new input:" in output

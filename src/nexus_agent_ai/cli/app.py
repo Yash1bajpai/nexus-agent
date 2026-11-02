@@ -646,8 +646,7 @@ def repl(
                 display.print_footer(agent.total_tokens, agent.estimated_cost, duration)
                 _check_run_outcome(agent, exit_on_failure=False)
                 if getattr(agent, "context_window", None):
-                    from ..agent import context as _ctx
-                    typer.echo(_ctx.meter(agent.context_used(), agent.context_window))
+                    typer.echo("Context estimates: /context (stored demand, next-request projection, free input).")
             except (KeyboardInterrupt, EOFError):
                 typer.echo("\nSession ended. Goodbye!")
                 break
