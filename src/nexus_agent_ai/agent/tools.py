@@ -465,7 +465,7 @@ def execute_write_file(path: str, content: str) -> str:
             return f"No changes: '{path}' already has the requested content."
         _remember_file(p)
         backup_msg = f" (backup saved to {p.name}.bak)" if existed else ""
-        return f"Successfully wrote {len(content)} characters to {path}{backup_msg}"
+        return f"Successfully wrote {len(content)} characters to {path} (absolute path: {p}){backup_msg}"
     except PermissionError:
         return f"ERROR: Permission denied writing to: {path}"
     except Exception as e:
@@ -630,7 +630,7 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
             return f"No changes: '{path}' already has the requested content."
         _remember_file(p)
         backup_msg = f" (backup saved to {p.name}.bak)"
-        return f"Successfully patched '{path}': replaced {count} occurrence(s){backup_msg}.{note}"
+        return f"Successfully patched '{path}' (absolute path: {p}): replaced {count} occurrence(s){backup_msg}.{note}"
     except PermissionError:
         return f"ERROR: Permission denied patching: {path}"
     except Exception as e:
@@ -643,11 +643,14 @@ def execute_list_directory(path: str = ".") -> str:
         if isinstance(validated, str) and validated.startswith("ERROR:"):
             return validated
         root_path = validated
+        if root_path.exists() and root_path.is_file():
+            return (f"ERROR: '{path}' is a file, not a directory. Use read_file to read it. "
+                    f"Absolute path: {root_path}")
         if not root_path.exists() or not root_path.is_dir():
             return f"ERROR: Directory not found or not a directory: {path}"
 
         ignore_dirs = {".git", "__pycache__", "node_modules", "venv", ".env", ".pytest_cache", "dist", "build"}
-        output_lines = [f"Directory tree for: {root_path.name}"]
+        output_lines = [f"Directory tree for: {root_path.name} (absolute path: {root_path})"]
 
         root_depth = len(root_path.parts)
 

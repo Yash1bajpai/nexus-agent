@@ -1067,3 +1067,23 @@ def test_recovery_hint_describes_candidate_only_no_deletion_no_authority(tmp_pat
     # A second attempt at the same lossy write is still refused (no authority leaked).
     result2 = tools_module.execute_write_file(str(path), "def divide(a, b):\n    return a / b if b else 0\n")
     assert result2.startswith("ERROR:")
+
+
+def test_tool_results_carry_grounded_absolute_paths(tmp_path):
+    # Deterministic path grounding: the model learns real absolute paths from
+    # tool results instead of inventing them.
+    from nexus_agent_ai.agent import tools as tools_module
+    (tmp_path / "calc.py").write_text("x = 1\n")
+    tools_module.execute_read_file("calc.py")
+    result = tools_module.execute_write_file("calc.py", "x = 2\n")
+    assert f"absolute path: {tmp_path}/calc.py" in result
+    result = tools_module.execute_patch_file("calc.py", "x = 2", "x = 3")
+    assert f"absolute path: {tmp_path}/calc.py" in result
+    result = tools_module.execute_list_directory(".")
+    assert f"absolute path: {tmp_path}" in result
+    # The real turn-3 failure: list_directory on a file gets a specific,
+    # corrective message with the grounded path.
+    result = tools_module.execute_list_directory("./calc.py")
+    assert "is a file, not a directory" in result
+    assert "read_file" in result
+    assert f"Absolute path: {tmp_path}/calc.py" in result
