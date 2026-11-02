@@ -57,7 +57,7 @@ def row_fail(name, text):
 
 
 def run_cli(name, prompt=None, stdin_text=None, env_extra=None, cwd=None,
-            timeout=PROMPT_TIMEOUT, session=True, extra_args=()):
+            timeout=PROMPT_TIMEOUT, session=True, extra_args=(), require_output=True):
     """Run the CLI with prompt as exactly one argv element. Returns output body."""
     argv = [sys.executable, "-m", CLI_MODULE, "chat"]
     if prompt is not None:
@@ -72,6 +72,7 @@ def run_cli(name, prompt=None, stdin_text=None, env_extra=None, cwd=None,
     t0 = time.time()
     try:
         p = subprocess.run(argv, input=stdin_text, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
                            timeout=timeout, env=env, cwd=str(cwd) if cwd else None)
     except subprocess.TimeoutExpired:
         elapsed = time.time() - t0
@@ -88,6 +89,10 @@ def run_cli(name, prompt=None, stdin_text=None, env_extra=None, cwd=None,
     print(f"{name}: exit={p.returncode} {elapsed:.1f}s", flush=True)
     if p.returncode == 2:
         row_fail(name, "HARNESS ERROR - CLI usage error (exit 2); row did NOT execute")
+        return None
+    if require_output and not body.strip():
+        row_fail(name, "UNVERIFIABLE - no output captured (decode/capture loss); "
+                       "output-text claims for this row cannot be assessed")
         return None
     return body
 
@@ -129,14 +134,14 @@ def self_test():
     for s in HOSTILE_PROMPTS:
         p = subprocess.run([sys.executable, "-c",
                             "import sys,json;print(json.dumps(sys.argv[1:]))", s],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
         got = json.loads(p.stdout)
         if got != [s]:
             print(f"SELF-TEST FAIL: transport mangled {s!r} -> {got!r}")
             return False
     # Calibrate the exit-2 classifier against the real CLI's argparse behavior.
     p = subprocess.run([sys.executable, "-m", CLI_MODULE, "chat", "--definitely-not-a-real-flag"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 2:
         print(f"SELF-TEST FAIL: bogus-flag exit was {p.returncode}, expected 2; "
               "harness cannot distinguish usage errors from real runs")
@@ -172,7 +177,9 @@ def main():
     run_cli("e01-create", "create a python file calculator.py with a function that adds two numbers")
     t = file_text("calculator.py")
     e01ok = t is not None and "def add" in t
-    if not e01ok:
+    if e01ok:
+        verdict("e01-create", "calculator.py with add() created (file effect)")
+    else:
         row_fail("e01-create", "calculator.py with add() not created (dependent rows marked SKIP)")
 
     body = run_cli("e02-list", "show me the files in this folder")
@@ -213,6 +220,8 @@ def main():
     run_cli("e06-mathutils", "create a file math_utils.py with exactly this one-line function: def divide(a, b): return a + b")
     if file_text("math_utils.py") is None:
         row_fail("e06-mathutils", "math_utils.py not created")
+    else:
+        verdict("e06-mathutils", "math_utils.py created (file effect)")
     body = run_cli("e07-bugfix", "divide(10, 2) should give 5 but this code gives 12. find and fix the bug")
     t = file_text("math_utils.py")
     if t is not None and "return a + b" in t:
@@ -316,7 +325,7 @@ def main():
             verdict("e17-namerecall", "name recalled")
         else:
             verdict("e17-namerecall", "REVIEW - name not recalled")
-    run_cli("e18-clear", stdin_text="/clear\n/exit\n")
+    run_cli("e18-clear", stdin_text="/clear\n/exit\n", require_output=False)
     body = run_cli("e19-afterclear", "what is my name?")
     if body is not None:
         if has(body, "Yash"):
@@ -335,7 +344,7 @@ def main():
 
     # --- Row 12: doctor ---
     p = subprocess.run([sys.executable, "-m", CLI_MODULE, "doctor"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
     write_out("doctor", p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr else ""))
     if "Downloading" in p.stdout:
         failures.append("doctor downloaded something")
