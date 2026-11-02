@@ -8,6 +8,8 @@ Turn off with NEXUS_GUARDRAILS=0 (for measuring the model alone).
 """
 import ast
 from dataclasses import dataclass
+import hashlib
+import json
 import keyword
 import difflib
 import math
@@ -55,6 +57,141 @@ _NEGATION_OR_PROPOSAL = re.compile(
     re.IGNORECASE,
 )
 _PATH_ARG_TOOLS = ("read_file", "patch_file", "write_file")
+
+
+_FAILURE_CLASSES = (
+    ("sandbox-access-denied", r"Security Sandbox Access Denied:"),
+    ("sensitive-file-access-denied", r"Security Blocked:"),
+    ("unread-file", r"Read .+ with read_file before editing it,"),
+    ("stale-file", r".+ changed on disk since you last read it\."),
+    ("missing-file", r"File not found:|Target test path does not exist:"),
+    ("missing-directory", r"Directory not found or not a directory:"),
+    ("not-a-file", r"Path is a directory, not a file:"),
+    ("not-a-directory", r".+ is a file, not a directory\."),
+    ("empty-target", r"Target string to replace cannot be empty\."),
+    ("target-mismatch", r"Target content not found in "),
+    ("ambiguous-target", r"Target content found \d+ times in "),
+    ("syntax-validation", r"Python syntax validation failed|Code has a syntax error:"),
+    ("removal-not-approved", r"This (?:overwrite of|patch to) "),
+    ("permission-denied", r"Permission denied"),
+    ("execution-not-approved", r"Project test execution is not approved\."),
+    ("execution-disabled", r"Executing existing files "),
+    ("commit-disabled", r"Git commit is disabled "),
+    ("invalid-arguments", r"Invalid arguments for tool "),
+    ("unknown-tool", r"Unknown tool "),
+    ("read-failed", r"Could not read file:"),
+    ("write-failed", r"Could not write file:"),
+    ("patch-failed", r"Could not patch file:"),
+    ("directory-list-failed", r"Could not list directory:"),
+    ("execution-timeout", r"Code execution timed out|Pytest execution timed out"),
+    ("execution-failed", r"Code execution failed:|Execution failed for tool "),
+    ("unsupported-language", r"Running language "),
+    ("pytest-unavailable", r"pytest is not installed "),
+    ("invalid-test-arguments", r"Invalid or unsafe -k |Invalid --maxfail |Unsupported or unsafe pytest argument:"),
+    ("pytest-failed", r"Failed to run pytest:"),
+    ("git-status-failed", r"Could not get git status"),
+    ("git-diff-failed", r"Could not read git diff"),
+    ("git-commit-failed", r"git commit failed:|Could not commit:"),
+    ("empty-commit-message", r"Commit message cannot be empty\."),
+    ("no-staged-changes", r"No staged changes found to commit\."),
+)
+
+
+class IdenticalFailureTracker:
+    """Bounded, turn-local evidence of repeated failures on verified unchanged state.
+
+    Observe actual tool results before guard wrappers add hints. File states are
+    supplied by the caller; this tracker never reads or resolves a target path.
+    Only SHA256 identities and fixed error labels are retained, not tool payloads.
+    """
+
+    def __init__(self, max_entries: int = 128):
+        if type(max_entries) is not int or max_entries < 1:
+            raise ValueError("max_entries must be a positive integer")
+        self.max_entries = max_entries
+        self._failures = {}
+        self.last_error_class: Optional[str] = None
+
+    def begin_turn(self) -> None:
+        self._failures.clear()
+        self.last_error_class = None
+
+    @staticmethod
+    def _error_identity(result: str) -> Tuple[str, str]:
+        # Inspect a bounded header only, never supplemental file DATA or hints.
+        prefix = result[6:518].lstrip(" \t").split("\n", 1)[0].split("\r", 1)[0]
+        prefix = re.split(
+            r"\b(?:DATA|HINTS?):", prefix, maxsplit=1, flags=re.IGNORECASE,
+        )[0].rstrip()
+        for label, pattern in _FAILURE_CLASSES:
+            if re.match(pattern, prefix):
+                return label, label
+        search = re.match(r"search_web \[(empty|irrelevant|network|unavailable|blocked|timeout|error)\]:", prefix)
+        if search:
+            label = "search-" + search.group(1)
+            return label, label
+        # Unrecognized errors remain distinct without exposing their text. The
+        # bounded digest also prevents arbitrary error payloads growing state.
+        return "unclassified-tool-error", hashlib.sha256(prefix.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _verified_state(state) -> bool:
+        if not isinstance(state, tuple) or len(state) != 2:
+            return False
+        kind, digest = state
+        if kind in ("missing", "no-target"):
+            return digest is None
+        return (
+            kind == "file" and (
+                (isinstance(digest, bytes) and len(digest) == 32)
+                or (
+                    isinstance(digest, str)
+                    and re.fullmatch(r"[0-9a-fA-F]{64}", digest) is not None
+                )
+            )
+        )
+
+    def observe(self, name: str, args: dict, result: str, before_state, after_state) -> bool:
+        """Return true on the second identical ERROR with unchanged known state.
+
+        Different failures may intervene. Any successful actual call or explicit
+        turn boundary clears all evidence. Unknown/changed state invalidates old
+        evidence for these arguments rather than assuming a file stayed unchanged.
+        """
+        if not result.startswith("ERROR:"):
+            self.begin_turn()
+            return False
+        self.last_error_class, error_identity = self._error_identity(result)
+        normalized = args
+        if name == "patch_file" and "allow_multiple" not in args:
+            normalized = dict(args, allow_multiple=False)
+        try:
+            canonical = json.dumps(
+                normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            # Non-JSON arguments cannot establish a canonical identity.
+            self._failures.clear()
+            return False
+        args_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        if (
+            not self._verified_state(before_state)
+            or not self._verified_state(after_state)
+            or before_state != after_state
+        ):
+            self._failures = {
+                key: value for key, value in self._failures.items()
+                if key[:2] != (name, args_hash)
+            }
+            return False
+        key = (name, args_hash, self.last_error_class, error_identity, before_state)
+        if key in self._failures:
+            return True
+        if len(self._failures) >= self.max_entries:
+            del self._failures[next(iter(self._failures))]
+        self._failures[key] = None
+        return False
 
 
 def _clean_for_claims(text: str) -> str:

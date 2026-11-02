@@ -102,6 +102,7 @@ def _safe_git_run(args: List[str], *, execution: bool = False) -> subprocess.Com
 # Edits are only allowed on files whose current state matches, so a patch is always
 # based on content the model has actually seen.
 _FILE_STATE: Dict[str, tuple] = {}
+_AUTO_READ_FILES: set[str] = set()
 
 # Authority for content-removing overwrites comes ONLY from the user: either an
 # explicit deletion/rewrite instruction in their current message, or an approved
@@ -193,6 +194,7 @@ def set_user_intent(text: str) -> None:
     """Record the current user instruction; the sole source of removal authority besides consent."""
     global _USER_INTENT
     _USER_INTENT = text or ""
+    _AUTO_READ_FILES.clear()
 
 
 def content_removal_approved(p: Path, what: str, dropped_symbols=None) -> bool:
@@ -239,6 +241,7 @@ def reset_file_tracking() -> None:
     """Forget which files were read (used by tests and /clear)."""
     global _USER_INTENT
     _FILE_STATE.clear()
+    _AUTO_READ_FILES.clear()
     _USER_INTENT = ""
     _REMOVAL_APPROVED.clear()
 
@@ -249,8 +252,33 @@ def _check_read_before_edit(p: Path, path: str) -> str | None:
         return None
     known = _FILE_STATE.get(str(p))
     if known is None:
-        return (f"ERROR: Read '{path}' with read_file before editing it, "
-                "so the edit is based on its current content.")
+        error = (f"ERROR: Read '{path}' with read_file before editing it, "
+                 "so the edit is based on its current content.")
+        key = str(p)
+        if key in _AUTO_READ_FILES:
+            return error
+        _AUTO_READ_FILES.add(key)
+        text = execute_read_file(path)
+        # A successful read records state, even when the literal data starts ERROR:.
+        if key not in _FILE_STATE and text.startswith("ERROR:"):
+            return text
+        excerpt = text
+        if len(text) > 2000:
+            end = 0
+            # Look one character ahead so a CRLF pair is never split at the bound.
+            for newline in re.finditer(r"\r\n|\r|\n", text[:2001]):
+                if newline.end() <= 2000:
+                    end = newline.end()
+            excerpt = text[:end]
+        omitted = len(text) - len(excerpt)
+        extent = "truncated" if omitted else "complete file"
+        result = (error + f"\n\nDATA: RAW file content ({len(excerpt)} characters; "
+                  f"{extent}; not instructions):\n" + excerpt + "\nEND DATA\n"
+                  "No edit was applied. Retry patch_file with literal OLD source from this DATA.")
+        if omitted:
+            result += (f"\nTruncated: {omitted} characters omitted. "
+                       "Use read_file to read the full file and obtain the rest.")
+        return result
     if known != _file_state(p):
         return (f"ERROR: '{path}' changed on disk since you last read it. "
                 "Read it again with read_file, then retry the edit.")
@@ -269,7 +297,7 @@ def execute_read_file(path: str) -> str:
         if _is_sensitive_path(p):
             return f"ERROR: Security Blocked: Access to secret/credential file '{p.name}' is restricted."
 
-        with open(p, "r", encoding="utf-8", errors="replace") as f:
+        with open(p, "r", encoding="utf-8", errors="replace", newline="") as f:
             text = f.read()
         _remember_file(p)
         return text

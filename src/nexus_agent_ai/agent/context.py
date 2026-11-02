@@ -11,6 +11,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .memory import is_genuine_user_message
+from .outcomes import fitted_claim_view
 
 CHARS_PER_TOKEN = 3.5
 MESSAGE_OVERHEAD_TOKENS = 6
@@ -207,7 +208,8 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
     """Fit whole turns plus a bounded historical note; never alter the newest user request."""
     stats = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0,
              "omission_tokens": 0}
-    msgs = list(messages)
+    view = fitted_claim_view(messages)
+    msgs = list(view)
     starts = [i for i, m in enumerate(msgs) if is_genuine_user_message(m)]
     stats["turns_before"] = stats["turns_after"] = len(starts)
     total = history_tokens(msgs)
@@ -229,7 +231,7 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
                 break
             candidates = [
                 (message_tokens(m) - message_tokens(shrunk), i, shrunk)
-                for i, m in enumerate(msgs) if i != newest_user
+                for i, m in enumerate(msgs) if i != newest_user and not m.get("metadata", {}).get("outcome_correction")
                 for shrunk in [_shrink_message(m, limit)]
             ]
             saved, index, shrunk = max(candidates, default=(0, 0, None), key=lambda item: item[0])
@@ -253,9 +255,12 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
     stats["turns_after"] = len(starts)
     stats["dropped_turns"] = stats["turns_before"] - stats["turns_after"]
     if stats["dropped_messages"]:
-        note = _historical_omission(messages[:stats["dropped_messages"]], budget_tokens - total)
+        note = _historical_omission(view[:stats["dropped_messages"]], budget_tokens - total)
         stats["omission_tokens"] = history_tokens(note)
         msgs = note + msgs
+    stats["correction_tokens"] = sum(
+        message_tokens(m) for m in msgs if m.get("metadata", {}).get("outcome_correction")
+    )
     stats["tokens"] = history_tokens(msgs)
     return msgs, stats
 

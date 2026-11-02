@@ -10,13 +10,14 @@ from . import context
 from .memory import ConversationMemory, is_genuine_user_message
 from .tools import get_all_tools, execute_tool, execute_list_directory
 from .guardrails import (
-    LoopGuard, guardrails_enabled, promises_tool_use, function_request_prose,
+    IdenticalFailureTracker, LoopGuard, guardrails_enabled, promises_tool_use, function_request_prose,
     requested_function_names, check_function_requirements,
     requested_literal_assignment, check_literal_assignment_requirement,
 )
 from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
+from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata
 
 RULES_PROMPT = """RULES:
 1. Always use read_file tool before answering questions about a specific file.
@@ -158,6 +159,20 @@ def _edit_path(args) -> Optional[Path]:
         return Path(path).resolve() if isinstance(path, (str, os.PathLike)) and path else None
     except (OSError, ValueError):
         return None
+
+
+def _target_snapshot(name, args):
+    """Hash only permitted file targets; unknown/denied states are never evidence."""
+    if name not in ("read_file", "patch_file", "write_file"):
+        return None, ("no-target", None)
+    from . import tools
+    path = _edit_path(args)
+    if path is None:
+        return None, None
+    validated = tools._validate_workspace_path(path)
+    if not isinstance(validated, Path) or tools._is_sensitive_path(validated):
+        return None, None
+    return validated, _file_state(validated)
 
 
 
@@ -333,6 +348,8 @@ class Agent:
         self.response_incomplete = False
         self.changed_files: set[str] = set()
         self.requirements_incomplete: List[str] = []
+        self._identical_failures = IdenticalFailureTracker()
+        self._mutation_outcomes: Dict[str, str] = {}
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -376,6 +393,13 @@ class Agent:
 
     def _nudge(self, text: str):
         self.memory.add_raw({"role": "user", "content": text, "metadata": {"internal": True}})
+
+    def _remember_assistant(self, text, tool_calls=()):
+        """Keep original model bytes; attach only executor-observed mutation evidence."""
+        message = assistant_message(text, tool_calls)
+        if self._mutation_outcomes:
+            message["metadata"] = mutation_metadata(self._mutation_outcomes)
+        self.memory.add_raw(message)
 
     def _stream_correction(self, text: str):
         if not text:
@@ -422,7 +446,7 @@ class Agent:
     def _fit(self, messages, tools, scale: float = 1.0):
         """Trim only the sent view; retain the exact newest user request and stored history."""
         if not self.context_window:
-            return messages
+            return fitted_claim_view(messages)
         active = getattr(self.provider, "active_provider", self.provider)
         adaptive = _is_local_provider(active) and getattr(active, "_supports_output_budget", False)
         boost = getattr(self, "_output_boost", None) if adaptive else None
@@ -509,6 +533,8 @@ class Agent:
         """Execute the ReAct loop for a user input."""
         from . import tools as tools_module
         tools_module.set_user_intent(user_input or "")
+        self._identical_failures.begin_turn()
+        self._mutation_outcomes = {}
         routing_input = _routing_request(user_input, self.memory.get())
         requires_search = bool(_LIVE_SEARCH_REQUEST.search(routing_input))
         wants_edit = require_edit or (
@@ -539,7 +565,7 @@ class Agent:
         iteration = 0
         executed_tools = set()
         duplicate_counts = {}
-        failed_counts: Dict[str, int] = {}
+        repeated_failure_stop = ""
         force_final = False
         tool_errors = []
         unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
@@ -645,7 +671,7 @@ class Agent:
                         continue
 
                 if response.has_tool_calls:
-                    self.memory.add_raw(assistant_message(response.text, response.tool_calls))
+                    self._remember_assistant(response.text, response.tool_calls)
 
                     # Show THINKING trace: the LLM's reasoning text before tool call
                     if response.text and not stream:
@@ -682,7 +708,9 @@ class Agent:
                         start = time.time()
                         
                         allowed_names = {tool.name for tool in use_tools}
-                        if tool_call.name not in allowed_names:
+                        if repeated_failure_stop:
+                            result = "ERROR: Not executed: turn stopped after repeated identical failure."
+                        elif tool_call.name not in allowed_names:
                             result = f"ERROR: Tool '{tool_call.name}' is not allowed in this session."
                         elif tool_sig in executed_tools:
                             duplicate_counts[tool_sig] = duplicate_counts.get(tool_sig, 0) + 1
@@ -702,10 +730,22 @@ class Agent:
                                 result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
                         else:
                             executed_tools.add(tool_sig)
-                            edit_path = _edit_path(tool_call.args) if tool_call.name in _WRITE_TOOLS else None
-                            before_edit = _file_state(edit_path) if edit_path is not None else None
+                            target_path, before_state = _target_snapshot(tool_call.name, tool_call.args)
+                            edit_path = target_path if tool_call.name in _WRITE_TOOLS else None
+                            before_edit = before_state if edit_path is not None else None
                             tool_executed = True
                             result = execute_tool(tool_call.name, tool_call.args)
+                            _, after_state = _target_snapshot(tool_call.name, tool_call.args)
+                            if self._identical_failures.observe(
+                                    tool_call.name, tool_call.args, str(result), before_state, after_state):
+                                repeated_failure_stop = (
+                                    f"Stopped: repeated identical tool failure ({tool_call.name}; "
+                                    f"{self._identical_failures.last_error_class}). "
+                                    "The same error occurred twice for the same observed state. "
+                                    + ("There was no observed target-file state change during either failed call."
+                                       if target_path is not None else "This tool has no target-file state.")
+                                )
+                                display.print_warn(repeated_failure_stop)
                             if tool_call.name == "search_web" and str(result).startswith("Search results for:"):
                                 search_succeeded = True
                                 for u in re.findall(r"^\s*URL:\s*(https?://\S+)", str(result), re.MULTILINE):
@@ -713,11 +753,20 @@ class Agent:
                                     if clean_u.startswith(("http://", "https://")) and clean_u not in retrieved_search_urls:
                                         retrieved_search_urls.append(clean_u)
                             changed = (edit_path is not None and before_edit is not None
-                                       and (after_edit := _file_state(edit_path)) is not None
-                                       and after_edit != before_edit
+                                       and after_state is not None
+                                       and after_state != before_edit
                                        and not str(result).startswith(("ERROR:", "No changes:")))
                             if changed:
                                 self.changed_files.add(str(edit_path))
+                            if edit_path is not None:
+                                path_key = str(edit_path)
+                                outcome = ("changed" if changed else
+                                           "unchanged" if before_edit is not None and after_state == before_edit else "unknown")
+                                if self._mutation_outcomes.get(path_key) != "changed":
+                                    self._mutation_outcomes.pop(path_key, None)
+                                    self._mutation_outcomes[path_key] = outcome
+                                    if len(self._mutation_outcomes) > MAX_OUTCOME_FILES:
+                                        del self._mutation_outcomes[next(iter(self._mutation_outcomes))]
                             if guard:
                                 result = guard.after_tool(tool_call.name, tool_call.args, result)
 
@@ -726,11 +775,9 @@ class Agent:
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
                             unresolved_tool[error_key] = tool_call.name
-                            # A failed call may legitimately be retried unchanged (e.g. after
-                            # read_file). Only a repeated failure counts as a loop.
-                            failed_counts[tool_sig] = failed_counts.get(tool_sig, 0) + 1
-                            if failed_counts[tool_sig] < 2:
-                                executed_tools.discard(tool_sig)
+                            # Failed calls remain executable: the state-aware tracker,
+                            # not a blanket duplicate signature, decides when to stop.
+                            executed_tools.discard(tool_sig)
                         elif not str(result).startswith("[SYSTEM"):
                             # A later success fixes the error only if it is the same tool succeeding, or a
                             # write. Reading the file is not a fix for a failed edit.
@@ -759,7 +806,13 @@ class Agent:
                         if self.verbose:
                             display.print_tool_result(result, duration, tool_call.name)
 
-                        self.memory.add_raw({"role": "tool", "tool_call_id": tool_call.id, "content": str(result)})
+                        result_message = {"role": "tool", "tool_call_id": tool_call.id, "content": str(result)}
+                        if self._mutation_outcomes:
+                            result_message["metadata"] = mutation_metadata(self._mutation_outcomes)
+                        self.memory.add_raw(result_message)
+
+                    if repeated_failure_stop:
+                        break
 
                     if force_final:
                         # Anti-loop: no tools next round, model must answer directly
@@ -788,7 +841,7 @@ class Agent:
                     if guard and not self.response_incomplete:
                         verdict, reviewed = guard.review_final(final_text)
                         if verdict == "retry":
-                            self.memory.add("assistant", final_text)
+                            self._remember_assistant(response.text)
                             self._nudge(reviewed)
                             self.claim_unverified = guard.claim_unverified
                             if stream:
@@ -807,7 +860,7 @@ class Agent:
                     if (not self.response_incomplete and local_mode and unresolved and use_tools and error_nudges < 2 and iteration < effective_max_iter):
                         # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
                         error_nudges += 1
-                        self.memory.add("assistant", final_text or "(no answer)")
+                        self._remember_assistant(response.text)
                         self._nudge("[SYSTEM] Your last tool call failed: " + "; ".join(dict.fromkeys(unresolved.values()))[:400]
                                         + " Do not just describe a plan. Fix this by calling the tools now (read_file first if needed), then finish the task.")
                         messages = self.memory.get()
@@ -820,7 +873,7 @@ class Agent:
                             and not _NO_CHANGE_OK.search(final_text or "")):
                         # An edit was requested, nothing was written, and the model did not say there is nothing to change.
                         error_nudges += 1
-                        self.memory.add("assistant", final_text or "(no answer)")
+                        self._remember_assistant(response.text)
                         self._nudge("[SYSTEM] No file has been changed yet. Do not explain; act. Call patch_file "
                                         "(or write_file) now using the exact text from the file, then call run_tests to check.")
                         messages = self.memory.get()
@@ -901,7 +954,7 @@ class Agent:
                         elif not self.event_callback:
                             display.print_response(final_text)
 
-                    self.memory.add("assistant", final_text)
+                    self._remember_assistant(response.text)
                     return final_text
         finally:
             display.stop_status(status)
@@ -909,8 +962,12 @@ class Agent:
                 self.provider.before_request = previous_before_request
             self.unresolved_errors = list(unresolved.values())
 
-        final_text = "Stopped: maximum tool iterations reached before the task completed."
-        self.unresolved_errors.append("Maximum tool iterations reached before task completed.")
+        final_text = repeated_failure_stop or "Stopped: maximum tool iterations reached before the task completed."
+        self.unresolved_errors.append(
+            repeated_failure_stop or "Maximum tool iterations reached before task completed."
+        )
+        if repeated_failure_stop and self.changed_files:
+            final_text += " Other observed file mutations in this turn remain in place."
         if wants_edit and not self.changed_files:
             self.edit_not_applied = True
             final_text += " No file was changed."
@@ -923,7 +980,7 @@ class Agent:
             final_text += " Any partial edits remain in place; no automatic repair was attempted."
         if self.unresolved_errors:
             final_text += "\nUnresolved tool errors:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
-        self.memory.add("assistant", final_text)
+        self._remember_assistant(final_text)
         if self.event_callback:
             self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
         if stream and not self.event_callback:
