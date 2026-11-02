@@ -37,7 +37,7 @@ def test_fit_drops_oldest_whole_turns_and_keeps_latest():
     assert ctx.history_tokens(fitted) <= budget
     assert fitted[-1] == msgs[-1]
     assert fitted[0]["role"] == "user"  # never starts mid-turn
-    assert stats["dropped_messages"] == len(msgs) - len(fitted) > 0
+    assert stats["dropped_messages"] == len(msgs) - (len(fitted) - 2) > 0
 
 
 def test_fit_keeps_tool_pairs_together():
@@ -48,19 +48,16 @@ def test_fit_keeps_tool_pairs_together():
         {"role": "assistant", "content": "done"},
         {"role": "user", "content": "new question"},
     ]
-    fitted, _ = ctx.fit_messages(msgs, 60)
-    assert fitted[0]["content"] == "new question"
+    fitted, _ = ctx.fit_messages(msgs, 200)
+    assert fitted[2:] == [msgs[-1]]
 
 
-def test_fit_truncates_giant_single_message():
+def test_fit_refuses_to_truncate_giant_current_user_request():
     big = "HEAD" + ("z" * 40_000) + "TAIL"
     msgs = [{"role": "user", "content": big}]
-    fitted, stats = ctx.fit_messages(msgs, 1000)
-    text = fitted[0]["content"]
-    assert ctx.history_tokens(fitted) <= 1000
-    assert text.startswith("HEAD") and text.endswith("TAIL") and "truncated" in text
-    assert stats["truncated_messages"] >= 1
-    assert msgs[0]["content"] == big  # stored history not mutated
+    with pytest.raises(ctx.ContextBudgetError, match="newest user request"):
+        ctx.fit_messages(msgs, 1000)
+    assert msgs[0]["content"] == big
 
 
 def test_fit_truncates_big_tool_result_in_latest_turn():
@@ -205,8 +202,8 @@ def test_internal_nudges_do_not_replace_real_request_or_split_tool_pairs(tmp_pat
         for message in active[1:]:
             memory.add_raw(message)
         assert memory.get() == active
-    fitted, _ = ctx.fit_messages(turn(0, size=4000) + active, ctx.history_tokens(active) + 1)
-    assert fitted == active
+    fitted, _ = ctx.fit_messages(turn(0, size=4000) + active, ctx.history_tokens(active) + 150)
+    assert fitted[2:] == active
     compacted, _ = ctx.compact_messages(turn(0) + active, keep_turns=1)
     assert compacted[2:] == active
     assert "Try again" not in compacted[0]["content"]

@@ -385,13 +385,11 @@ class Agent:
         else:
             display.print_stream_chunk(text)
 
-    def _fit(self, messages, tools, scale: float = 1.0):
-        """Trim what is sent to the model so it fits the window. Stored history is untouched."""
-        if not self.context_window:
-            return messages
+    def _plan_fit(self, messages, tools, scale=1.0, *, output_reserve=None, boost=None):
+        """Plan a request with the existing budget policy, without changing agent/provider state."""
         window = int(self.context_window * scale)
         configured = self.output_reserve
-        reserve = configured
+        reserve = configured if output_reserve is None else output_reserve
         active = getattr(self.provider, "active_provider", self.provider)
         adaptive = _is_local_provider(active) and getattr(active, "_supports_output_budget", False)
         # Keep a usable reply allowance rather than shrinking all the way to a
@@ -400,12 +398,9 @@ class Agent:
         overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
         # A pending output-boost retry raises the reserve BEFORE fitting, so the
         # history budget shrinks accordingly and input + output stays within the
-        # window. The boost is consumed here; it never overflows the window.
-        if adaptive:
-            boost = getattr(self, "_output_boost", None)
-            if boost:
-                self._output_boost = None
-                reserve = max(reserve, min(boost, max(minimum_output, window - overhead - 256)))
+        # window. Planning does not consume the boost.
+        if adaptive and boost:
+            reserve = max(reserve, min(boost, max(minimum_output, window - overhead - 256)))
         while True:
             budget = window - reserve - overhead
             try:
@@ -421,6 +416,21 @@ class Agent:
                 if not adaptive or reserve <= minimum_output:
                     raise
                 reserve = max(minimum_output, reserve // 2)
+        stats.update(request_window=window, reserve=reserve, budget_tokens=budget)
+        return fitted, stats
+
+    def _fit(self, messages, tools, scale: float = 1.0):
+        """Trim only the sent view; retain the exact newest user request and stored history."""
+        if not self.context_window:
+            return messages
+        active = getattr(self.provider, "active_provider", self.provider)
+        adaptive = _is_local_provider(active) and getattr(active, "_supports_output_budget", False)
+        boost = getattr(self, "_output_boost", None) if adaptive else None
+        if boost:
+            self._output_boost = None
+        fitted, stats = self._plan_fit(messages, tools, scale, boost=boost)
+        configured = self.output_reserve
+        reserve = stats["reserve"]
         if adaptive:
             active._request_output_cap = reserve
             self.output_reserve = reserve
@@ -446,24 +456,46 @@ class Agent:
         self._sync_context_window()
         return (context.history_tokens(self.memory.get()) + context.estimate_tokens(self.system)
                 + context.tools_tokens(self.tools) + self.output_reserve)
-    def context_breakdown(self) -> Dict[str, int]:
-        """Return token breakdown: system+tools overhead, history, output reserve, window."""
+    def context_breakdown(self) -> Dict[str, Any]:
+        """Stored demand and a side-effect-free next-request projection, both estimates."""
         self._sync_context_window()
         sys_tok = context.estimate_tokens(self.system)
         tool_tok = context.tools_tokens(self.tools)
         overhead = sys_tok + tool_tok
-        hist_tok = context.history_tokens(self.memory.get())
-        reserve = self.output_reserve
-        total = overhead + hist_tok + reserve
-        return {
-            "overhead": overhead,
-            "system": sys_tok,
-            "tools": tool_tok,
-            "history": hist_tok,
-            "reserve": reserve,
-            "total": total,
-            "window": self.context_window or 0,
+        messages = self.memory.get()
+        hist_tok = context.history_tokens(messages)
+        active = getattr(self.provider, "active_provider", self.provider)
+        reserve = getattr(active, "_request_output_cap", self.output_reserve)
+        if not isinstance(reserve, int) or isinstance(reserve, bool) or reserve <= 0:
+            reserve = self.output_reserve
+        result = {
+            "overhead": overhead, "system": sys_tok, "tools": tool_tok,
+            "history": hist_tok, "reserve": reserve,
+            "total": overhead + hist_tok + reserve, "window": self.context_window or 0,
+            "projection": None, "fitted_history": None, "free": None,
+            "kept_turns": 0, "dropped_turns": 0, "omission_tokens": 0,
+            "projection_error": "",
         }
+        if not self.context_window:
+            return result
+        try:
+            _, stats = self._plan_fit(
+                messages, self.tools, output_reserve=reserve,
+                boost=getattr(self, "_output_boost", None),
+            )
+        except context.ContextBudgetError as exc:
+            result["projection_error"] = str(exc)
+            return result
+        reserve = stats["reserve"]
+        projection = overhead + stats["tokens"] + reserve
+        result.update(
+            reserve=reserve, total=overhead + hist_tok + reserve,
+            projection=projection, fitted_history=stats["tokens"],
+            free=stats["request_window"] - projection,
+            kept_turns=stats["turns_after"], dropped_turns=stats["dropped_turns"],
+            omission_tokens=stats["omission_tokens"],
+        )
+        return result
 
     def compact(self, keep_turns: int = 2):
         """Shrink stored history; returns (before_tokens, after_tokens, info)."""

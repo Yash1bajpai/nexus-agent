@@ -465,16 +465,30 @@ def repl(
                         display.print_info("This provider does not expose a context budget.")
                     else:
                         bk = agent.context_breakdown()
+                        if bk["projection"] is None:
+                            projection = (
+                                f"Next request projection: unavailable — {bk['projection_error']}\n"
+                                "Free for new input: unavailable."
+                            )
+                        else:
+                            projection = (
+                                f"Next request projection: ~{bk['projection']}/{window} tokens "
+                                f"(fitted history ~{bk['fitted_history']}, including omission note+ack "
+                                f"~{bk['omission_tokens']}; kept {bk['kept_turns']} turn(s), "
+                                f"dropped {bk['dropped_turns']}).\n"
+                                f"Free for new input: ~{bk['free']} tokens (window - projection)."
+                            )
                         display.print_info(
-                            f"Configured context budget: {window} tokens; configured output ceiling: {agent.output_reserve} tokens. "
-                            "Restart with --context-size / --max-output-tokens to change the budgets. Larger local windows use more RAM.\n"
-                            f"Breakdown: system+tools overhead ~{bk['overhead']} tokens, "
-                            f"history ~{bk['history']} tokens, output reserve ~{bk['reserve']} tokens, total ~{bk['total']}/{window} tokens.\n"
-                            "Old turns are dropped and big items cut automatically when a request would not fit; "
-                            "/compact shrinks stored history, /clear clears it (including a persistent session)."
+                            f"Configured context budget: {window} tokens; configured output ceiling: {agent.output_reserve} tokens.\n"
+                            f"Stored demand: ~{bk['total']}/{window} tokens (overhead + full stored history + reserve).\n"
+                            f"Breakdown: system ~{bk['system']}, tools ~{bk['tools']}, "
+                            f"system+tools overhead ~{bk['overhead']}, full stored history ~{bk['history']}, "
+                            f"output reserve ~{bk['reserve']}, window {window} tokens.\n"
+                            f"{projection}\n"
+                            "Projection is an estimate, not tokenizer counts or proof of an actual sent request; future input is not included.\n"
+                            "Restart with --context-size / --max-output-tokens to change budgets. Larger local windows use more RAM. "
+                            "/compact shrinks stored history; /clear clears it."
                         )
-                        from ..agent import context as _ctx
-                        display.print_info(_ctx.meter(agent.context_used(), window, breakdown=bk))
                     continue
                 elif lower_input == "/compact":
                     before, after, info = agent.compact()

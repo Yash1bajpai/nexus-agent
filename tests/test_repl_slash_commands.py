@@ -69,3 +69,51 @@ def test_repl_commit_flow_cancel_and_confirm(monkeypatch, tmp_path):
     assert "OptionInfo" not in r.output
     n = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
     assert n == "2"
+
+
+def test_context_reports_stored_demand_fitted_projection_and_free_input(monkeypatch):
+    from nexus_agent_ai.agent import context
+    from nexus_agent_ai.agent.core import Agent
+
+    provider = MsgProvider()
+    provider.context_size = 1000
+    provider.max_output_tokens = 200
+    monkeypatch.setattr(cli, "get_provider_instance", lambda *a, **k: (provider, "local"))
+    monkeypatch.setattr(context, "estimate_tokens", lambda text: 100)
+    monkeypatch.setattr(context, "tools_tokens", lambda tools: 50)
+
+    def cost(message):
+        if message.get("metadata", {}).get("internal"):
+            return 40 if message["role"] == "user" else 10
+        return {"old request": 600, "old answer": 600, "current request": 100}[message["content"]]
+
+    monkeypatch.setattr(context, "message_tokens", cost)
+    agents = []
+
+    def seeded_agent(**kwargs):
+        kwargs["tools"] = []
+        agent = Agent(**kwargs)
+        agent.memory.replace([
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "current request"},
+        ])
+        agents.append(agent)
+        return agent
+
+    monkeypatch.setattr(cli, "Agent", seeded_agent)
+    result = CliRunner().invoke(cli.app, ["repl", "--no-persist"], input="/context\n/exit\n")
+    assert result.exit_code == 0, result.output
+    output = " ".join(result.output.split())
+    # Stored: 100 + 50 + (600 + 600 + 100) + 200 = 1650.
+    # Projected: 100 + 50 + (40 + 10 + 100) + 200 = 500; free = 1000 - 500.
+    assert "Stored demand: ~1650/1000 tokens" in output
+    assert "system ~100, tools ~50, system+tools overhead ~150" in output
+    assert "full stored history ~1300, output reserve ~200" in output
+    assert "Next request projection: ~500/1000 tokens" in output
+    assert "fitted history ~150, including omission note+ack ~50" in output
+    assert "kept 1 turn(s), dropped 1" in output
+    assert "Free for new input: ~500 tokens" in output
+    assert "not tokenizer counts or proof of an actual sent request" in output
+    assert len(agents[0].memory.get()) == 3
+    assert agents[0].last_trim["dropped_messages"] == 0
