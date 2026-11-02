@@ -110,9 +110,76 @@ _USER_INTENT: str = ""
 _REMOVAL_APPROVED: set = set()
 _removal_ask = None  # test hook; defaults to input
 
-_DELETION_INTENT = re.compile(
+_DELETION_VERB = re.compile(
     r"\b(rewrite|re-write|recreate|re-create|overwrite|replace|start over|from scratch|"
     r"redo|scrap|delete|remove|drop|empty|wipe|get rid of|throw away)\b", re.IGNORECASE)
+_WHOLE_FILE_VERB = re.compile(
+    r"\b(rewrite|re-write|recreate|re-create|overwrite|start over|from scratch|redo|scrap|wipe)\b",
+    re.IGNORECASE)
+_PROTECTIVE = re.compile(r"\b(don't|do not|never|keep|preserve|without|avoid|leave)\b", re.IGNORECASE)
+_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`[^`]*`')
+_FILE_REF = re.compile(r"\b[\w.-]+\.\w{1,5}\b")
+_SYMBOL_REF = re.compile(r"\b(?:the\s+)?([A-Za-z_]\w*)\s*(?:\(\s*\)|function|method|class)\b", re.IGNORECASE)
+
+
+def _parse_removal_intent(text: str):
+    """Clause-scoped deletion authority from the user's own instruction.
+
+    Quoted spans (code, error text) are stripped: quoting a deletion is not
+    requesting one. Each clause grants only what it names:
+      - file + no symbols + deletion verb  -> ('file', name): lossy overwrite of that file
+      - symbol(s), no file                 -> ('symbol', name): removing that symbol anywhere
+      - file + symbol(s)                   -> ('filesymbol', file, name): that symbol, that file only
+      - neither + whole-file verb          -> whole: replacing whatever is under discussion
+    A protective clause ('keep add', 'don't delete anything') grants nothing and
+    protects the symbols it names. Returns (grants, protected, whole).
+    """
+    stripped = _QUOTED.sub(" ", text or "")
+    grants, protected = set(), set()
+    whole = False
+    for clause in re.split(r"[!;?\n]|\bthen\b|\bbut\b|,|\.\s+", stripped):
+        cl_files = {f.lower() for f in _FILE_REF.findall(clause)}
+        cl_symbols = {m.lower() for m in _SYMBOL_REF.findall(clause)}
+        if _PROTECTIVE.search(clause):
+            protected |= cl_symbols
+            continue
+        if not _DELETION_VERB.search(clause):
+            continue
+        if cl_files and _WHOLE_FILE_VERB.search(clause):
+            # "rewrite calc.py ... with just a multiply function": symbols name the
+            # new content, not a removal scope - the whole file may be replaced.
+            for f in cl_files:
+                grants.add(("file", f))
+        elif cl_files and cl_symbols:
+            for f in cl_files:
+                for sym in cl_symbols:
+                    grants.add(("filesymbol", f, sym))
+        elif cl_files:
+            for f in cl_files:
+                grants.add(("file", f))
+        elif cl_symbols:
+            for sym in cl_symbols:
+                grants.add(("symbol", sym))
+        elif _WHOLE_FILE_VERB.search(clause):
+            whole = True
+    return grants, protected, whole
+
+
+def _removal_authorized(p: Path, dropped_symbols) -> bool:
+    grants, protected, whole = _parse_removal_intent(_USER_INTENT)
+    lowered = [sym.lower() for sym in (dropped_symbols or [])]
+    if any(sym in protected for sym in lowered):
+        return False
+    name = p.name.lower()
+    if ("file", name) in grants:
+        return True
+    if lowered and all(
+            ("symbol", sym) in grants or ("filesymbol", name, sym) in grants
+            for sym in lowered):
+        return True
+    if whole:
+        return True
+    return False
 
 
 def set_user_intent(text: str) -> None:
@@ -121,13 +188,9 @@ def set_user_intent(text: str) -> None:
     _USER_INTENT = text or ""
 
 
-def user_requests_removal() -> bool:
-    return bool(_DELETION_INTENT.search(_USER_INTENT))
-
-
-def content_removal_approved(p: Path, what: str) -> bool:
-    """Ask the user before an overwrite that deletes existing content. Per-file, this session."""
-    if user_requests_removal():
+def content_removal_approved(p: Path, what: str, dropped_symbols=None) -> bool:
+    """User authority (scoped instruction or an approved prompt) for a lossy overwrite."""
+    if _removal_authorized(p, dropped_symbols or []):
         return True
     key = str(p)
     if key in _REMOVAL_APPROVED:
@@ -304,26 +367,26 @@ def _dropped_python_symbols(old: str, new: str):
     return [n for n in top_level(old_tree) if n not in new_names]
 
 
-def _describe_content_loss(name: str, old: str, new: str) -> str | None:
-    """Describe what an overwrite would silently delete; None when nothing load-bearing is lost."""
+def _describe_content_loss(name: str, old: str, new: str):
+    """(description, dropped_symbols) for what an overwrite would silently delete; (None, []) when safe."""
     if not old.strip():
-        return None
+        return None, []
     if not new.strip():
-        return f"all existing content ({len(old.splitlines())} line(s))"
+        return f"all existing content ({len(old.splitlines())} line(s))", []
     if name.endswith(".py"):
         dropped = _dropped_python_symbols(old, new)
         if dropped:
-            return "top-level definition(s): " + ", ".join(dropped)
+            return "top-level definition(s): " + ", ".join(dropped), dropped
         if dropped is not None:
-            return None
+            return None, []
     old_lines = [l for l in old.splitlines() if l.strip()]
     if len(old_lines) < 3:
-        return None
+        return None, []
     new_lines = {l.strip() for l in new.splitlines() if l.strip()}
     removed = [l for l in old_lines if l.strip() not in new_lines]
     if len(removed) > max(2, len(old_lines) // 2):
-        return f"{len(removed)} of {len(old_lines)} existing line(s)"
-    return None
+        return f"{len(removed)} of {len(old_lines)} existing line(s)", []
+    return None, []
 
 
 def execute_write_file(path: str, content: str) -> str:
@@ -348,8 +411,8 @@ def execute_write_file(path: str, content: str) -> str:
         if p.exists():
             with open(p, "r", encoding="utf-8", errors="replace") as f:
                 old_content = f.read()
-            loss = _describe_content_loss(p.name, old_content, content)
-            if loss and not content_removal_approved(p, loss):
+            loss, dropped = _describe_content_loss(p.name, old_content, content)
+            if loss and not content_removal_approved(p, loss, dropped):
                 return (f"ERROR: This overwrite of '{path}' would delete {loss}. "
                         "The user has not approved removing it. Ask the user to confirm the replacement, "
                         "or use patch_file for a targeted edit that keeps the existing content.")

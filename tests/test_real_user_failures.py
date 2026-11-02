@@ -901,3 +901,50 @@ def test_write_file_new_file_unaffected_by_content_loss_guard(tmp_path):
     from nexus_agent_ai.agent.tools import execute_write_file
     result = execute_write_file(str(tmp_path / "fresh.py"), "def new():\n    return 1\n")
     assert result.startswith("Successfully")
+
+
+@pytest.mark.parametrize("intent,dropped,expected", [
+    # cross-file: deleting temp.txt does not authorize dropping add from calc.py
+    ("delete temp.txt then fix calc.py", ["add"], False),
+    # quoted code/error text is not deletion authority
+    ('apply the comment "remove the helper function"', ["helper"], False),
+    # protective clause: keep add blocks dropping add even in a rewrite
+    ("rewrite calc.py but keep the add function", ["add"], False),
+    ("rewrite calc.py but keep the add function", ["divide"], True),
+    # negated instruction is not authority
+    ("don't delete anything, just fix divide", ["add"], False),
+    # file+symbol pairs bind to that symbol only
+    ("remove the add function from calc.py", ["add"], True),
+    ("remove the add function from calc.py", ["divide"], False),
+    # whole-file and bare rewrite intents authorize replacement
+    ("rewrite calc.py from scratch", ["add"], True),
+    ("rewrite it completely", ["add"], True),
+    # a plain fix request authorizes no removal
+    ("fix the bug in calc.py where divide crashes when b is zero", ["add"], False),
+])
+def test_removal_intent_scope_binding(tmp_path, intent, dropped, expected):
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.set_user_intent(intent)
+    try:
+        assert tools_module._removal_authorized(tmp_path / "calc.py", dropped) is expected
+    finally:
+        tools_module.set_user_intent("")
+
+
+def test_content_removal_consent_denial_and_no_tty_fail_closed(tmp_path, monkeypatch):
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    rewrite = "def multiply(a, b):\n    return a * b\n"
+    # Consent denied at an interactive prompt -> refused, file untouched.
+    monkeypatch.setattr(tools_module, "_removal_ask", lambda prompt: "n")
+    monkeypatch.setattr("nexus_agent_ai.utils.interactive.stdin_is_interactive", lambda: True)
+    result = tools_module.execute_write_file(str(path), rewrite)
+    assert result.startswith("ERROR:") and "not approved" in result
+    assert path.read_text() == CALC_WITH_ADD
+    # No TTY -> cannot ask -> refused.
+    monkeypatch.setattr("nexus_agent_ai.utils.interactive.stdin_is_interactive", lambda: False)
+    result = tools_module.execute_write_file(str(path), rewrite)
+    assert result.startswith("ERROR:")
+    assert path.read_text() == CALC_WITH_ADD
