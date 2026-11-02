@@ -393,9 +393,13 @@ class Agent:
                 )
         self.last_trim = stats
         if stats["dropped_messages"] or stats["truncated_messages"]:
+            before = stats.get("turns_before", 0)
+            after = stats.get("turns_after", 0)
             display.print_warn(
-                f"Context is full: left out {stats['dropped_messages']} older message(s) and cut "
-                f"{stats['truncated_messages']} large item(s) for this request. Use /compact to shrink history."
+                f"Context is full: kept {after} of {before} turn(s) "
+                f"(left out {stats['dropped_messages']} older message(s), cut "
+                f"{stats['truncated_messages']} large item(s), ~{stats['tokens']} tokens preserved) "
+                "for this request. Use /compact to shrink history."
             )
         return fitted
 

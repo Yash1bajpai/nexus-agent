@@ -1,0 +1,64 @@
+name: Windows E2E (real local model)
+
+# Real end-to-end on Windows with the actual LFM2.5-1.2B model: fresh wheel
+# install, natural one-shot prompts, real file/output verification. Not a mock.
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/fresh-install-2026-11-02]
+
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build and install wheel (what a fresh user gets)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m pip install (Get-Item dist\*.whl).FullName
+      - name: Mark initialized (skip interactive wizard in CI)
+        shell: pwsh
+        run: |
+          "Nexus-Agent initialized." | Out-File -Encoding ascii $env:USERPROFILE\.nexus_agent_initialized
+      - name: E2E natural prompts (real model, real effects)
+        shell: pwsh
+        run: |
+          $wd = "$env:RUNNER_TEMP\nexus-e2e"
+          New-Item -ItemType Directory -Force $wd | Out-Null
+          Set-Location $wd
+          $results = @()
+          function Run-Prompt($name, $prompt) {
+            "=== $name : $prompt ===" | Tee-Object -FilePath "$name.out"
+            python -m nexus_agent_ai chat $prompt --persist --session ci *>> "$name.out"
+            $results += "$name exit=$LASTEXITCODE"
+          }
+          Run-Prompt "e01-create" "create a python file calculator.py with a function that adds two numbers"
+          if (-not (Test-Path calculator.py)) { throw "e01: calculator.py not created" }
+          if (-not (Select-String -Path calculator.py -Pattern "def add" -Quiet)) { throw "e01: add() missing" }
+          Run-Prompt "e02-list" "show me the files in this folder"
+          Run-Prompt "e03-path" "give me the full path of that file"
+          Run-Prompt "e04-calc" "calculate 997 * 881"
+          if (-not (Select-String -Path e04-calc.out -Pattern "878,?357" -Quiet)) { throw "e04: wrong arithmetic answer" }
+          Run-Prompt "e05-search" "search the web for the latest llama.cpp release"
+          if (Select-String -Path e05-search.out -Pattern "search_web \[irrelevant\]" -Quiet) { throw "e05: search relevance rejection regressed" }
+          Run-Prompt "e06-mathutils" "create a file math_utils.py with exactly this one-line function: def divide(a, b): return a + b"
+          if (-not (Test-Path math_utils.py)) { throw "e06: math_utils.py not created" }
+          Run-Prompt "e07-bugfix" "divide(10, 2) should give 5 but this code gives 12. find and fix the bug"
+          python -m nexus_agent_ai doctor | Tee-Object doctor.out
+          $results | Tee-Object summary.txt
+      - name: Upload E2E results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-e2e-results
+          path: |
+            C:\Users\RUNNER~1\AppData\Local\Temp\nexus-e2e\*.out
+            C:\Users\RUNNER~1\AppData\Local\Temp\nexus-e2e\*.txt
+            C:\Users\RUNNER~1\AppData\Local\Temp\nexus-e2e\*.py
+          if-no-files-found: warn

@@ -254,3 +254,28 @@ def test_compact_decodes_full_windows_paths_from_structured_arguments():
     compacted, _ = ctx.compact_messages(messages, keep_turns=1)
     assert "Files touched: " + path in compacted[0]["content"]
     assert "Tools used: patch_file" in compacted[0]["content"]
+
+
+def test_meter_over_budget_label():
+    from nexus_agent_ai.agent.context import meter
+    out = meter(4200, 4096)
+    assert "OVER BUDGET" in out
+    assert "4200" in out  # printed counts never clamped
+
+
+def test_meter_normal_has_no_over_budget():
+    from nexus_agent_ai.agent.context import meter
+    out = meter(1000, 4096)
+    assert "OVER BUDGET" not in out
+
+
+def test_fit_messages_records_turns_before_after():
+    from nexus_agent_ai.agent.context import fit_messages
+    msgs = [{"role": "system", "content": "s"}]
+    for i in range(20):
+        msgs.append({"role": "user", "content": "question %d " % i + "x" * 200})
+        msgs.append({"role": "assistant", "content": "answer %d " % i + "y" * 200})
+    fitted, stats = fit_messages(msgs, 500)
+    assert "turns_before" in stats and "turns_after" in stats
+    assert stats["turns_before"] == 20
+    assert stats["turns_after"] < stats["turns_before"]

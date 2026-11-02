@@ -112,6 +112,7 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
     """
     stats = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
     msgs = list(messages)
+    stats["turns_before"] = sum(1 for m in msgs if is_genuine_user_message(m))
     total = history_tokens(msgs)
     if total <= budget_tokens:
         stats["tokens"] = total
@@ -153,6 +154,7 @@ def fit_messages(messages: List[Dict[str, Any]], budget_tokens: int) -> Tuple[Li
             "within the endpoint's documented capacity."
         )
     stats["tokens"] = total
+    stats["turns_after"] = sum(1 for m in msgs if is_genuine_user_message(m))
     return msgs, stats
 
 
@@ -230,7 +232,9 @@ def meter(used_tokens: int, window: Optional[int], breakdown: Optional[Dict[str,
     bar_len = 10
     filled = min(bar_len, pct * bar_len // 100)
     hint = ""
-    if pct >= 85:
+    if pct > 100:
+        hint = "  - OVER BUDGET: demand exceeds the window; run /compact or /clear"
+    elif pct >= 85:
         hint = "  - nearly full, run /compact"
     elif pct >= 70:
         hint = "  - getting full"
