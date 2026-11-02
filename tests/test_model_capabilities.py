@@ -5,6 +5,7 @@ import warnings
 import pytest
 
 from nexus_agent_ai.providers.capabilities import (
+    ContextQualityWarning,
     ModelLimits,
     model_capabilities,
     resolve_limits,
@@ -57,12 +58,11 @@ def test_known_maxima_clamp_each_field_with_visible_warnings(
     with pytest.warns(UserWarning) as caught:
         limits = resolve_limits(provider, model, context + 1, output + 1)
     assert limits == ModelLimits(context, output)
-    assert len(caught) == 2
-    assert "context_size" in str(caught[0].message)
-    assert str(context) in str(caught[0].message)
-    assert "max_output_tokens" in str(caught[1].message)
-    assert str(output) in str(caught[1].message)
-    assert all(model in str(item.message) for item in caught)
+    messages = [str(item.message) for item in caught]
+    assert any("context_size" in message and "clamping" in message and str(context) in message for message in messages)
+    assert any("max_output_tokens" in message and "clamping" in message and str(output) in message for message in messages)
+    assert any(isinstance(item.message, ContextQualityWarning) for item in caught)
+    assert all(model in message for message in messages)
     assert model_capabilities(provider, model) == limits
 
 

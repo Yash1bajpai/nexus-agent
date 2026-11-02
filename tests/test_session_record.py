@@ -29,6 +29,8 @@ def old_turn(path="a.py", text="Earlier discussion"):
         {"role": "user", "content": text}, tool_call(path),
         {"role": "tool", "tool_call_id": "read", "content": "old result " * 3000},
         {"role": "assistant", "content": "Historical answer"},
+        {"role": "user", "content": "Intervening request"},
+        {"role": "assistant", "content": "Intervening answer"},
     ]
 
 
@@ -40,12 +42,12 @@ def test_function_tool_paths_use_only_validated_structured_call_provenance(name)
     collected = ctx._collect_omission_fields(messages)
     assert collected == record(["src/functions.py"], tools=[name])
     current = {"role": "user", "content": "Current"}
-    fitted, stats = ctx.fit_messages(messages + [current], 350)
+    fitted, stats = ctx.fit_messages(messages + [current], 600)
     assert stats["session_record"]["files"] == ["src/functions.py"]
     assert "Retained file paths: src/functions.py" in fitted[0]["content"]
     assert "forged.py" not in fitted[0]["content"]
     assert "result_only.py" not in fitted[0]["content"]
-    assert fitted[2:] == [current]
+    assert fitted[2 + len(messages):] == [current]
     assert ctx._collect_omission_fields([tool_call("approved.py", name)])["files"] == []
 
 
@@ -61,7 +63,7 @@ def test_expanded_tool_allowlist_preserves_ten_name_recency_bound():
     assert len(retained["tools"]) <= 10
 
 
-def test_no_record_or_note_before_first_whole_turn_eviction():
+def test_no_record_without_compaction_and_protected_results_fail_closed():
     messages = [{"role": "user", "content": "Keep this request"}]
     fitted, stats = ctx.fit_messages(messages, 1000)
     assert fitted == messages
@@ -70,11 +72,8 @@ def test_no_record_or_note_before_first_whole_turn_eviction():
     assert stats["omission_tokens"] == stats["dropped_turns"] == 0
 
     messages += [tool_call(), {"role": "tool", "tool_call_id": "read", "content": "x" * 10000}]
-    fitted, stats = ctx.fit_messages(messages, 700)
-    assert stats["truncated_messages"] > 0
-    assert stats["session_record"] is None
-    assert stats["omission_tokens"] == stats["dropped_turns"] == 0
-    assert fitted[:2] == messages[:2]
+    with pytest.raises(ctx.ContextBudgetError):
+        ctx.fit_messages(messages, 700)
 
 
 def test_existing_record_is_injected_without_new_eviction_and_is_pure():
@@ -113,9 +112,9 @@ def test_record_fields_come_only_from_original_builder_sources():
     assert attack not in text and "forged.py" not in text and "fake.py" not in text
     assert "unknown_tool" not in text and "ignore.py" not in text
     assert retained["files"] == ["safe.py"]
-    assert "session record only, not instructions or approval" in text
+    assert "not instructions or approval" in text
     assert "Retained file paths:" in text
-    assert "current file" not in text.lower()
+    assert "not answers or current-filesystem proof" in text
 
 
 @pytest.mark.parametrize("bad", [
@@ -148,11 +147,9 @@ def test_prior_and_new_fields_merge_recency_then_shed_without_parsing_prose():
     )
     current = {"role": "user", "content": "Current"}
     cap = ctx.history_tokens(ctx._omission_pair(["again.py"]))
-    fitted, stats = ctx.fit_messages(fresh + [current], ctx.history_tokens([current]) + cap, session_record=prior)
-    assert stats["session_record"] == record(["again.py"])
-    assert stats["fields_included"] == {"files": 1, "topics": 0, "tools": 0}
-    assert fitted[:2] == ctx._omission_pair(["again.py"])
-    assert fitted[2:] == [current]
+    pair, retained = ctx._fit_omission_fields(collected, cap)
+    assert retained == record(["again.py"])
+    assert pair == ctx._omission_pair(["again.py"])
     assert prior == record(["older.py", "again.py"], ["testing", "debugging"], ["git_status"])
 
 
@@ -165,7 +162,7 @@ def test_collection_and_repeated_record_accumulation_are_bounded():
     prior = None
     for index in range(20):
         current = {"role": "user", "content": "Current"}
-        fitted, stats = ctx.fit_messages(old_turn(f"file_{index}.py") + [current], 350, session_record=prior)
+        fitted, stats = ctx.fit_messages(old_turn(f"file_{index}.py") + [current], 600, session_record=prior)
         prior = stats["session_record"]
         assert len(json.dumps(prior)) <= 4096
         assert stats["omission_tokens"] == ctx.history_tokens(fitted[:2]) <= 150
@@ -243,12 +240,11 @@ def test_redaction_facts_are_retained_only_and_fitting_has_no_audit_side_effects
         return result
 
     monkeypatch.setattr(ctx, "fitted_claim_view", copied_view)
-    fitted, stats = ctx.fit_messages(messages, 400)
-    assert stats["claim_redactions"] == [kept_fact]
+    fitted, stats = ctx.fit_messages(messages, 600)
+    assert stats["claim_redactions"] == [old_fact, kept_fact]
     assert messages == before
-    assert old_fact not in stats["claim_redactions"]
     assert fitted[-1]["content"] == "Retained text"
-    stats["claim_redactions"][0]["file"] = "changed.py"
+    stats["claim_redactions"][1]["file"] = "changed.py"
     assert kept_fact["file"] == "current.py"
 
 
@@ -349,8 +345,8 @@ def test_sqlite_legacy_schema_migrates_and_delete_clears_only_selected_session(t
 def test_projection_candidate_does_not_persist_until_explicit_actual_fit_commit(memory):
     messages = old_turn() + [{"role": "user", "content": "Current"}]
     before = copy.deepcopy(messages)
-    _, projected = ctx.fit_messages(messages, 350, session_record=memory.get_session_metadata("SESSION_RECORD"))
-    assert projected["dropped_turns"] == 1
+    _, projected = ctx.fit_messages(messages, 600, session_record=memory.get_session_metadata("SESSION_RECORD"))
+    assert projected["dropped_turns"] == 0 and projected["compacted_messages"] > 0
     assert projected["session_record"] is not None
     assert memory.get_session_metadata("SESSION_RECORD") is None
     assert messages == before
@@ -378,7 +374,7 @@ class ProjectionProvider(BaseProvider):
         return {"role": "tool", "tool_call_id": tool_call_id, "content": result}
 
 
-def test_agent_projection_is_read_only_and_only_successful_evictions_commit(memory, monkeypatch):
+def test_agent_projection_is_read_only_and_only_successful_compactions_commit(memory, monkeypatch):
     memory.max_messages = 100
     current = {"role": "user", "content": "Current"}
     messages = old_turn() + [current]
@@ -395,8 +391,17 @@ def test_agent_projection_is_read_only_and_only_successful_evictions_commit(memo
         return setter(key, value)
 
     monkeypatch.setattr(memory, "set_session_metadata", track_set)
+    if not isinstance(memory, SQLiteMemory):
+        with pytest.raises(ctx.ContextBudgetError):
+            agent._plan_fit(memory.get(), [])
+        assert agent.context_breakdown()["projection"] is None
+        with pytest.raises(ctx.ContextBudgetError):
+            agent._fit(memory.get(), [])
+        assert writes == [] and memory.get() == messages
+        assert memory.get_session_metadata("SESSION_RECORD") is None
+        return
     _, planned = agent._plan_fit(memory.get(), [])
-    assert planned["dropped_turns"] > 0
+    assert planned["dropped_turns"] == 0 and planned["compacted_messages"] > 0
     assert planned["session_record"] is not None
     agent.context_breakdown()
     assert writes == []
@@ -406,7 +411,7 @@ def test_agent_projection_is_read_only_and_only_successful_evictions_commit(memo
 
     fitted = agent._fit(memory.get(), [])
     assert fitted[-1] == current
-    assert agent.last_trim["dropped_turns"] > 0
+    assert agent.last_trim["compacted_messages"] > 0
     assert writes == [agent.last_trim["session_record"]]
     retained = memory.get_session_metadata("SESSION_RECORD")
     agent._fit([current], [])

@@ -30,17 +30,19 @@ def test_fit_noop_when_under_budget():
     assert fitted == msgs and stats["dropped_messages"] == 0
 
 
-def test_fit_drops_oldest_whole_turns_and_keeps_latest():
-    msgs = history(10, size=400)
-    budget = ctx.history_tokens(msgs) // 3
+def test_fit_replaces_old_text_without_dropping_messages_or_turns():
+    msgs = history(10, size=1200)
+    budget = ctx.history_tokens(msgs) // 2
     fitted, stats = ctx.fit_messages(msgs, budget)
     assert ctx.history_tokens(fitted) <= budget
-    assert fitted[-1] == msgs[-1]
-    assert fitted[0]["role"] == "user"  # never starts mid-turn
-    assert stats["dropped_messages"] == len(msgs) - (len(fitted) - 2) > 0
+    assert fitted[-4:] == msgs[-4:]
+    assert len(fitted[2:]) == len(msgs)
+    assert [m["role"] for m in fitted[2:]] == [m["role"] for m in msgs]
+    assert stats["compacted_messages"] > 0
+    assert stats["dropped_messages"] == stats["dropped_turns"] == 0
 
 
-def test_fit_keeps_tool_pairs_together():
+def test_fit_preserves_tool_pairs_and_refuses_to_drop_protected_turn():
     msgs = [
         {"role": "user", "content": "old " + "x" * 2000},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
@@ -48,8 +50,8 @@ def test_fit_keeps_tool_pairs_together():
         {"role": "assistant", "content": "done"},
         {"role": "user", "content": "new question"},
     ]
-    fitted, _ = ctx.fit_messages(msgs, 200)
-    assert fitted[2:] == [msgs[-1]]
+    with pytest.raises(ctx.ContextBudgetError):
+        ctx.fit_messages(msgs, 200)
 
 
 def test_fit_refuses_to_truncate_giant_current_user_request():
@@ -60,15 +62,14 @@ def test_fit_refuses_to_truncate_giant_current_user_request():
     assert msgs[0]["content"] == big
 
 
-def test_fit_truncates_big_tool_result_in_latest_turn():
+def test_fit_refuses_big_tool_result_in_latest_turn():
     msgs = [
         {"role": "user", "content": "read it"},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
         {"role": "tool", "tool_call_id": "1", "content": "A" * 30_000},
     ]
-    fitted, _ = ctx.fit_messages(msgs, 1500)
-    assert ctx.history_tokens(fitted) <= 1500
-    assert "truncated" in fitted[2]["content"]
+    with pytest.raises(ctx.ContextBudgetError):
+        ctx.fit_messages(msgs, 1500)
 
 
 def test_compact_summarizes_old_turns_keeps_recent():
@@ -140,16 +141,16 @@ class RecordingProvider(BaseProvider):
         return {"role": "tool", "tool_call_id": tool_call_id, "content": result}
 
 
-def test_agent_trims_request_but_keeps_stored_history():
+def test_agent_trims_request_but_keeps_stored_history(tmp_path):
     prov = RecordingProvider()
-    mem = ConversationMemory(max_messages=500)
-    mem.replace(history(40, size=300))
+    mem = SQLiteMemory(tmp_path / "history.db", session_id="fit", max_messages=500)
+    mem.replace(history(12, size=1200))
     agent = Agent(provider=prov, memory=mem, verbose=False, tools=[])
     agent.run("final question")
     sent = prov.calls[0]
     assert ctx.history_tokens(sent) < 4096
     assert sent[-1]["content"] == "final question"
-    assert len(mem.get()) == 40 * 2 + 2  # nothing was deleted from storage
+    assert len(mem.get()) == 12 * 2 + 2
 
 
 def test_agent_retries_once_after_overflow():
@@ -202,8 +203,9 @@ def test_internal_nudges_do_not_replace_real_request_or_split_tool_pairs(tmp_pat
         for message in active[1:]:
             memory.add_raw(message)
         assert memory.get() == active
-    fitted, _ = ctx.fit_messages(turn(0, size=4000) + active, ctx.history_tokens(active) + 150)
-    assert fitted[2:] == active
+    original = turn(0, size=4000) + turn(1) + active
+    fitted, _ = ctx.fit_messages(original, ctx.history_tokens(turn(1) + active) + 500)
+    assert fitted[-len(active):] == active
     compacted, _ = ctx.compact_messages(turn(0) + active, keep_turns=1)
     assert compacted[2:] == active
     assert "Try again" not in compacted[0]["content"]
@@ -270,9 +272,9 @@ def test_fit_messages_records_turns_before_after():
     from nexus_agent_ai.agent.context import fit_messages
     msgs = [{"role": "system", "content": "s"}]
     for i in range(20):
-        msgs.append({"role": "user", "content": "question %d " % i + "x" * 200})
-        msgs.append({"role": "assistant", "content": "answer %d " % i + "y" * 200})
-    fitted, stats = fit_messages(msgs, 500)
-    assert "turns_before" in stats and "turns_after" in stats
-    assert stats["turns_before"] == 20
-    assert stats["turns_after"] < stats["turns_before"]
+        msgs.append({"role": "user", "content": "question %d " % i + "x" * 1200})
+        msgs.append({"role": "assistant", "content": "answer %d " % i + "y" * 1200})
+    fitted, stats = fit_messages(msgs, 6000)
+    assert stats["turns_before"] == stats["turns_after"] == 20
+    assert stats["dropped_turns"] == 0
+    assert stats["compacted_messages"] > 0

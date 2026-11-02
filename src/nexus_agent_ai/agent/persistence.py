@@ -1,3 +1,5 @@
+import hashlib
+import re
 import json
 import sqlite3
 from contextlib import closing
@@ -60,6 +62,23 @@ class SQLiteMemory:
         )
     """
 
+    _ARTIFACT_SCHEMA_SQL = """
+        CREATE TABLE IF NOT EXISTS context_artifacts (
+            artifact_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            byte_len INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (session_id, artifact_id)
+        )
+    """
+    ARTIFACT_MAX_BYTES = 256 * 1024
+    HISTORY_SCAN_ROWS = 500
+    HISTORY_SCAN_BYTES = 2 * 1024 * 1024
+    HISTORY_ROW_BYTES = 512 * 1024
+    HISTORY_EXCERPT_CHARS = 2000
+
     def _init_db(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             self._ensure_schema(conn)
@@ -70,6 +89,7 @@ class SQLiteMemory:
         # existing db file without the table, so never assume it is there.
         conn.execute(cls._SCHEMA_SQL)
         conn.execute(cls._METADATA_SCHEMA_SQL)
+        conn.execute(cls._ARTIFACT_SCHEMA_SQL)
 
     def add(self, role: str, content: str):
         self.add_raw({"role": role, "content": content})
@@ -147,10 +167,162 @@ class SQLiteMemory:
                 (self.session_id, key, SESSION_METADATA_VERSION, encoded),
             )
 
+    def store_artifacts(self, plans):
+        """Atomically retain all pure fitter plans, or raise without changing state.
+
+        Plans have exactly artifact_id/tool_name/byte_len/content; byte_len is
+        the original string's UTF-8 length. IDs hash tool_name + NUL + content.
+        The 256KiB per-session cap counts payload bytes. Existing artifacts are
+        evicted by created_at, then rowid, oldest first; artifacts referenced by
+        this batch are never evicted. An oversized batch fails closed.
+        """
+        if not isinstance(plans, list):
+            raise ValueError("Artifact plans must be a list.")
+        retained = {}
+        for plan in plans:
+            if not isinstance(plan, dict) or set(plan) != {"artifact_id", "tool_name", "byte_len", "content"}:
+                raise ValueError("Invalid artifact plan fields.")
+            content, name = plan["content"], plan["tool_name"]
+            if not isinstance(content, str) or not isinstance(name, str):
+                raise ValueError("Artifact content and tool name must be text.")
+            size = len(content.encode("utf-8"))
+            identity = hashlib.sha256((name + "\0" + content).encode("utf-8")).hexdigest()
+            if (type(plan["byte_len"]) is not int or plan["byte_len"] != size
+                    or plan["artifact_id"] != identity):
+                raise ValueError("Artifact identity or UTF-8 byte length mismatch.")
+            retained[identity] = plan
+        if sum(plan["byte_len"] for plan in retained.values()) > self.ARTIFACT_MAX_BYTES:
+            raise ValueError("Artifact batch exceeds the 256KiB session cap.")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for identity, plan in retained.items():
+                conn.execute(
+                    "INSERT INTO context_artifacts (artifact_id, session_id, tool_name, byte_len, content) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, artifact_id) DO NOTHING",
+                    (identity, self.session_id, plan["tool_name"], plan["byte_len"], plan["content"]),
+                )
+                actual = conn.execute(
+                    "SELECT tool_name, byte_len, content FROM context_artifacts WHERE session_id = ? AND artifact_id = ?",
+                    (self.session_id, identity),
+                ).fetchone()
+                if actual != (plan["tool_name"], plan["byte_len"], plan["content"]):
+                    raise ValueError("Artifact identity collision or corrupt retained content.")
+            rows = conn.execute(
+                "SELECT artifact_id, byte_len FROM context_artifacts WHERE session_id = ? "
+                "ORDER BY created_at ASC, rowid ASC", (self.session_id,),
+            ).fetchall()
+            total = sum(row[1] for row in rows)
+            for identity, size in rows:
+                if total <= self.ARTIFACT_MAX_BYTES:
+                    break
+                if identity not in retained:
+                    conn.execute("DELETE FROM context_artifacts WHERE session_id = ? AND artifact_id = ?",
+                                 (self.session_id, identity))
+                    total -= size
+            if total > self.ARTIFACT_MAX_BYTES:
+                raise ValueError("Artifact retention cap cannot retain this batch.")
+        return list(retained)
+
+    def history_entries(self, query, limit=5):
+        """SELECT-only same-session canonical excerpts, never normalize audit rows.
+
+        A literal case-insensitive substring ranks above all-keyword matches;
+        each group is newest first. Empty query means recency. Scan at most 500
+        recent rows / 2MiB, reject rows above 512KiB, return <=10 exact contiguous
+        <=2000-character excerpts. Structured call paths, never result prose,
+        supply provenance for the caller's current workspace/sensitive guards.
+        """
+        if not isinstance(query, str) or len(query) > 256:
+            raise ValueError("History query must be text of at most 256 characters.")
+        if type(limit) is not int or not 1 <= limit <= 10:
+            raise ValueError("History limit must be between 1 and 10.")
+        with closing(sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            cursor = conn.execute(
+                "SELECT id, timestamp, role, message_json FROM "
+                "(SELECT id, timestamp, role, message_json FROM conversation_history "
+                "WHERE session_id = ? ORDER BY id DESC LIMIT ?) "
+                "WHERE length(CAST(message_json AS BLOB)) <= ? ORDER BY id DESC",
+                (self.session_id, self.HISTORY_SCAN_ROWS, self.HISTORY_ROW_BYTES),
+            )
+            rows, scanned = [], 0
+            for row in cursor:
+                scanned += len(row[3].encode("utf-8"))
+                if scanned > self.HISTORY_SCAN_BYTES:
+                    break
+                rows.append(row)
+        calls, candidates = {}, []
+        query = query if query.strip() else ""
+        words = re.findall(r"\w+", query)
+        for entry_id, timestamp, role, raw in reversed(rows):
+            try:
+                message = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if (not isinstance(message, dict) or role not in ("user", "assistant", "tool")
+                    or message.get("role") != role):
+                continue
+            metadata = message.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            if role == "user" and not metadata.get("internal"):
+                calls.clear()
+            if role == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
+                        continue
+                    function = call["function"]
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except (ValueError, TypeError):
+                            arguments = {}
+                    paths = [arguments[key] for key in ("path", "file_path", "filepath", "filename")
+                             if isinstance(arguments, dict) and isinstance(arguments.get(key), str) and arguments[key]]
+                    calls[call.get("id")] = paths
+            if metadata.get("internal") or metadata.get("outcome_correction"):
+                continue
+            text = message.get("content")
+            if not isinstance(text, str) or not text:
+                continue
+            paths = calls.get(message.get("tool_call_id"), []) if role == "tool" else []
+            attachment = (any(key in metadata for key in ("attachments", "files", "file_path", "path"))
+                          or "[Context attached from @" in text)
+            kind = "tool_result" if role == "tool" or attachment else "conversation"
+            known = bool(paths) if kind == "tool_result" else True
+            match = re.search(re.escape(query), text, re.IGNORECASE) if query else None
+            # The historical index carries paths, while read_file returns raw
+            # content without a path header. Search trusted call provenance too.
+            path_text = "\n".join(paths)
+            path_match = re.search(re.escape(query), path_text, re.IGNORECASE) if query and paths else None
+            if query and match is None and path_match is None:
+                search_text = text + "\n" + path_text
+                matches = [re.search(re.escape(word), search_text, re.IGNORECASE) for word in words]
+                if not matches or not all(matches):
+                    continue
+                position, rank = 0, 1
+                for word in words:
+                    content_match = re.search(re.escape(word), text, re.IGNORECASE)
+                    if content_match:
+                        position = content_match.start()
+                        break
+            else:
+                position, rank = (match.start() if match else 0), 2
+            start = max(0, position - 200)
+            candidates.append((rank, entry_id, {
+                "entry_id": entry_id, "timestamp": timestamp, "role": role,
+                "content": text[start:start + self.HISTORY_EXCERPT_CHARS],
+                "truncated": start > 0 or start + self.HISTORY_EXCERPT_CHARS < len(text),
+                "paths": list(paths), "content_kind": kind, "provenance_known": known,
+            }))
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in candidates[:limit]]
+
     def clear(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (self.session_id,))
             conn.execute("DELETE FROM session_metadata WHERE session_id = ?", (self.session_id,))
+            conn.execute("DELETE FROM context_artifacts WHERE session_id = ?", (self.session_id,))
 
     @classmethod
     def list_sessions(cls, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -178,3 +350,4 @@ class SQLiteMemory:
             cls._ensure_schema(conn)
             conn.execute("DELETE FROM conversation_history WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_metadata WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM context_artifacts WHERE session_id = ?", (session_id,))

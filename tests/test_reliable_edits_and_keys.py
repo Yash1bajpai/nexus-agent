@@ -275,7 +275,6 @@ def test_recovered_error_is_not_reported_as_failure(tmp_path, monkeypatch):
     (tmp_path / "f.txt").write_text("alpha")
     prov = Scripted([
         ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}),  # refused: unread
-        ("read_file", {"path": "f.txt"}),
         ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}),
         None,
     ])
@@ -292,7 +291,7 @@ def test_unfixed_error_stays_and_chat_exits_nonzero(tmp_path, monkeypatch):
     prov = Scripted([("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}), None])
     agent = Agent(prov, verbose=False)
     out = agent.run("fix f.txt")
-    assert agent.unresolved_errors and "Tool errors occurred" in out
+    assert agent.unresolved_errors and agent.edit_not_applied
 
     T.reset_file_tracking()
     monkeypatch.setattr("nexus_agent_ai.cli.onboarding.run_if_first_time", lambda: None)
@@ -376,7 +375,7 @@ def test_reading_a_file_does_not_clear_a_failed_edit(tmp_path, monkeypatch):
     ])
     agent = Agent(prov, verbose=False)
     out = agent.run("fix f.txt")
-    assert agent.unresolved_errors and "Tool errors occurred" in out
+    assert agent.unresolved_errors and agent.edit_not_applied
     assert (tmp_path / "f.txt").read_text() == "alpha"
 
 
@@ -552,15 +551,14 @@ def test_chat_exits_1_when_edit_requested_and_nothing_changed(tmp_path, monkeypa
 
 
 def test_reread_after_a_successful_edit_and_a_failed_patch_is_not_a_loop(tmp_path, monkeypatch):
-    """Transcript from the 2.6B diagnostic (sub.py): read, read again, patch ok, read, failed patch, read again.
-    The last read is needed to recover and must not be treated as a repeat of the reads made before the edit."""
+    """The recovery reuses the fresh read after a successful edit, not a duplicate
+    model reread, and accepts one corrected patch against that snapshot."""
     monkeypatch.setenv("NEXUS_AGENT_AUTO_ATTACH", "0")
     (tmp_path / "f.txt").write_text("alpha")
     prov = Scripted([("read_file", {"path": "f.txt"}), ("read_file", {"path": "f.txt"}),
                      ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "gamma"}),
                      ("read_file", {"path": "f.txt"}),
                      ("patch_file", {"path": "f.txt", "target": "alpha", "replacement": "beta"}),  # stale target: fails
-                     ("read_file", {"path": "f.txt"}),
                      ("patch_file", {"path": "f.txt", "target": "gamma", "replacement": "beta"}), None])
     Agent(prov, verbose=False).run("fix f.txt")
     assert (tmp_path / "f.txt").read_text() == "beta"

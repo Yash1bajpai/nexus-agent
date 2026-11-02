@@ -69,7 +69,12 @@ def test_typed_refusal_matrix_controls_offering_and_dispatch_only_by_class(tmp_p
     monkeypatch.setattr(core, "execute_tool", execute)
     provider = Transcript([
         (edit_tool, {"path": "f.py", "function_name": "f", "new_body": "def f():\n    return 2\n"}),
-        ("run_code", {"code": "print(42)"}), "No changes were made.",
+        ProviderResponse(tool_calls=[
+            ToolCall("code", "run_code", {"code": "print(42)"}),
+            ToolCall("corrected", edit_tool, {
+                "path": "f.py", "function_name": "f", "new_body": "def f():\n    return 2\n",
+            }),
+        ]), "No changes were made.",
     ])
     events = []
     agent = Agent(provider, verbose=False, event_callback=events.append)
@@ -253,9 +258,11 @@ def test_session_record_actual_fit_audits_but_projection_is_pure(tmp_path):
         }]},
         {"role": "tool", "tool_call_id": "edit", "content": "old output " * 2000},
         {"role": "assistant", "content": "Earlier discussion"},
+        {"role": "user", "content": "Intervening request"},
+        {"role": "assistant", "content": "Intervening answer"},
         {"role": "user", "content": "Exact current request\n café  "},
     ]
-    memory = ConversationMemory(max_messages=100)
+    memory = SQLiteMemory(tmp_path / "history.db", session_id="actual-fit", max_messages=100)
     memory.replace(messages)
     audit = copy.deepcopy(memory.get())
     provider = Transcript([])

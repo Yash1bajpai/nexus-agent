@@ -226,7 +226,7 @@ def test_nonzero_code_execution_is_typed_without_changing_output_contract(monkey
     assert result == "STDERR:\nobserved failure"
 
 
-def test_nonzero_test_execution_is_typed_without_changing_output_contract(monkeypatch):
+def test_nonzero_test_execution_is_typed_with_separate_observed_streams(monkeypatch):
     import importlib.util
     from nexus_agent_ai.agent import consent
     monkeypatch.setattr(consent, "execution_allowed", lambda: (True, ""))
@@ -234,4 +234,8 @@ def test_nonzero_test_execution_is_typed_without_changing_output_contract(monkey
     monkeypatch.setattr(T.subprocess, "run",
                         lambda *a, **kw: SimpleNamespace(returncode=1, stdout="observed failure", stderr=""))
     result = check(T.execute_run_tests(), R.OTHER)
-    assert result == "=== Pytest Results: FAILED (exit code 1) ===\nobserved failure"
+    assert result == (
+        "=== Pytest Results: FAILED (exit code 1) ===\n"
+        "--- stdout tail (16/16 characters) ---\nobserved failure\n--- end stdout tail ---\n"
+        "--- stderr tail (0/0 characters) ---\n\n--- end stderr tail ---"
+    )

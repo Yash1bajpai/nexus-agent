@@ -9,7 +9,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from .base import BaseProvider, ProviderResponse, Tool
-from .capabilities import resolve_limits
+from .capabilities import ContextCapabilities, resolve_context_capabilities, resolve_limits, warn_context_quality
 from .messages import assistant_message, decode_native_tool_call, extract_json_tool_calls, openai_messages, tool_result
 
 # llama-server binary URLs per platform (llama.cpp b7075 release)
@@ -182,6 +182,25 @@ class LocalProvider(BaseProvider):
         self._server_log_path = None
         self._server_model_path = None
         self._server_context_size = None
+        self._model_context_metadata = {}
+        self._context_overridden = context_size is not None or "NEXUS_CONTEXT_SIZE" in os.environ
+
+    @property
+    def context_capabilities(self) -> ContextCapabilities:
+        """Current advisory registry, using loaded metadata without any I/O."""
+        return resolve_context_capabilities(
+            "local", self.model_id, metadata=self._model_context_metadata, local=True,
+        )
+
+    def _record_context_metadata(self, metadata) -> None:
+        """Consume information from the engine's existing load/identity path."""
+        if not isinstance(metadata, dict):
+            return
+        previous = self.context_capabilities
+        self._model_context_metadata = dict(metadata)
+        current = self.context_capabilities
+        if self._context_overridden and current.safe_context != previous.safe_context:
+            warn_context_quality("local", self.model_id, self.context_size, current)
 
     def setup_model(self, verify_download: bool = False) -> str:
         if self._model_path is not None and not verify_download:
@@ -227,6 +246,11 @@ class LocalProvider(BaseProvider):
                 self._model_instance = AutoModelForCausalLM.from_pretrained(
                     self.model_id, gguf_file=self.filename, device_map="auto", trust_remote_code=True
                 )
+                config = getattr(self._model_instance, "config", None)
+                self._record_context_metadata({
+                    key: getattr(config, key, None)
+                    for key in ("safe_context", "max_context", "max_position_embeddings", "kv_warn_bytes")
+                })
                 return
         except ImportError:
             pass
@@ -242,6 +266,7 @@ class LocalProvider(BaseProvider):
                     n_threads=4,
                     verbose=False,
                 )
+                self._record_context_metadata(getattr(self._llama, "metadata", None))
                 print("✅ Liquid LFM engine loaded on CPU!")
                 return
         except ImportError:
@@ -490,7 +515,13 @@ class LocalProvider(BaseProvider):
                     return False
             with urllib.request.urlopen(base + "/v1/models", timeout=2.0) as resp:
                 models = json.loads(resp.read()).get("data", [])
-            return any(model.get("id") == self._server_alias for model in models)
+            for model in models:
+                if model.get("id") == self._server_alias:
+                    # llama-server exposes n_ctx_train under meta on versions
+                    # that report it. Reuse this identity response, never /props.
+                    self._record_context_metadata(model.get("meta", {}))
+                    return True
+            return False
         except Exception:
             return False
 

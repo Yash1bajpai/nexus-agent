@@ -11,6 +11,7 @@ import pytest
 from nexus_agent_ai.agent import context, core
 from nexus_agent_ai.agent.core import Agent
 from nexus_agent_ai.agent.memory import ConversationMemory
+from nexus_agent_ai.agent.persistence import SQLiteMemory
 from nexus_agent_ai.providers.anthropic_provider import AnthropicProvider
 from nexus_agent_ai.providers.base import Tool
 from nexus_agent_ai.providers.gemini_provider import GeminiProvider
@@ -123,22 +124,22 @@ def test_nondefault_cloud_cap_stops_entire_native_batch_before_dispatch(monkeypa
 
 @pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
 @pytest.mark.parametrize("stream", [False, True])
-def test_cloud_context_fits_full_input_plus_actual_output_cap(monkeypatch, kind, stream):
+def test_cloud_context_fits_full_input_plus_actual_output_cap(monkeypatch, tmp_path, kind, stream):
     sent_sizes = []
     for cap in (512, 4096):
         provider, requests = cloud(monkeypatch, kind, context_size=8192, max_output_tokens=cap)
-        memory = ConversationMemory(max_messages=500)
+        memory = SQLiteMemory(tmp_path / f"history-{cap}.db", session_id="cloud", max_messages=500)
         memory.replace([{"role": role, "content": f"old {index} " + "x" * 600}
-                        for index in range(50) for role in ("user", "assistant")])
+                        for index in range(20) for role in ("user", "assistant")])
         agent = Agent(provider, memory=memory, tools=[], verbose=False)
         agent.system = "Short test instructions."
         assert agent.run("explain this", stream=stream) == "ok"
         sent = sent_messages(kind, requests[0])
         assert sent[-1]["content"] == "explain this"
         assert context.history_tokens(sent) + context.estimate_tokens(agent.system) + cap <= 8192
-        assert len(memory.get()) == 102
+        assert len(memory.get()) == 42
         assert (agent.total_input_tokens, agent.total_output_tokens) == (7, 5)
-        sent_sizes.append(len(sent))
+        sent_sizes.append(context.history_tokens(sent))
     assert sent_sizes[0] > sent_sizes[1]
 
 

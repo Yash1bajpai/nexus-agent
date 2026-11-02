@@ -173,7 +173,6 @@ def test_failed_patch_and_reread_do_not_become_edit_or_test_success(tmp_path, mo
     agent = Agent(Transcript([
         ("read_file", {"path": "test_calc.py"}),
         ("patch_file", {"path": "test_calc.py", "target": "def missing(a, b):\n    return a - b", "replacement": "def add(a, b):\n    return a + b"}),
-        ("read_file", {"path": "test_calc.py"}),
         "The function has been updated. All tests pass.",
     ]), max_iterations=4, verbose=False, event_callback=events.append)
     agent.run("There is a bug in test_calc.py in this folder. Read the file, fix the add function without changing the test, and run the tests to verify.")

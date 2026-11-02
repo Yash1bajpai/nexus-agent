@@ -43,7 +43,7 @@ def is_genuine_user_message(msg: Dict[str, Any]) -> bool:
     parts = msg.get("parts")
     if isinstance(parts, list):
         for p in parts:
-            if isinstance(p, dict) and "function_response" in p:
+            if isinstance(p, dict) and ("function_response" in p or "functionResponse" in p):
                 return False
     # Anthropic: content is a list of blocks with type='tool_result'
     content = msg.get("content")

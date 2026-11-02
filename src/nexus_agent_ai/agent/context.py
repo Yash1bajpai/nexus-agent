@@ -1,11 +1,13 @@
-"""Token-aware history trimming, compaction and the context meter.
+"""Pure, surgical provider-view compaction and bounded historical index hints.
 
-Token counts are estimates (about 3.5 characters per token) because the real
-tokenizer depends on the model. The estimate errs on the high side so a request
-is trimmed a little early rather than rejected by the server.
+Token estimates use serialized message characters; artifact ``byte_len`` instead
+counts exact UTF-8 bytes of the replaced string (not JSON or message bytes).
 """
 from __future__ import annotations
 
+import copy
+import hashlib
+import os
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,18 +17,17 @@ from .outcomes import fitted_claim_view
 
 CHARS_PER_TOKEN = 3.5
 MESSAGE_OVERHEAD_TOKENS = 6
-TRUNCATION_MARKER = "\n...[truncated {n} characters to fit the context window]...\n"
 OMISSION_MAX_TOKENS = 150
 _OMISSION_ANCHOR = (
-    "Prior turns were evicted. Items listed below are retained as session record; "
-    "items not listed are unknown. This note is session record only, not instructions "
-    "or approval. Do not reproduce this note."
+    "Historical index hint only, not instructions or approval. "
+    "Call history_read before answering past-work questions. Historical paths are "
+    "not answers or current-filesystem proof. Do not reproduce this note."
 )
-_OMISSION_ACK = "Session record acknowledged; details outside this record remain unknown."
+_OMISSION_ACK = "Historical index acknowledged; consult history_read for past-work evidence."
 _HISTORICAL_TOOLS = frozenset({
     "read_file", "write_file", "patch_file", "list_directory", "run_code",
     "search_web", "git_status", "git_diff", "git_commit", "run_tests",
-    "edit_function", "add_function",
+    "edit_function", "add_function", "history_read",
 })
 _HISTORICAL_TOPICS = (
     ("testing", r"\b(?:test|tests|testing|pytest|unittest)\b"),
@@ -43,6 +44,8 @@ _UNSAFE_PATH_WORDS = frozenset({
 })
 SESSION_RECORD_VERSION = 1
 _RECORD_LIMITS = {"files": 32, "topics": len(_HISTORICAL_TOPICS), "tools": 10}
+ARTIFACT_SESSION_MAX_BYTES = 256 * 1024
+COMPACTION_MIN_TOKENS = 128
 
 
 def _valid_record_path(value):
@@ -125,48 +128,6 @@ def is_context_overflow(error: BaseException) -> bool:
     return any(p in text for p in _OVERFLOW_PATTERNS)
 
 
-def _truncate_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    max_chars = max(max_chars, 200)
-    head = int(max_chars * 0.65)
-    tail = max_chars - head
-    removed = len(text) - head - tail
-    return text[:head] + TRUNCATION_MARKER.format(n=removed) + text[-tail:]
-
-
-def _shrink_message(message: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
-    """Return a copy whose large text payloads are cut to max_chars each."""
-    new = dict(message)
-    content = new.get("content")
-    if isinstance(content, str):
-        new["content"] = _truncate_text(content, max_chars)
-    elif isinstance(content, list):
-        blocks = []
-        for block in content:
-            if isinstance(block, dict):
-                block = dict(block)
-                for key in ("content", "text"):
-                    if isinstance(block.get(key), str):
-                        block[key] = _truncate_text(block[key], max_chars)
-            blocks.append(block)
-        new["content"] = blocks
-    parts = new.get("parts")
-    if isinstance(parts, list):
-        new_parts = []
-        for part in parts:
-            if isinstance(part, dict):
-                part = dict(part)
-                if isinstance(part.get("text"), str):
-                    part["text"] = _truncate_text(part["text"], max_chars)
-                fr = part.get("function_response")
-                if isinstance(fr, dict) and isinstance(fr.get("response"), dict):
-                    fr = dict(fr)
-                    fr["response"] = {k: (_truncate_text(v, max_chars) if isinstance(v, str) else v) for k, v in fr["response"].items()}
-                    part["function_response"] = fr
-            new_parts.append(part)
-        new["parts"] = new_parts
-    return new
 
 
 def _omission_pair(files=(), topics=(), tools=()):
@@ -258,101 +219,249 @@ def _fit_omission_fields(record, budget_tokens):
     return pair, record
 
 
+def _tool_calls(message):
+    """Yield structured call identities without parsing prose or rewriting shapes."""
+    for call in message.get("tool_calls") or []:
+        if isinstance(call, dict):
+            function = call.get("function", {})
+            if isinstance(function, dict):
+                yield call.get("id"), function.get("name"), function.get("arguments", {})
+    blocks = message.get("parts") or message.get("content")
+    for block in blocks if isinstance(blocks, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            yield block.get("id"), block.get("name"), block.get("input", {})
+        function = block.get("function_call") or block.get("functionCall")
+        if isinstance(function, dict):
+            yield function.get("id"), function.get("name"), function.get("args", {})
+
+
+def _call_paths(arguments):
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(arguments, dict):
+        return []
+    return [arguments[key] for key in ("path", "file_path", "filepath", "filename")
+            if isinstance(arguments.get(key), str) and arguments[key]]
+
+
+def _payloads(message, calls):
+    """Yield mutable string slots only; never visit tool inputs/arguments."""
+    if message.get("role") == "tool":
+        name = calls.get(message.get("tool_call_id"), ("unknown_tool", []))[0]
+        if isinstance(message.get("content"), str):
+            yield message, "content", name
+        return
+    if isinstance(message.get("content"), str):
+        yield message, "content", None
+    blocks = message.get("parts") or message.get("content")
+    for block in blocks if isinstance(blocks, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            name = calls.get(block.get("tool_use_id"), ("unknown_tool", []))[0]
+            content = block.get("content")
+            if isinstance(content, str):
+                yield block, "content", name
+            elif isinstance(content, list):
+                for child in content:
+                    if isinstance(child, dict) and child.get("type") == "text" and isinstance(child.get("text"), str):
+                        yield child, "text", name
+        elif isinstance(block.get("function_response") or block.get("functionResponse"), dict):
+            response = block.get("function_response") or block.get("functionResponse")
+            name = response.get("name") or "unknown_tool"
+            # Response dictionaries may nest text, but call identifiers/names
+            # outside the response payload must remain byte-exact.
+            def strings(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if isinstance(child, str):
+                            yield value, key, name
+                        elif isinstance(child, (dict, list)):
+                            yield from strings(child)
+                elif isinstance(value, list):
+                    for index, child in enumerate(value):
+                        if isinstance(child, str):
+                            yield value, index, name
+                        elif isinstance(child, (dict, list)):
+                            yield from strings(child)
+            yield from strings(response.get("response"))
+        elif block.get("type") in (None, "text") and isinstance(block.get("text"), str):
+            yield block, "text", None
+
+
+def _pinned_read_messages(messages):
+    """Pin reads preceding same-path executor refusals in the mutation segment.
+
+    Legacy reads without a segment are conservatively pinned within their genuine
+    user turn; explicit different segment identities never match.
+    """
+    pinned, reads, calls = set(), [], {}
+    turn = -1
+    for index, message in enumerate(messages):
+        if is_genuine_user_message(message):
+            turn += 1
+            reads, calls = [], {}
+        metadata = message.get("metadata", {})
+        identity = (metadata.get("turn"), metadata.get("segment"))
+        for call_id, name, arguments in _tool_calls(message):
+            paths = _call_paths(arguments)
+            calls[call_id] = (name, paths, identity)
+            if name == "read_file":
+                reads.append((index, paths, identity, call_id))
+        if message.get("role") == "tool":
+            call = calls.get(message.get("tool_call_id"))
+            if call and call[0] == "read_file":
+                reads.append((index, call[1], call[2], message.get("tool_call_id")))
+        blocks = message.get("parts") or message.get("content")
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict):
+                continue
+            call = calls.get(block.get("tool_use_id"))
+            response = block.get("function_response") or block.get("functionResponse")
+            if call and call[0] == "read_file":
+                reads.append((index, call[1], call[2], block.get("tool_use_id")))
+            elif isinstance(response, dict) and response.get("name") == "read_file":
+                matching = [read for read in reads if read[0] < index]
+                if matching:
+                    reads.append((index, matching[-1][1], matching[-1][2], None))
+        for event in metadata.get("mutation_outcomes", []):
+            if not isinstance(event, dict) or event.get("failed") is not True:
+                continue
+            path = event.get("path")
+            if not isinstance(path, str):
+                continue
+            event_identity = (event.get("turn"), event.get("segment"))
+            for read_index, paths, read_identity, _ in reads:
+                if (read_index < index and (read_identity == event_identity or read_identity == (None, None))
+                        and any(os.path.normcase(os.path.abspath(value)) == os.path.normcase(os.path.abspath(path))
+                                for value in paths)):
+                    pinned.add(read_index)
+    return pinned
+
+
 def fit_messages(
     messages: List[Dict[str, Any]], budget_tokens: int, *, session_record=None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Pure fitting with bounded historical metadata; never alter the newest request."""
+    """Plan replacements in a disposable copy; never mutate audit history.
+
+    ``stats["artifacts"]`` is an ordered list of dictionaries with exactly
+    ``artifact_id`` (deterministic content/tool SHA-256), ``tool_name`` (empty
+    for ordinary text), ``byte_len`` (UTF-8 payload bytes), and ``content``
+    (the complete original string). A caller MUST atomically retain every plan
+    before sending placeholders; unavailable persistence must fail closed.
+    ``message_bytes_before/after`` list UTF-8 serialized provider-view message
+    lengths (json.dumps(default=str, ensure_ascii=False)) before/after surgical
+    replacement: after factual claim projection/private-ledger removal and
+    excluding the prepended index pair, including remaining metadata.
+    No turn/container, tool binding, tool argument, correction, or message in
+    the last two genuine user turns is eligible for replacement.
+    """
     record = _validated_session_record(session_record)
-    stats = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0,
-             "omission_tokens": 0, "session_record": None,
+    stats = {"dropped_messages": 0, "truncated_messages": 0, "compacted_messages": 0,
+             "tokens": 0, "omission_tokens": 0, "session_record": None,
              "fields_included": {"files": 0, "topics": 0, "tools": 0},
-             "claim_redactions": []}
-    view = []
-    for message in fitted_claim_view(messages):
-        # Executor ledgers are audit evidence, not provider input. Consume them
-        # for claim handling first, then omit only these private fields in the
-        # disposable view; persisted records and genuine user bytes stay intact.
+             "claim_redactions": [], "artifacts": [], "elided_tokens": 0}
+    view = fitted_claim_view(messages)
+    pinned = _pinned_read_messages(view)
+    msgs = copy.deepcopy(view)
+    for message in msgs:
         metadata = message.get("metadata", {})
-        if not is_genuine_user_message(message) and any(
-                key in metadata for key in ("mutation_outcomes", "turn", "segment")):
-            message = dict(message)
+        if not is_genuine_user_message(message):
             retained = {key: value for key, value in metadata.items()
                         if key not in ("mutation_outcomes", "turn", "segment")}
             if retained:
                 message["metadata"] = retained
             else:
                 message.pop("metadata", None)
-        view.append(message)
-    msgs = list(view)
-    starts = [i for i, m in enumerate(msgs) if is_genuine_user_message(m)]
+    byte_lengths = lambda source: [len(json.dumps(m, default=str, ensure_ascii=False).encode("utf-8")) for m in source]
+    stats["message_bytes_before"] = byte_lengths(msgs)
+    starts = [i for i, message in enumerate(msgs) if is_genuine_user_message(message)]
     stats["turns_before"] = stats["turns_after"] = len(starts)
+    stats["dropped_turns"] = 0
+    protected_start = starts[-2] if len(starts) >= 2 else (starts[0] if starts else 0)
+    calls, candidates = {}, []
+    for index, message in enumerate(msgs):
+        for call_id, name, arguments in _tool_calls(message):
+            calls[call_id] = (name or "unknown_tool", _call_paths(arguments))
+        if (index >= protected_start or index in pinned or message.get("role") == "system"
+                or message.get("metadata", {}).get("outcome_correction")
+                or message.get("metadata", {}).get("claim_redactions")
+                or message.get("metadata", {}).get("recovery_pinned")
+                or "edit_recovery" in message.get("metadata", {})):
+            continue
+        for owner, key, name in _payloads(message, calls):
+            content = owner[key]
+            if estimate_tokens(content) < COMPACTION_MIN_TOKENS or content.startswith("[COMPACTED:"):
+                continue
+            tool_name = name or ""
+            artifact_id = hashlib.sha256((tool_name + "\0" + content).encode("utf-8")).hexdigest()
+            # N measures the original payload tokens elided, not a guessed
+            # saving. Budget decisions use actual serialized replacement cost.
+            count = max(0, estimate_tokens(content))
+            label = f"{tool_name} result, " if name else ""
+            replacement = f"[COMPACTED: {label}{count} tokens elided. Artifact ID: {artifact_id}]"
+            owner[key] = replacement
+            saving = message_tokens(message)
+            owner[key] = content
+            saving = message_tokens(message) - saving
+            if saving > 0:
+                candidates.append((index, owner, key, replacement, count, {
+                    "artifact_id": artifact_id, "tool_name": tool_name,
+                    "byte_len": len(content.encode("utf-8")), "content": content,
+                }))
+    changed, plans, planned_bytes = set(), {}, 0
+    needs_record = record is not None
+    for index, owner, key, replacement, count, plan in candidates:
+        anchor = history_tokens(_omission_pair()) if needs_record else 0
+        if history_tokens(msgs) + anchor <= budget_tokens:
+            break
+        if plan["artifact_id"] not in plans:
+            if planned_bytes + plan["byte_len"] > ARTIFACT_SESSION_MAX_BYTES:
+                # Never claim an artifact that the bounded store cannot retain.
+                continue
+            plans[plan["artifact_id"]] = plan
+            planned_bytes += plan["byte_len"]
+        owner[key] = replacement
+        stats["elided_tokens"] += count
+        changed.add(index)
+        needs_record = True
     total = history_tokens(msgs)
-    anchor_tokens = history_tokens(_omission_pair())
-    while len(starts) > 1 and total + (anchor_tokens if record is not None or stats["dropped_messages"] else 0) > budget_tokens:
-        cut = starts[1]
-        stats["dropped_messages"] += cut
-        msgs = msgs[cut:]
-        starts = [i - cut for i in starts[1:]]
-        total = history_tokens(msgs)
-
-    needs_record = record is not None or bool(stats["dropped_messages"])
-    payload_budget = budget_tokens - (anchor_tokens if needs_record else 0)
-    newest_user = starts[-1] if starts else None
-    if total > payload_budget:
-        # Neither tool-call arguments nor the newest genuine user message may change.
-        limit = max(200, int(payload_budget * CHARS_PER_TOKEN * 0.5))
-        for _ in range(16):
-            if total <= payload_budget:
-                break
-            candidates = [
-                (message_tokens(m) - message_tokens(shrunk), i, shrunk)
-                for i, m in enumerate(msgs) if i != newest_user and not m.get("metadata", {}).get("outcome_correction")
-                for shrunk in [_shrink_message(m, limit)]
-            ]
-            saved, index, shrunk = max(candidates, default=(0, 0, None), key=lambda item: item[0])
-            if saved > 0:
-                msgs[index] = shrunk
-                stats["truncated_messages"] += 1
-                total = history_tokens(msgs)
-            elif limit <= 200:
-                break
-            limit = max(200, int(limit * 0.6))
-    if total > payload_budget:
-        gap = ("Historical omission coverage gap: the omission anchor cannot fit with the current turn. "
-               if needs_record else "")
-        raise ContextBudgetError(
-            gap + f"Current conversation needs at least {total + (anchor_tokens if needs_record else 0)} "
-            f"estimated tokens but only {budget_tokens} are available in the configured request budget. "
-            "The newest user request, tool arguments and call/result bindings were preserved; "
-            "no over-budget request was sent. Shorten input or adjust configured budgets "
-            "within the endpoint's documented capacity."
-        )
-    stats["turns_after"] = len(starts)
-    stats["dropped_turns"] = stats["turns_before"] - stats["turns_after"]
     if needs_record:
-        collected = _collect_omission_fields(view[:stats["dropped_messages"]], record)
+        collected = _collect_omission_fields(
+            [message for index, message in enumerate(view) if index < protected_start], record)
         note, retained = _fit_omission_fields(collected, budget_tokens - total)
-        # Stop rule: if real e28 E2E still asserts false absence with this record,
-        # retire this candidate and report retention STILL UNSUPPORTED/NOT FIXED;
-        # historical metadata must never become stronger claims or new authority.
         stats["session_record"] = retained
         stats["fields_included"] = {key: len(retained[key]) for key in _RECORD_LIMITS}
         stats["omission_tokens"] = history_tokens(note)
-        msgs = note + msgs
-    redactions = []
+    else:
+        note = []
+    if total + stats["omission_tokens"] > budget_tokens:
+        raise ContextBudgetError(
+            f"Current conversation needs at least {total + stats['omission_tokens']} estimated tokens "
+            f"but only {budget_tokens} are available. The newest user request, last two genuine "
+            "user turns, pinned reads, corrections, tool arguments and call/result bindings "
+            "were preserved; no over-budget request was sent. Shorten input or adjust configured budgets."
+        )
+    stats["compacted_messages"] = stats["truncated_messages"] = len(changed)
+    stats["artifacts"] = list(plans.values())
+    stats["message_bytes_after"] = byte_lengths(msgs)
     for message in msgs:
         if message.get("role") not in ("assistant", "model"):
             continue
         for fact in message.get("metadata", {}).get("claim_redactions", []):
             if (isinstance(fact, dict) and set(fact) == {"turn", "file", "trigger"}
                     and all(isinstance(value, str) for value in fact.values())
-                    and fact not in redactions):
-                redactions.append(dict(fact))
-                del redactions[:-128]
-    stats["claim_redactions"] = redactions
+                    and fact not in stats["claim_redactions"]):
+                stats["claim_redactions"].append(dict(fact))
+                del stats["claim_redactions"][:-128]
     stats["correction_tokens"] = sum(
-        message_tokens(m) for m in msgs if m.get("metadata", {}).get("outcome_correction")
-    )
+        message_tokens(m) for m in msgs if m.get("metadata", {}).get("outcome_correction"))
+    msgs = note + msgs
     stats["tokens"] = history_tokens(msgs)
     return msgs, stats
 
@@ -372,16 +481,14 @@ def _text_of(message: Dict[str, Any]) -> str:
 def compact_messages(messages: List[Dict[str, Any]], keep_turns: int = 2) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Replace older turns with one short note and keep the last `keep_turns` turns intact.
 
-    The note lists what the user asked earlier and which files and tools were
-    touched. It is built without calling the model, so it works even when the
-    context is already full.
+    Explicit user compaction is separate from automatic sent-view fitting.
+    The note lists earlier requests and structured historical file/tool references.
     """
     starts = [i for i, m in enumerate(messages) if is_genuine_user_message(m)]
     if len(starts) <= keep_turns:
         return list(messages), {"removed_messages": 0, "turns_summarized": 0}
     cut = starts[-keep_turns] if keep_turns > 0 else len(messages)
     old, recent = messages[:cut], messages[cut:]
-
     asks, files, tools = [], [], []
     for m in old:
         if is_genuine_user_message(m):
@@ -390,6 +497,7 @@ def compact_messages(messages: List[Dict[str, Any]], keep_turns: int = 2) -> Tup
                 asks.append(text[:160])
             elif text.startswith("[Earlier conversation compacted"):
                 asks.append("(earlier compacted history) " + text[text.find("\n") + 1:][:300].replace("\n", " "))
+
         def collect(value):
             if isinstance(value, dict):
                 name = value.get("name")
@@ -419,7 +527,6 @@ def compact_messages(messages: List[Dict[str, Any]], keep_turns: int = 2) -> Tup
         lines.append("Tools used: " + ", ".join(tools[:12]))
     lines.append("Ask again if you need details from before this point.")
     note = {"role": "user", "content": "\n".join(lines)}
-    # Providers expect alternating roles; a short assistant ack keeps that valid.
     ack = {"role": "assistant", "content": "Understood. I will use that summary of the earlier conversation."}
     return [note, ack] + recent, {"removed_messages": len(old), "turns_summarized": len(asks)}
 

@@ -84,7 +84,8 @@ def test_second_identical_failure_ends_turn_without_another_model_request(tmp_pa
 def test_successful_actual_call_resets_failure_evidence(tmp_path):
     read_b(tmp_path)
     (tmp_path / "other.txt").write_text("other")
-    provider = Scripted([bad_patch(), ("read_file", {"path": "other.txt"}), bad_patch(), bad_patch(), "unused"])
+    failed_write = ("write_file", {"path": "b.py", "content": "def broken(:"})
+    provider = Scripted([failed_write, ("read_file", {"path": "other.txt"}), failed_write, failed_write, "unused"])
     final = Agent(provider, verbose=False).run("Fix b.py")
     assert len(provider.seen) == 4
     assert "repeated identical tool failure" in final
@@ -120,9 +121,11 @@ def test_blind_refusal_and_target_mismatch_are_different_failures(tmp_path):
     (tmp_path / "b.py").write_text("x = 1\n")
     provider = Scripted([bad_patch(), bad_patch(), bad_patch(), "unused"])
     final = Agent(provider, verbose=False).run("Fix b.py")
-    assert len(provider.seen) == 3
+    assert len(provider.seen) == 2
     assert "DATA: RAW file content" in provider.seen[1][-1]["content"]
-    assert "repeated identical tool failure" in final
+    assert "repeated identical tool failure" not in final
+    assert "targeting" in final
+    assert len(provider.steps) == 2
 
 
 def test_mixed_write_repeat_stop_never_claims_no_files_changed(tmp_path):
@@ -288,11 +291,8 @@ def test_omission_and_projection_include_correction_cost_without_audit_changes(t
     assert memory.get() == before and messages == before
 
     budget = context.history_tokens([current]) + 150
-    omitted, stats = context.fit_messages(messages, budget)
-    assert omitted[2:] == [current]
-    assert stats["dropped_turns"] == 1 and stats["correction_tokens"] == 0
-    assert stats["omission_tokens"] == context.history_tokens(omitted[:2])
-    assert stats["tokens"] == context.history_tokens(omitted) <= budget
+    with pytest.raises(context.ContextBudgetError):
+        context.fit_messages(messages, budget)
     assert messages == before
 
 

@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from .capabilities import ContextCapabilities, resolve_context_capabilities
 
 class RateLimitError(Exception):
     """Raised when an LLM provider returns a 429 rate-limit response."""
@@ -40,6 +41,24 @@ class ProviderResponse:
 class BaseProvider(ABC):
     """Abstract base class for all LLM providers."""
     _supports_output_budget = False
+
+    @property
+    def context_capabilities(self) -> ContextCapabilities:
+        """Pure advisory registry, following the active fallback provider."""
+        active = getattr(self, "active_provider", None)
+        if active is not None and active is not self:
+            return active.context_capabilities
+        # Preserve the concrete provider's identity for application subclasses.
+        provider_name = next((
+            cls.__module__.rsplit(".", 1)[-1].removesuffix("_provider")
+            for cls in type(self).__mro__
+            if cls.__module__.startswith(f"{__package__}.")
+            and cls.__module__.endswith("_provider")
+        ), "")
+        return resolve_context_capabilities(
+            provider_name, getattr(self, "model", ""),
+            local=bool(getattr(self, "is_local", False)),
+        )
 
     @property
     def request_output_cap(self) -> int:

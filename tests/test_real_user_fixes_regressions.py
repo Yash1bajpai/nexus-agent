@@ -217,14 +217,13 @@ def test_doctor_windows_msvc_dll_probe(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Fix 9: Local context defaults (8192, 2048), RAM note, and meter breakdown
+# Local context defaults remain measured 4096/512, with RAM note and meter breakdown
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="candidate change: local default context raise held for design review")
-def test_local_defaults_raised_to_8192():
-    assert _LOCAL_DEFAULTS == ModelLimits(8192, 2048)
-    assert resolve_limits("local", "custom.gguf").context_size == 8192
-    assert resolve_limits("local", "custom.gguf").max_output_tokens == 2048
+def test_local_defaults_remain_4096_with_512_reserve():
+    assert _LOCAL_DEFAULTS == ModelLimits(4096, 512)
+    assert resolve_limits("local", "custom.gguf").context_size == 4096
+    assert resolve_limits("local", "custom.gguf").max_output_tokens == 512
 
 
 def test_context_breakdown_and_meter():

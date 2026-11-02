@@ -138,7 +138,7 @@ def test_local_default_budget_finishes_short_edit_without_overcommitting_output(
     def completion(**request):
         requests.append(request)
         index = len(requests)
-        if index == 2:
+        if index == 1:
             call = {"id": "read", "type": "function", "function": {
                 "name": "read_file", "arguments": json.dumps({"path": "f.py"}),
             }}
@@ -146,18 +146,18 @@ def test_local_default_budget_finishes_short_edit_without_overcommitting_output(
             call = {"id": f"patch_{index}", "type": "function", "function": {
                 "name": "patch_file",
                 "arguments": json.dumps({
-                    "path": "f.py", "target": "x = 0" if index in (1, 3) else "x = 1",
+                    "path": "f.py", "target": "x = 0" if index == 2 else "x = 1",
                     "replacement": "x = 2",
                 }),
             }}
-        truncated = cutoff and index == 4
+        truncated = cutoff and index == 3
         if truncated:
             call["function"]["arguments"] = '{"path":"f.py","replacement":"unfinished'
         return {
             "choices": [{"message": {
-                "content": reasoning if index <= 4 else "Changed f.py.",
-                "tool_calls": [call] if index <= 4 else [],
-            }, "finish_reason": "length" if truncated else "tool_calls" if index <= 4 else "stop"}],
+                "content": reasoning if index <= 3 else "Changed f.py.",
+                "tool_calls": [call] if index <= 3 else [],
+            }, "finish_reason": "length" if truncated else "tool_calls" if index <= 3 else "stop"}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 20},
         }
 
@@ -169,11 +169,10 @@ def test_local_default_budget_finishes_short_edit_without_overcommitting_output(
     assert (provider.context_size, provider.max_output_tokens) == (4096, 512)
     assert provider.request_output_cap == 512
     if cutoff:
-        # Output-boost retry recovers the truncated turn (one request with a
-        # larger, window-clamped cap), then the unapplied-edit guard keeps the
-        # outcome honest.
-        assert not agent.response_incomplete
-        assert any(request["max_tokens"] > 512 for request in requests)
+        # A cut-off corrected edit ends this one-recovery chain; no second
+        # attempt/output-boost retry may apply incomplete arguments.
+        assert agent.response_incomplete
+        assert not any(request["max_tokens"] > 512 for request in requests)
         assert agent.edit_not_applied
         assert path.read_text() == "x = 1\n"
         assert agent.changed_files == set()

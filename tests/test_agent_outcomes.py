@@ -189,7 +189,7 @@ def test_raw_sdk_message_is_json_safe_in_memory_and_sqlite(tmp_path):
         assert messages[1]["content"] == ""
 
 
-def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch):
+def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch, tmp_path):
     from nexus_agent_ai.agent import context
     from nexus_agent_ai.providers import fallback_provider
 
@@ -203,10 +203,10 @@ def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch):
         ("primary", lambda: primary), ("local", lambda: local),
     ])
     provider = fallback_provider.FallbackProvider("primary")
-    memory = ConversationMemory(max_messages=500)
+    memory = SQLiteMemory(tmp_path / "history.db", session_id="fallback", max_messages=500)
     memory.replace([
         {"role": role, "content": f"{index} " + "x" * 600}
-        for index in range(30) for role in ("user", "assistant")
+        for index in range(8) for role in ("user", "assistant")
     ])
     agent = Agent(provider, memory=memory, tools=[], verbose=False)
     agent.system = "Short test instructions."
@@ -214,14 +214,14 @@ def test_fallback_transition_and_recovery_rebudget_full_history(monkeypatch):
     assert agent.context_window == 2048
     assert agent.output_reserve == provider.max_output_tokens == 512
     assert context.history_tokens(local.seen[0]) <= 2048 - 512 - context.estimate_tokens(agent.system)
-    assert len(primary.seen[0]) > len(local.seen[0])
+    assert context.history_tokens(primary.seen[0]) > context.history_tokens(local.seen[0])
     assert provider.before_request is None
     provider._fallback_time = 0
     provider._recovery_cooldown = 0
     assert agent.run("continue") == "recovered"
     assert agent.context_window == 8192
     assert agent.output_reserve == provider.max_output_tokens == 2048
-    assert len(primary.seen[1]) > len(local.seen[0])
+    assert context.history_tokens(primary.seen[1]) > context.history_tokens(local.seen[0])
     assert provider.before_request is None
 
 

@@ -7,6 +7,8 @@ unverified 32,768/16,384 fallback; this is not a verified endpoint capacity.
 """
 
 from dataclasses import dataclass
+from collections.abc import Mapping
+from typing import Literal
 import os
 import re
 import warnings
@@ -16,6 +18,37 @@ import warnings
 class ModelLimits:
     context_size: int
     max_output_tokens: int
+
+
+CapabilitySource = Literal["model-reported", "explicit-table", "assumed"]
+
+
+@dataclass(frozen=True, slots=True)
+class ContextProvenance:
+    """Per-field evidence; ``None`` means no value or evidence is available."""
+
+    safe_context: CapabilitySource
+    max_context: CapabilitySource | None
+    kv_warn_bytes: CapabilitySource | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCapabilities:
+    """Advisory context configuration, not new provider execution limits.
+
+    ``max_context`` and ``kv_warn_bytes`` stay ``None`` when unknown. A reported
+    GGUF context length describes the weights' training extent, not measured
+    quality, available RAM, or the running server's configured context size.
+    """
+
+    safe_context: int
+    max_context: int | None
+    kv_warn_bytes: int | None
+    provenance: ContextProvenance
+
+
+class ContextQualityWarning(UserWarning):
+    """A requested context exceeds the registry's advisory safe setting."""
 
 
 # Exact documented IDs only. Never infer capacity from a family-name prefix.
@@ -66,6 +99,99 @@ def model_capabilities(provider_name: str, model: str) -> ModelLimits | None:
     return _MODEL_LIMITS.get((provider_name.strip().lower(), model))
 
 
+def _reported_context(metadata: Mapping[str, object] | None) -> dict[str, int]:
+    """Read already available model information without probing any endpoint."""
+    if not isinstance(metadata, Mapping):
+        return {}
+    reported = {}
+    for field in ("safe_context", "max_context", "kv_warn_bytes"):
+        value = metadata.get(field)
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            value = int(value)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            reported[field] = value
+    if "max_context" not in reported:
+        # Use only model capacity fields. n_ctx/num_ctx and tokenizer sentinel
+        # lengths describe runtime settings or placeholders, not model maxima.
+        architecture = metadata.get("general.architecture")
+        gguf_key = f"{architecture}.context_length" if isinstance(architecture, str) else None
+        keys = ("context_length", "n_ctx_train", "max_position_embeddings", "input_token_limit")
+        if gguf_key:
+            keys = (gguf_key, *keys)
+        else:
+            gguf_keys = [key for key in metadata if isinstance(key, str) and key.endswith(".context_length")]
+            if len(gguf_keys) == 1:
+                keys = (*keys, gguf_keys[0])
+        for key in keys:
+            value = metadata.get(key)
+            if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+                value = int(value)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                reported["max_context"] = value
+                break
+    return reported
+
+
+def resolve_context_capabilities(
+    provider_name: str,
+    model: str,
+    *,
+    metadata: Mapping[str, object] | None = None,
+    local: bool = False,
+) -> ContextCapabilities:
+    """Resolve model report > documented exact-ID table > existing defaults.
+
+    Callers may supply existing cloud model-info, local model config, or GGUF
+    metadata; this function performs no I/O and ignores environment overrides.
+    Normalized ``safe_context``, ``max_context`` and ``kv_warn_bytes`` are
+    accepted, alongside GGUF context_length, Transformers max_position_embeddings
+    and cloud input_token_limit. No KV threshold is inferred from model size.
+    Registry values are advisory: resolve_limits retains all existing defaults
+    and documented maximum/clamping policies even when a report is supplied.
+    """
+    local = local or provider_name.strip().lower() == "local"
+    documented = None if local else model_capabilities(provider_name, model)
+    reported = _reported_context(metadata)
+    safe = reported.get("safe_context")
+    safe_source: CapabilitySource = "model-reported"
+    if safe is None:
+        safe = documented.context_size if documented else (
+            _LOCAL_DEFAULTS.context_size if local else _CLOUD_FALLBACK.context_size
+        )
+        safe_source = "explicit-table" if documented else "assumed"
+    maximum = reported.get("max_context")
+    maximum_source: CapabilitySource | None = "model-reported" if maximum is not None else None
+    if maximum is None and documented:
+        maximum = documented.context_size
+        maximum_source = "explicit-table"
+    kv = reported.get("kv_warn_bytes")
+    return ContextCapabilities(
+        safe_context=safe,
+        max_context=maximum,
+        kv_warn_bytes=kv,
+        provenance=ContextProvenance(safe_source, maximum_source, "model-reported" if kv is not None else None),
+    )
+
+
+def warn_context_quality(
+    provider_name: str,
+    model: str,
+    context_size: int,
+    capabilities: ContextCapabilities,
+) -> None:
+    """Warn without changing the requested context or allocating KV memory."""
+    if context_size > capabilities.safe_context:
+        warnings.warn(
+            f"QUALITY + RAM WARNING: {provider_name}/{model}: context_size={context_size} "
+            f"exceeds safe_context={capabilities.safe_context} "
+            f"({capabilities.provenance.safe_context}). Larger context can degrade "
+            "response quality and increase KV-cache RAM use; available RAM and "
+            "model quality are not guaranteed. This advisory does not clamp context.",
+            ContextQualityWarning,
+            stacklevel=3,
+        )
+
+
 def _configured_limit(
     value: int | str | None,
     field: str,
@@ -111,12 +237,13 @@ def resolve_limits(
     max_output_tokens: int | str | None = None,
     *,
     local: bool = False,
+    metadata: Mapping[str, object] | None = None,
 ) -> ModelLimits:
     """Resolve args > NEXUS environment > model maxima > cloud fallback.
 
     Each field resolves independently. Known-model maxima cap explicit arguments
     and environment settings, with a visible UserWarning. Local defaults remain
-    4096/2048, context must be at least 512, and neither local setting has an
+    4096/512, context must be at least 512, and neither local setting has an
     inferred upper bound: the user must choose within model and RAM limits.
     The unknown-cloud fallback is configurable and is not a verified capacity.
     """
@@ -132,7 +259,7 @@ def resolve_limits(
             UserWarning,
             stacklevel=2,
         )
-    return ModelLimits(
+    limits = ModelLimits(
         context_size=_configured_limit(
             context_size, "context_size", "NEXUS_CONTEXT_SIZE",
             defaults.context_size, maxima.context_size if maxima else None,
@@ -144,3 +271,12 @@ def resolve_limits(
             1, provider_name, model,
         ),
     )
+    raw_context = context_size if context_size is not None else os.environ.get("NEXUS_CONTEXT_SIZE")
+    if raw_context is not None and provider_name.strip().lower() != "fallback":
+        # _configured_limit has already validated this value. Compare the actual
+        # requested count, even when the existing documented maximum clamps it.
+        warn_context_quality(
+            provider_name, model, int(raw_context),
+            resolve_context_capabilities(provider_name, model, metadata=metadata, local=local),
+        )
+    return limits
