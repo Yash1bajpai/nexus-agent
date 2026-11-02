@@ -228,3 +228,41 @@ def test_run_code_refusal_points_to_run_tests():
     from nexus_agent_ai.agent import tools as T
     out = T.execute_run_code("import os\nprint(os.getcwd())")
     assert "run_tests" in out
+
+
+# --- f-string pre/post-eval bounds in sandboxed run_code (design-review MODIFY) ---
+
+@pytest.mark.parametrize("code", [
+    'print(f"{1:{10**9}}")',            # exponent-driven width -> memory DoS
+    'print(f"{\'x\':>999999999}")',     # huge width literal
+    'print(f"{3.14:.10000000f}")',      # huge precision literal
+    'x = 1\nprint(f"{x:{2:{3}}}")',     # format spec nested deeper than one level
+    'print(f"{f\'{f"{f"{1}"}"}\'}")',   # JoinedStr nesting depth 4
+    'print(f"{__import__(\'os\').system(\'echo pwned\')}")',  # escape via FormattedValue.value
+])
+def test_run_code_fstring_dos_and_escape_blocked(code):
+    from nexus_agent_ai.agent.tools import execute_run_code
+    result = execute_run_code(code)
+    assert result.startswith("SANDBOX BLOCK:"), result[:200]
+    assert "pwned" not in result
+
+
+@pytest.mark.parametrize("code,expected", [
+    ('x = 1\ny = 5\nprint(f"{x:{y}}")', "1"),            # dynamic spec depth 1 allowed
+    ('name = "world"\nprint(f"hello {name}")', "hello world"),
+    ('x = 7\nprint(f"{x:>100}")', "7"),                  # width 100 fine
+    ('print(f"{f\'{f"{1}"}\'}")', "1"),                  # nesting depth 3 allowed
+    ('x = 42\nprint(f"{x=}")', "x=42"),  # self-documenting fine
+])
+def test_run_code_fstring_legit_forms_still_work(code, expected):
+    from nexus_agent_ai.agent.tools import execute_run_code
+    result = execute_run_code(code)
+    assert not result.startswith("SANDBOX BLOCK:"), result[:200]
+    assert expected in result
+
+
+def test_run_code_output_capped_at_one_mib():
+    from nexus_agent_ai.agent.tools import execute_run_code
+    result = execute_run_code('print("x" * 2_000_000)')
+    assert "output truncated at 1 MiB" in result
+    assert len(result) < 1_200_000

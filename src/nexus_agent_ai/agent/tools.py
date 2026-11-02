@@ -744,6 +744,61 @@ def _attr_name_is_safe(attr: str) -> bool:
     return True
 
 
+_FSTRING_MAX_NESTING = 3        # JoinedStr inside JoinedStr, total depth
+_FSTRING_MAX_SPEC_NUMBER = 1000  # width/precision literals in format specs
+_FSTRING_MAX_OUTPUT = 1024 * 1024  # post-eval rendered output cap (1 MiB)
+_SPEC_DIGITS = re.compile(r"\d+")
+
+
+def _joinedstr_depth(node) -> int:
+    """Deepest JoinedStr nesting below (and including) this node."""
+    import ast as _ast
+    best = 0
+    for child in _ast.iter_child_nodes(node):
+        best = max(best, _joinedstr_depth(child))
+    if isinstance(node, _ast.JoinedStr):
+        best += 1
+    return best
+
+
+def _fstring_violations(tree) -> list:
+    """Pre-evaluation bounds for f-strings in sandboxed run_code.
+
+    ast.walk already routes FormattedValue.value and format_spec expressions
+    through the standard node/name/call gates, so these checks add only the
+    f-string-specific surfaces both reviewers flagged: format-spec memory
+    exhaustion (huge width/precision), dynamic specs via nested expressions
+    (exponentiation or oversized literals), and unbounded JoinedStr nesting.
+    """
+    import ast as _ast
+    violations = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.JoinedStr):
+            depth = _joinedstr_depth(node)
+            if depth > _FSTRING_MAX_NESTING:
+                violations.append(
+                    f"f-string nesting deeper than {_FSTRING_MAX_NESTING} levels is not allowed in sandboxed run_code")
+        if isinstance(node, _ast.FormattedValue) and node.format_spec is not None:
+            spec = node.format_spec
+            for sub in _ast.walk(spec):
+                if isinstance(sub, _ast.FormattedValue) and sub.format_spec is not None:
+                    violations.append("format specs nested deeper than one level are not allowed in sandboxed run_code")
+                if isinstance(sub, _ast.BinOp) and isinstance(sub.op, _ast.Pow):
+                    violations.append("exponentiation in a format spec is not allowed in sandboxed run_code")
+                if isinstance(sub, _ast.Constant):
+                    if isinstance(sub.value, (int, float)) and not isinstance(sub.value, bool):
+                        if abs(sub.value) > _FSTRING_MAX_SPEC_NUMBER:
+                            violations.append(
+                                f"format spec value larger than {_FSTRING_MAX_SPEC_NUMBER} is not allowed in sandboxed run_code")
+                    elif isinstance(sub.value, str):
+                        for digits in _SPEC_DIGITS.findall(sub.value):
+                            if int(digits) > _FSTRING_MAX_SPEC_NUMBER:
+                                violations.append(
+                                    f"format width/precision larger than {_FSTRING_MAX_SPEC_NUMBER} is not allowed in sandboxed run_code")
+                                break
+    return violations
+
+
 def _sandbox_check(code: str) -> str | None:
     """
     AST-based static analysis. Returns an error string if forbidden
@@ -799,6 +854,7 @@ def _sandbox_check(code: str) -> str | None:
             if ("__" in node.value and node.value not in {"__main__"}) or any(word in node.value.lower() for word in ("import", "subprocess", "system", "password", "token")):
                 violations.append("sensitive reflection or command text is not allowed in sandboxed run_code")
 
+    violations.extend(_fstring_violations(tree))
     if violations:
         bullet_list = "\n  - ".join(violations)
         return (
@@ -860,8 +916,19 @@ def execute_run_code(code: str, language: str = "python") -> str:
             except Exception:
                 pass
 
-        out = res.stdout.strip()
-        err = res.stderr.strip()
+        out = res.stdout
+        err = res.stderr
+        truncated = []
+        if len(out) > _FSTRING_MAX_OUTPUT:
+            out = out[:_FSTRING_MAX_OUTPUT]
+            truncated.append("stdout")
+        if len(err) > _FSTRING_MAX_OUTPUT:
+            err = err[:_FSTRING_MAX_OUTPUT]
+            truncated.append("stderr")
+        out = out.strip()
+        err = err.strip()
+        if truncated:
+            err = (err + "\n" if err else "") + "[output truncated at 1 MiB: " + ", ".join(truncated) + "]"
         output = ""
         if out:
             output += f"STDOUT:\n{out}\n"
