@@ -1003,3 +1003,19 @@ def test_content_loss_covers_methods_imports_constants(tmp_path):
         tools_module.set_user_intent("")
     # Nothing dropped -> no loss.
     assert _describe_content_loss("c.py", old, old + "\nX = 1\n") == (None, [])
+
+
+def test_refused_lossy_overwrite_includes_ready_targeted_patch(tmp_path):
+    path = tmp_path / "calc.py"
+    path.write_text(CALC_WITH_ADD)
+    from nexus_agent_ai.agent import tools as tools_module
+    tools_module.execute_read_file(str(path))
+    fixed_divide = "def divide(a, b):\n    if b == 0:\n        raise ValueError('division by zero')\n    return a / b\n"
+    result = tools_module.execute_write_file(str(path), fixed_divide)
+    assert result.startswith("ERROR:")
+    # The refusal hands the model a ready-to-use targeted patch for the intended change.
+    assert "patch_file with these exact arguments" in result
+    assert "def divide(a, b):" in result and "ValueError" in result
+    # Deletions are never suggested.
+    result2 = tools_module.execute_write_file(str(path), "def add(a, b):\n    return a + b\n")
+    assert "exact arguments" not in result2

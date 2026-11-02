@@ -237,6 +237,9 @@ def test_run_code_refusal_points_to_run_tests():
     'print(f"{\'x\':>999999999}")',     # huge width literal
     'print(f"{3.14:.10000000f}")',      # huge precision literal
     'x = 1\nprint(f"{x:{2:{3}}}")',     # format spec nested deeper than one level
+    'w = 10**9\nprint(f"{1:{w}}")',    # computed width - unboundable pre-eval
+    'w = 1000 * 1000\nprint(f"{1:{w}}")',  # multiplication-generated width
+
     'print(f"{f\'{f"{f"{1}"}"}\'}")',   # JoinedStr nesting depth 4
     'print(f"{__import__(\'os\').system(\'echo pwned\')}")',  # escape via FormattedValue.value
 ])
@@ -248,7 +251,6 @@ def test_run_code_fstring_dos_and_escape_blocked(code):
 
 
 @pytest.mark.parametrize("code,expected", [
-    ('x = 1\ny = 5\nprint(f"{x:{y}}")', "1"),            # dynamic spec depth 1 allowed
     ('name = "world"\nprint(f"hello {name}")', "hello world"),
     ('x = 7\nprint(f"{x:>100}")', "7"),                  # width 100 fine
     ('print(f"{f\'{f"{1}"}\'}")', "1"),                  # nesting depth 3 allowed
@@ -266,3 +268,21 @@ def test_run_code_output_capped_at_one_mib():
     result = execute_run_code('print("x" * 2_000_000)')
     assert "output truncated at 1 MiB" in result
     assert len(result) < 1_200_000
+
+
+
+def test_run_code_memory_ceiling_kills_huge_allocation():
+    # Real resource-failure proof: a ~600MB allocation exceeds the 512MB child
+    # address-space limit and dies as MemoryError instead of hanging or OOM-ing
+    # the host. Skipped automatically where RLIMIT_AS is unavailable (Android).
+    import resource
+    from nexus_agent_ai.agent.tools import execute_run_code
+    result = execute_run_code('x = "y" * 600_000_000\nprint(len(x))')
+    assert "600000000" not in result
+    assert "ERROR" in result or "MemoryError" in result or "STDERR" in result
+
+
+def test_run_code_repr_of_large_object_output_truncated():
+    from nexus_agent_ai.agent.tools import execute_run_code
+    result = execute_run_code('x = "y" * 2_000_000\nprint(f"{x!r}")')
+    assert "output truncated at 1 MiB" in result

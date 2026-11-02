@@ -455,9 +455,10 @@ def execute_write_file(path: str, content: str) -> str:
                 old_content = f.read()
             loss, dropped = _describe_content_loss(p.name, old_content, content)
             if loss and not content_removal_approved(p, loss, dropped):
+                hint = _suggest_targeted_patch(old_content, content) or                     "Use patch_file for a targeted edit that keeps the existing content."
                 return (f"ERROR: This overwrite of '{path}' would delete {loss}. "
-                        "The user has not approved removing it. Ask the user to confirm the replacement, "
-                        "or use patch_file for a targeted edit that keeps the existing content.")
+                        "The user has not approved removing it. Ask the user to confirm the replacement. "
+                        + hint.replace("{path}", path))
 
         existed = p.exists()
         if not _atomic_file_update(p, content):
@@ -620,9 +621,10 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
 
         loss, dropped = _describe_content_loss(p.name, content, new_content)
         if loss and not content_removal_approved(p, loss, dropped):
+            hint = _suggest_targeted_patch(content, new_content) or                 "Choose a target that keeps the existing content."
             return (f"ERROR: This patch to '{path}' would delete {loss}. "
-                    "The user has not approved removing it. Ask the user to confirm the removal, "
-                    "or choose a target that keeps the existing content.")
+                    "The user has not approved removing it. Ask the user to confirm the removal. "
+                    + hint.replace("{path}", path))
 
         if not _atomic_file_update(p, new_content):
             return f"No changes: '{path}' already has the requested content."
@@ -781,11 +783,12 @@ def _fstring_violations(tree) -> list:
         if isinstance(node, _ast.FormattedValue) and node.format_spec is not None:
             spec = node.format_spec
             for sub in _ast.walk(spec):
-                if isinstance(sub, _ast.FormattedValue) and sub.format_spec is not None:
-                    violations.append("format specs nested deeper than one level are not allowed in sandboxed run_code")
-                if isinstance(sub, _ast.BinOp) and isinstance(sub.op, _ast.Pow):
-                    violations.append("exponentiation in a format spec is not allowed in sandboxed run_code")
-                if isinstance(sub, _ast.Constant):
+                if isinstance(sub, _ast.FormattedValue):
+                    # No dynamic format specs at all: a computed width/precision
+                    # (f"{x:{w}}" with w=10**9) cannot be bounded pre-evaluation,
+                    # and runtime allocation happens before any output cap.
+                    violations.append("dynamic format specs are not allowed in sandboxed run_code; use a fixed literal spec")
+                elif isinstance(sub, _ast.Constant):
                     if isinstance(sub.value, (int, float)) and not isinstance(sub.value, bool):
                         if abs(sub.value) > _FSTRING_MAX_SPEC_NUMBER:
                             violations.append(
@@ -797,6 +800,44 @@ def _fstring_violations(tree) -> list:
                                     f"format width/precision larger than {_FSTRING_MAX_SPEC_NUMBER} is not allowed in sandboxed run_code")
                                 break
     return violations
+
+
+def _suggest_targeted_patch(old: str, new: str) -> str | None:
+    """When a lossy overwrite/patch is refused, give the model a ready-to-use
+    targeted patch_file call for the small localized change it actually wants."""
+    import difflib
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    ops = [op for op in sm.get_opcodes() if op[0] != "equal"]
+    # Deletions are the content loss being refused - never suggest them.
+    ops = [op for op in ops if op[0] != "delete"]
+    if not (1 <= len(ops) <= 2):
+        return None
+    import json as _json
+    hints = []
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "replace":
+            target = "".join(old_lines[i1:i2])
+            replacement = "".join(new_lines[j1:j2])
+        else:  # insert: anchor on the neighbouring unchanged line
+            if i1 > 0 and old_lines[i1 - 1].strip():
+                anchor = old_lines[i1 - 1]
+                target = anchor
+                replacement = anchor + "".join(new_lines[j1:j2])
+            elif i1 < len(old_lines) and old_lines[i1].strip():
+                anchor = old_lines[i1]
+                target = anchor
+                replacement = "".join(new_lines[j1:j2]) + anchor
+            else:
+                return None
+        if not target or len(target) > 2000 or len(replacement) > 2000:
+            return None
+        hints.append("patch_file with these exact arguments (JSON): "
+                     + _json.dumps({"path": "{path}", "target": target, "replacement": replacement}))
+    if not hints:
+        return None
+    return "To apply just the change without deleting anything, call " + " and then ".join(hints)
 
 
 def _sandbox_check(code: str) -> str | None:
