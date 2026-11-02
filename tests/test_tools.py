@@ -274,12 +274,46 @@ def test_run_code_output_capped_at_one_mib():
 def test_run_code_memory_ceiling_kills_huge_allocation():
     # Real resource-failure proof: a ~600MB allocation exceeds the 512MB child
     # address-space limit and dies as MemoryError instead of hanging or OOM-ing
-    # the host. Skipped automatically where RLIMIT_AS is unavailable (Android).
-    import resource
-    from nexus_agent_ai.agent.tools import execute_run_code
+    # the host. The ceiling is a POSIX-only control verified on Linux (see
+    # _child_rlimits_supported): Android/Termux and Windows deliberately run
+    # the child without rlimits, so this test runs only where the control is
+    # actually enforced; the omission on other platforms is pinned by
+    # test_run_code_rlimit_dispatch_matches_supported_boundary below.
+    from nexus_agent_ai.agent.tools import _child_rlimits_supported, execute_run_code
+    if not _child_rlimits_supported():
+        pytest.skip("child rlimits not applied on this platform (Android/Termux or Windows); "
+                    "memory ceiling is a desktop-POSIX-only control")
     result = execute_run_code('x = "y" * 600_000_000\nprint(len(x))')
     assert "600000000" not in result
     assert "ERROR" in result or "MemoryError" in result or "STDERR" in result
+
+
+def test_run_code_rlimit_dispatch_matches_supported_boundary(monkeypatch):
+    # The dispatch itself is the contract: rlimits on plain POSIX, omitted on
+    # Android/Termux (ANDROID_ROOT set) and on non-POSIX. Pinning the omission
+    # keeps the uncovered-platform gap explicit instead of silently skipped.
+    from nexus_agent_ai.agent import tools
+    monkeypatch.delenv("ANDROID_ROOT", raising=False)
+    monkeypatch.setattr(tools.os, "name", "posix")
+    assert tools._child_rlimits_supported() is True
+    monkeypatch.setenv("ANDROID_ROOT", "/system")
+    assert tools._child_rlimits_supported() is False
+    monkeypatch.delenv("ANDROID_ROOT", raising=False)
+    monkeypatch.setattr(tools.os, "name", "nt")
+    assert tools._child_rlimits_supported() is False
+
+
+def test_run_code_execution_works_where_rlimits_omitted(monkeypatch):
+    # Where rlimits are deliberately omitted (simulated Android dispatch), the
+    # remaining controls must still let ordinary code execute: timeout,
+    # stripped environment and output caps stay active.
+    from nexus_agent_ai.agent import tools
+    if tools.os.name != "posix":
+        pytest.skip("dispatch simulation requires a posix host")
+    monkeypatch.setenv("ANDROID_ROOT", "/system")
+    assert tools._child_rlimits_supported() is False
+    result = tools.execute_run_code('x = "y" * 1_000\nprint(len(x))')
+    assert "1000" in result
 
 
 def test_run_code_repr_of_large_object_output_truncated():

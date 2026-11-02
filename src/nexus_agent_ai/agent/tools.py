@@ -911,6 +911,24 @@ def _sandbox_check(code: str) -> str | None:
         )
     return None
 
+def _child_rlimits_supported() -> bool:
+    """Whether run_code child-process rlimits (CPU/AS/FSIZE/NOFILE) are applied.
+
+    Supported boundary, explicitly: desktop POSIX by code path; verified by
+    test on Linux only - macOS shares the code path but has no separate test
+    evidence. On Android/Termux the child runs WITHOUT the 512MB
+    address-space ceiling -
+    platform reservation behavior makes small RLIMIT_AS values unreliable
+    there, so the enforced controls on Android are the AST sandbox, the
+    subprocess timeout, the stripped environment and the output caps, and
+    nothing else. On Windows (os.name != "posix") preexec_fn is unavailable,
+    so no rlimits are applied there either; a real ceiling would need Job
+    Objects (not implemented). Do not claim the memory ceiling outside
+    desktop POSIX.
+    """
+    return os.name == "posix" and not os.getenv("ANDROID_ROOT")
+
+
 def execute_run_code(code: str, language: str = "python") -> str:
     """Run Python code snippet in a sandboxed subprocess with AST analysis + timeout."""
     if language.lower() not in ["python", "py"]:
@@ -929,9 +947,7 @@ def execute_run_code(code: str, language: str = "python") -> str:
         try:
             safe_env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
             preexec_fn = None
-            # Android/Termux applies process resource limits differently; the
-            # subprocess timeout and stripped environment remain active there.
-            if os.name == "posix" and not os.getenv("ANDROID_ROOT"):
+            if _child_rlimits_supported():
                 def _limit_child_resources():
                     try:
                         import resource
