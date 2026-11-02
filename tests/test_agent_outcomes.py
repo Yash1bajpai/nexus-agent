@@ -255,21 +255,39 @@ def test_system_prompt_rules_run_file_arithmetic_speaker_identity():
 
 
 def test_zero_tool_file_creation_claim_is_corrected_without_retry():
-    # Output-claim guard: model claims a concrete file was created although no
-    # mutating tool ran; the request itself carries no edit intent keywords.
-    agent = Agent(Scripted(["I've created calculator.py with the add function."]), tools=[], verbose=False)
-    final = agent.run("make me a small example for addition")
+    # The user explicitly asked for a filesystem effect and the model claims it
+    # happened although no mutating tool ran: fail clean, no repair retry.
+    provider = Scripted(["I've created calculator.py with the add function."])
+    agent = Agent(provider, tools=[], verbose=False)
+    final = agent.run("create a file calculator.py with a function that adds two numbers")
     assert agent.claimed_unapplied_edit
     assert "no file tool modified any file" in final
-    assert len(agent.turns if hasattr(agent, "turns") else []) == 0  # no extra provider round-trip
+    assert len(provider.seen) == 1  # fail clean: exactly one provider call, no auto-retry
 
 
 def test_zero_tool_file_claim_does_not_repair_retry():
     provider = Scripted(["Done - math_utils.py has been saved with the helper."])
     agent = Agent(provider, tools=[], verbose=False)
-    final = agent.run("set up the helper")
+    final = agent.run("create the file math_utils.py with the helper")
     assert agent.claimed_unapplied_edit
-    assert len(provider.seen) == 1  # fail clean: exactly one provider call, no auto-retry
+    assert len(provider.seen) == 1
+
+
+def test_inline_authored_draft_is_not_a_false_claim():
+    # Standard "code below" authoring: no failure mark, no advisory noise.
+    agent = Agent(Scripted(["I have created parse.py below:\n\n```python\nimport csv\n```"]), tools=[], verbose=False)
+    final = agent.run("create a script to parse CSV")
+    assert not agent.claimed_unapplied_edit
+    assert "Correction:" not in final and "no file was written to disk" not in final
+
+
+def test_uncertain_file_claim_gets_honest_advisory_not_failure():
+    # Claim without an explicit filesystem request: advisory, not a failure mark.
+    agent = Agent(Scripted(["I've created calculator.py with the add function."]), tools=[], verbose=False)
+    final = agent.run("make me a small example for addition")
+    assert not agent.claimed_unapplied_edit
+    assert "no file was written to disk in this run" in final
+    assert "Correction:" not in final
 
 
 def test_pure_advice_with_filename_is_not_a_false_claim():
@@ -277,3 +295,55 @@ def test_pure_advice_with_filename_is_not_a_false_claim():
     final = agent.run("how do I make a config file?")
     assert not agent.claimed_unapplied_edit
     assert "Correction:" not in final
+    assert "no file was written to disk" not in final
+
+
+def test_truncated_edit_turn_retries_once_with_larger_output_budget():
+    # finish_reason=length on an edit turn: one bounded retry with a boosted
+    # output budget, then normal completion (no infinite loop).
+    class LengthThenOk(Scripted):
+        context_size = 8192
+        max_output_tokens = 512
+        _supports_output_budget = True
+        is_local = True
+
+        def __init__(self, turns):
+            super().__init__(turns, local=True)
+            self.caps = []
+
+        def complete(self, messages, tools, system):
+            self.caps.append(getattr(self, "_request_output_cap", None))
+            turn = self.turns.pop(0)
+            if turn == "LENGTH":
+                return ProviderResponse(text="partial", finish_reason="length",
+                                        raw_assistant_message=assistant_message("partial", []))
+            return ProviderResponse(text=turn, raw_assistant_message=assistant_message(turn, []))
+
+    provider = LengthThenOk(["LENGTH", "Here is the file content written to notes.txt."])
+    agent = Agent(provider, tools=[tool("write_file")], verbose=False)
+    final = agent.run("create a file notes.txt with this long content")
+    assert not agent.response_incomplete
+    assert "output limit" not in final
+    assert len(provider.caps) == 2
+    assert provider.caps[1] == 2048  # boosted once
+
+
+def test_repeated_truncation_does_not_retry_forever():
+    class AlwaysLength(Scripted):
+        context_size = 8192
+        max_output_tokens = 512
+        _supports_output_budget = True
+        is_local = True
+
+        def complete(self, messages, tools, system):
+            self.seen.append(list(messages))
+            return ProviderResponse(text="partial", finish_reason="length",
+                                    raw_assistant_message=assistant_message("partial", []))
+
+    provider = AlwaysLength([])
+    provider.is_local = True
+    agent = Agent(provider, tools=[tool("write_file")], max_iterations=4, verbose=False)
+    final = agent.run("create a file notes.txt with this long content")
+    assert agent.response_incomplete
+    assert "reached its output limit" in final
+    assert len(provider.seen) == 2  # one boost retry, then honest incomplete

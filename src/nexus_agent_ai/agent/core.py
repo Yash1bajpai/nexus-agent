@@ -125,6 +125,20 @@ _FILE_CLAIM = re.compile(
     + r"|" + _FILE_REF + r"[^.\n]{0,80}?(?:has|have|was|were|is|are)\s+(?:now\s+|successfully\s+)?(?:been\s+)?" + _CLAIMED + r"\b",
     re.IGNORECASE,
 )
+# Inline-draft signals: "created parse.py below:" followed by a code block is standard
+# authored-in-reply phrasing, not a claim that anything was written to disk.
+_DRAFT_SIGNAL = re.compile(
+    r"\bbelow\b|\bfollowing\b|\bhere(?:'s| is)\s+(?:the\s+)?(?:code|script|file|example)\b|```",
+    re.IGNORECASE,
+)
+# The user explicitly asked for a filesystem create/edit effect (not advice or inline code).
+_FILE_OP_REQUEST = re.compile(
+    r"\b(?:create|write|save|edit|fix|modify|update|patch|change|add|make|generate|rename|delete|remove)\b"
+    r"[^.\n]{0,80}?(?:\bfile\b|\bscript\b|\bmodule\b|[\w./\\-]+\." + _FILE_EXT + r")"
+    r"|\b(?:file|script|module)\b[^.\n]{0,60}?"
+    r"\b(?:create|write|save|edit|fix|modify|update|patch|change|rename|delete|remove)\b",
+    re.IGNORECASE,
+)
 
 
 def _file_state(path: Path):
@@ -384,6 +398,14 @@ class Agent:
         # single token. Explicit smaller caps remain exact.
         minimum_output = min(configured, 256)
         overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
+        # A pending output-boost retry raises the reserve BEFORE fitting, so the
+        # history budget shrinks accordingly and input + output stays within the
+        # window. The boost is consumed here; it never overflows the window.
+        if adaptive:
+            boost = getattr(self, "_output_boost", None)
+            if boost:
+                self._output_boost = None
+                reserve = max(reserve, min(boost, max(minimum_output, window - overhead - 256)))
         while True:
             budget = window - reserve - overhead
             try:
@@ -489,6 +511,7 @@ class Agent:
         unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
         unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
         window_scale = 1.0
+        length_boost_used = False
         wrote_ok = False
         tool_executed = False
         search_succeeded = False
@@ -573,6 +596,19 @@ class Agent:
                     # Even complete-looking arguments may belong to an unfinished plan.
                     self.response_incomplete = True
                     response.tool_calls = []
+                    active_now = getattr(self.provider, "active_provider", self.provider)
+                    if (not length_boost_used and local_mode
+                            and (wants_edit or _FILE_OP_REQUEST.search(routing_input or ""))
+                            and getattr(active_now, "_supports_output_budget", False)):
+                        # One bounded retry with a larger output budget: a cut-off
+                        # tool call (e.g. a long literal file write) gets one chance
+                        # to complete instead of failing the turn outright.
+                        length_boost_used = True
+                        self.response_incomplete = False
+                        self._output_boost = 2048
+                        iteration -= 1
+                        display.print_warn("The model hit its output limit mid-answer. Retrying once with a larger output budget.")
+                        continue
 
                 if response.has_tool_calls:
                     self.memory.add_raw(assistant_message(response.text, response.tool_calls))
@@ -774,17 +810,24 @@ class Agent:
                             # Not just "nothing to change": the model claimed an edit that never happened.
                             self.claimed_unapplied_edit = True
                             final_text += "\nThe claim above that the code was changed is false: the files were not modified."
-                    if (not wrote_ok and not self.claimed_unapplied_edit
-                            and _FILE_CLAIM.search(final_text or "")
-                            and not _NO_CHANGE_OK.search(final_text or "")):
-                        # Zero-tool false success: the answer claims a concrete file was
-                        # created/changed but no mutating tool changed any file this turn.
-                        # Fail clean: correct the record, mark the turn not cleanly finished,
-                        # no automatic repair retry.
-                        self.claimed_unapplied_edit = True
-                        final_text += ("\n\nCorrection: the statement above that a file was created or "
-                                       "changed is not true - no file tool modified any file in this run, "
-                                       "so nothing was written to disk.")
+                    if not wrote_ok and not self.claimed_unapplied_edit:
+                        _claim = _FILE_CLAIM.search(final_text or "")
+                        if _claim and not _NO_CHANGE_OK.search(final_text or ""):
+                            _after = (final_text or "")[_claim.start():_claim.start() + 400]
+                            if not _DRAFT_SIGNAL.search(_after):
+                                if _FILE_OP_REQUEST.search(user_input or ""):
+                                    # The user asked for a filesystem effect and the answer claims
+                                    # it happened, but no mutating tool changed any file this turn.
+                                    # Fail clean: correct the record, mark the turn not cleanly
+                                    # finished, no automatic repair retry.
+                                    self.claimed_unapplied_edit = True
+                                    final_text += ("\n\nCorrection: the statement above that a file was created or "
+                                                   "changed is not true - no file tool modified any file in this run, "
+                                                   "so nothing was written to disk.")
+                                else:
+                                    # Uncertain intent: honest advisory, not a failure mark.
+                                    final_text += ("\n\nNote: no file was written to disk in this run; "
+                                                   "any code above exists only in this reply.")
                     self.requirements_incomplete = (
                         requirement_scope_errors + check_function_requirements(function_requirements)
                         + check_literal_assignment_requirement(literal_assignment_requirement)
