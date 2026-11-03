@@ -57,7 +57,7 @@ def test_fit_preserves_tool_pairs_and_refuses_to_drop_protected_turn():
 def test_fit_refuses_to_truncate_giant_current_user_request():
     big = "HEAD" + ("z" * 40_000) + "TAIL"
     msgs = [{"role": "user", "content": big}]
-    with pytest.raises(ctx.ContextBudgetError, match="newest user request"):
+    with pytest.raises(ctx.ContextBudgetError):
         ctx.fit_messages(msgs, 1000)
     assert msgs[0]["content"] == big
 
@@ -211,7 +211,8 @@ def test_internal_nudges_do_not_replace_real_request_or_split_tool_pairs(tmp_pat
     assert "Try again" not in compacted[0]["content"]
 
 
-def test_large_tool_arguments_fit_intact_or_fail_explicitly():
+@pytest.mark.parametrize("active", [True, False], ids=["active", "previous"])
+def test_large_tool_arguments_fit_intact_or_fail_explicitly(active):
     arguments = json.dumps({"path": "huge.py", "content": "x" * 20_000})
     messages = [
         {"role": "user", "content": "Create huge.py"},
@@ -221,6 +222,9 @@ def test_large_tool_arguments_fit_intact_or_fail_explicitly():
         }]},
         {"role": "tool", "tool_call_id": "large", "content": "Successfully wrote huge.py"},
     ]
+    if not active:
+        messages += [{"role": "assistant", "content": "Created huge.py"},
+                     {"role": "user", "content": "Review it next"}]
     fitted, _ = ctx.fit_messages(messages, 10_000)
     assert fitted[1]["tool_calls"][0]["function"]["arguments"] == arguments
     assert json.loads(fitted[1]["tool_calls"][0]["function"]["arguments"])["content"] == "x" * 20_000

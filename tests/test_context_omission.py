@@ -101,14 +101,34 @@ def test_retained_tool_calls_are_historical_hints_not_execution_proof():
     assert stats["omission_tokens"] == ctx.history_tokens(fitted[:2]) <= 150
 
 
-def test_protected_tool_output_is_not_compacted():
+@pytest.mark.parametrize("active", [True, False], ids=["active", "previous"])
+def test_only_active_tool_output_is_fully_protected(active):
     messages = [
         {"role": "user", "content": "Read this file"}, call(),
         {"role": "tool", "tool_call_id": "read", "content": "x" * 20000},
+        {"role": "assistant", "content": "Read result received."},
     ]
+    if not active:
+        messages.append({"role": "user", "content": "Now review the result."})
     before = copy.deepcopy(messages)
-    with pytest.raises(ctx.ContextBudgetError):
-        ctx.fit_messages(messages, 700)
+    if active:
+        with pytest.raises(ctx.ContextBudgetError):
+            ctx.fit_messages(messages, 700)
+    else:
+        fitted, stats = ctx.fit_messages(messages, 700)
+        assert_historical_index(fitted[:2])
+        assert fitted[4]["content"].startswith("[COMPACTED: read_file result,")
+        assert fitted[2:4] == messages[:2]
+        assert fitted[5:] == messages[3:]
+        assert fitted[3]["tool_calls"][0]["id"] == fitted[4]["tool_call_id"] == "read"
+        restored = copy.deepcopy(fitted[2:])
+        restored[2]["content"] = stats["artifacts"][0]["content"]
+        assert restored == before
+        assert stats["artifacts"][0]["content"] == before[2]["content"]
+        assert stats["compacted_messages"] == 1
+        assert stats["evicted_turns"] == stats["dropped_messages"] == stats["dropped_turns"] == 0
+        assert stats["turns_before"] == stats["turns_after"] == 2
+        assert stats["tokens"] == ctx.history_tokens(fitted) <= 700
     assert messages == before
 
 

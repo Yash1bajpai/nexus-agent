@@ -130,8 +130,11 @@ def is_context_overflow(error: BaseException) -> bool:
 
 
 
-def _omission_pair(files=(), topics=(), tools=()):
-    lines = [_OMISSION_ANCHOR]
+def _omission_pair(files=(), topics=(), tools=(), *, evicted_turns=0, turns_before=0):
+    lines = []
+    if evicted_turns:
+        lines.append(f"Older turns evicted ({evicted_turns} of {turns_before} shown as index only).")
+    lines.append(_OMISSION_ANCHOR)
     if files:
         lines.append("Retained file paths: " + ", ".join(files))
     if topics:
@@ -198,18 +201,18 @@ def _collect_omission_fields(messages, session_record=None):
     return record
 
 
-def _fit_omission_fields(record, budget_tokens):
+def _fit_omission_fields(record, budget_tokens, *, evicted_turns=0, turns_before=0):
     """Expose exactly the retained fields after tools/topics/files shedding."""
     record = {key: list(value) if isinstance(value, list) else value
               for key, value in record.items()}
     files, topics, tools = (record[key] for key in ("files", "topics", "tools"))
     cap = min(OMISSION_MAX_TOKENS, budget_tokens)
-    pair = _omission_pair(files, topics, tools)
+    pair = _omission_pair(files, topics, tools, evicted_turns=evicted_turns, turns_before=turns_before)
     # Tool names are least valuable, then older topics, then older file references.
     for items in (tools, topics, files):
         while items and history_tokens(pair) > cap:
             items.pop(0)
-            pair = _omission_pair(files, topics, tools)
+            pair = _omission_pair(files, topics, tools, evicted_turns=evicted_turns, turns_before=turns_before)
     if history_tokens(pair) > cap:
         raise ContextBudgetError(
             "Historical omission coverage gap: the omission anchor and acknowledgement "
@@ -344,6 +347,55 @@ def _pinned_read_messages(messages):
     return pinned
 
 
+def _pinned_evidence(message):
+    """Only structured evidence flags carry protection; prose grants no authority."""
+    metadata = message.get("metadata", {})
+    return (
+        message.get("role") == "system"
+        or bool(metadata.get("outcome_correction") or metadata.get("claim_redactions")
+                or metadata.get("recovery_pinned"))
+        or any(key in metadata for key in (
+            "edit_recovery", "consent", "authority", "approval",
+            "consent_record", "authority_record", "execution_consent", "removal_consent",
+        ))
+    )
+
+
+def _tool_results(message):
+    if message.get("role") == "tool":
+        yield message.get("tool_call_id"), message.get("name")
+        return
+    blocks = message.get("parts") or message.get("content")
+    for block in blocks if isinstance(blocks, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            yield block.get("tool_use_id"), None
+        response = block.get("function_response") or block.get("functionResponse")
+        if isinstance(response, dict):
+            yield response.get("id"), response.get("name")
+
+
+def _completed_turn(messages):
+    """Require a final assistant and closed native call/result bindings."""
+    if (not messages or messages[-1].get("role") not in ("assistant", "model")
+            or not _text_of(messages[-1]) or any(_tool_calls(messages[-1]))):
+        return False
+    pending = []
+    for message in messages:
+        for call_id, name, _ in _tool_calls(message):
+            if call_id and any(call_id == existing_id for existing_id, _ in pending):
+                return False
+            pending.append((call_id, name))
+        for result_id, name in _tool_results(message):
+            match = next((index for index, (call_id, call_name) in enumerate(pending)
+                          if (call_id == result_id if result_id else name and name == call_name)), None)
+            if match is None:
+                return False
+            pending.pop(match)
+    return not pending
+
+
 def fit_messages(
     messages: List[Dict[str, Any]], budget_tokens: int, *, session_record=None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -358,16 +410,18 @@ def fit_messages(
     lengths (json.dumps(default=str, ensure_ascii=False)) before/after surgical
     replacement: after factual claim projection/private-ledger removal and
     excluding the prepended index pair, including remaining metadata.
-    No turn/container, tool binding, tool argument, correction, or message in
-    the last two genuine user turns is eligible for replacement.
+    The active turn is fully protected; N-1 protects structure and text but not
+    ordinary tool-result payloads. Only a completed, unpinned prefix older than
+    N-1 can be evicted, after the surgical pass and mandatory anchor reservation.
     """
     record = _validated_session_record(session_record)
     stats = {"dropped_messages": 0, "truncated_messages": 0, "compacted_messages": 0,
              "tokens": 0, "omission_tokens": 0, "session_record": None,
              "fields_included": {"files": 0, "topics": 0, "tools": 0},
-             "claim_redactions": [], "artifacts": [], "elided_tokens": 0}
+             "claim_redactions": [], "artifacts": [], "elided_tokens": 0, "evicted_turns": 0}
     view = fitted_claim_view(messages)
     pinned = _pinned_read_messages(view)
+    pinned.update(index for index, message in enumerate(view) if _pinned_evidence(message))
     msgs = copy.deepcopy(view)
     for message in msgs:
         metadata = message.get("metadata", {})
@@ -383,18 +437,17 @@ def fit_messages(
     starts = [i for i, message in enumerate(msgs) if is_genuine_user_message(message)]
     stats["turns_before"] = stats["turns_after"] = len(starts)
     stats["dropped_turns"] = 0
-    protected_start = starts[-2] if len(starts) >= 2 else (starts[0] if starts else 0)
+    active_start = starts[-1] if starts else 0
+    previous_start = starts[-2] if len(starts) >= 2 else active_start
     calls, candidates = {}, []
     for index, message in enumerate(msgs):
         for call_id, name, arguments in _tool_calls(message):
             calls[call_id] = (name or "unknown_tool", _call_paths(arguments))
-        if (index >= protected_start or index in pinned or message.get("role") == "system"
-                or message.get("metadata", {}).get("outcome_correction")
-                or message.get("metadata", {}).get("claim_redactions")
-                or message.get("metadata", {}).get("recovery_pinned")
-                or "edit_recovery" in message.get("metadata", {})):
+        if index >= active_start or index in pinned:
             continue
         for owner, key, name in _payloads(message, calls):
+            if index >= previous_start and name is None:
+                continue
             content = owner[key]
             if estimate_tokens(content) < COMPACTION_MIN_TOKENS or content.startswith("[COMPACTED:"):
                 continue
@@ -414,11 +467,12 @@ def fit_messages(
                     "artifact_id": artifact_id, "tool_name": tool_name,
                     "byte_len": len(content.encode("utf-8")), "content": content,
                 }))
-    changed, plans, planned_bytes = set(), {}, 0
+    applied, plans, planned_bytes = [], {}, 0
+    total = history_tokens(msgs)
     needs_record = record is not None
     for index, owner, key, replacement, count, plan in candidates:
         anchor = history_tokens(_omission_pair()) if needs_record else 0
-        if history_tokens(msgs) + anchor <= budget_tokens:
+        if total + anchor <= budget_tokens:
             break
         if plan["artifact_id"] not in plans:
             if planned_bytes + plan["byte_len"] > ARTIFACT_SESSION_MAX_BYTES:
@@ -426,15 +480,37 @@ def fit_messages(
                 continue
             plans[plan["artifact_id"]] = plan
             planned_bytes += plan["byte_len"]
+        before = message_tokens(msgs[index])
         owner[key] = replacement
-        stats["elided_tokens"] += count
-        changed.add(index)
+        total += message_tokens(msgs[index]) - before
+        applied.append((index, count, plan["artifact_id"]))
         needs_record = True
-    total = history_tokens(msgs)
+    # Compaction is complete before eviction begins. Never revisit a skipped
+    # candidate or skip around an old protected/incomplete logical turn.
+    cut = 0
+    for turn_index in range(max(0, len(starts) - 2)):
+        evicted = stats["evicted_turns"]
+        anchor = history_tokens(_omission_pair(
+            evicted_turns=evicted, turns_before=len(starts),
+        )) if needs_record else 0
+        if total + anchor <= budget_tokens:
+            break
+        start, end = starts[turn_index], starts[turn_index + 1]
+        if (start != cut or any(index in pinned for index in range(start, end))
+                or not _completed_turn(view[start:end])):
+            break
+        total -= history_tokens(msgs[start:end])
+        cut = end
+        stats["evicted_turns"] += 1
+        needs_record = True
+    stats["turns_after"] -= stats["evicted_turns"]
+    msgs = msgs[cut:]
     if needs_record:
-        collected = _collect_omission_fields(
-            [message for index, message in enumerate(view) if index < protected_start], record)
-        note, retained = _fit_omission_fields(collected, budget_tokens - total)
+        collected = _collect_omission_fields(view[:active_start], record)
+        note, retained = _fit_omission_fields(
+            collected, budget_tokens - total, evicted_turns=stats["evicted_turns"],
+            turns_before=stats["turns_before"],
+        )
         stats["session_record"] = retained
         stats["fields_included"] = {key: len(retained[key]) for key in _RECORD_LIMITS}
         stats["omission_tokens"] = history_tokens(note)
@@ -443,12 +519,15 @@ def fit_messages(
     if total + stats["omission_tokens"] > budget_tokens:
         raise ContextBudgetError(
             f"Current conversation needs at least {total + stats['omission_tokens']} estimated tokens "
-            f"but only {budget_tokens} are available. The newest user request, last two genuine "
-            "user turns, pinned reads, corrections, tool arguments and call/result bindings "
-            "were preserved; no over-budget request was sent. Shorten input or adjust configured budgets."
+            f"but only {budget_tokens} are available. The active turn, previous-turn structure "
+            "and text, pinned evidence, tool arguments and call/result bindings were preserved; "
+            "no over-budget request was sent. Shorten input or adjust configured budgets."
         )
-    stats["compacted_messages"] = stats["truncated_messages"] = len(changed)
-    stats["artifacts"] = list(plans.values())
+    surviving = [(index, count, artifact_id) for index, count, artifact_id in applied if index >= cut]
+    kept_ids = {artifact_id for _, _, artifact_id in surviving}
+    stats["compacted_messages"] = stats["truncated_messages"] = len({index for index, _, _ in surviving})
+    stats["elided_tokens"] = sum(count for _, count, _ in surviving)
+    stats["artifacts"] = [plan for artifact_id, plan in plans.items() if artifact_id in kept_ids]
     stats["message_bytes_after"] = byte_lengths(msgs)
     for message in msgs:
         if message.get("role") not in ("assistant", "model"):

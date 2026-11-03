@@ -503,7 +503,7 @@ class Agent:
                 "reason": self._edit_recovery["reason"],
             })
             self._edit_recovery["delivered"] = True
-        if stats.get("compacted_messages", 0) and record is not None:
+        if (stats.get("compacted_messages", 0) or stats.get("evicted_turns", 0)) and record is not None:
             self.memory.set_session_metadata("SESSION_RECORD", record)
         if stats.get("omission_tokens", 0):
             # A historical record is not evidence of present files or successful retention.
@@ -640,13 +640,15 @@ class Agent:
                     "so input plus reserved output fits the context window."
                 )
         self.last_trim = stats
-        if stats.get("compacted_messages"):
+        if stats.get("compacted_messages") or stats.get("evicted_turns"):
             before = stats.get("turns_before", 0)
             after = stats.get("turns_after", 0)
+            evicted = stats.get("evicted_turns", 0)
+            eviction = f"evicted {evicted} older turn(s), " if evicted else ""
             display.print_warn(
                 f"Context is full: kept {after} of {before} turn(s) "
                 f"(compacted {stats['compacted_messages']} old content block(s), "
-                f"~{stats['elided_tokens']} payload tokens elided, ~{stats['tokens']} tokens preserved) "
+                f"{eviction}~{stats['elided_tokens']} payload tokens elided, ~{stats['tokens']} tokens preserved) "
                 "for this request. Canonical history is unchanged."
             )
         return fitted
@@ -673,7 +675,7 @@ class Agent:
             "history": hist_tok, "reserve": reserve,
             "total": overhead + hist_tok + reserve, "window": self.context_window or 0,
             "projection": None, "fitted_history": None, "free": None,
-            "kept_turns": 0, "dropped_turns": 0, "omission_tokens": 0,
+            "kept_turns": 0, "dropped_turns": 0, "evicted_turns": 0, "omission_tokens": 0,
             "projection_error": "",
         }
         if not self.context_window:
@@ -693,6 +695,7 @@ class Agent:
             projection=projection, fitted_history=stats["tokens"],
             free=stats["request_window"] - projection,
             kept_turns=stats["turns_after"], dropped_turns=stats["dropped_turns"],
+            evicted_turns=stats.get("evicted_turns", 0),
             omission_tokens=stats["omission_tokens"],
         )
         return result

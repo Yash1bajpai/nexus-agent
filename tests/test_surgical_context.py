@@ -59,12 +59,17 @@ def test_exact_placeholder_utf8_bytes_token_accounting_and_pure_deterministic_pl
 
 
 @pytest.mark.parametrize("projector", [lambda x: x, openai_messages, anthropic_messages, gemini_messages])
-def test_each_message_shape_keeps_structure_ids_arguments_and_last_two_turns(projector):
-    messages = projector(history("payload " * 3000))
+@pytest.mark.parametrize("tool_turn", ["older", "previous"])
+def test_each_message_shape_keeps_structure_ids_arguments_and_protected_text(projector, tool_turn):
+    source = history("payload " * 3000)
+    if tool_turn == "previous":
+        source = source[:4] + source[-1:]
+    messages = projector(source)
     before = copy.deepcopy(messages)
     fitted, stats = ctx.fit_messages(messages, 900)
     assert stats["compacted_messages"] == 1
-    assert stats["turns_before"] == stats["turns_after"] == 3
+    assert stats["turns_before"] == stats["turns_after"] == (3 if tool_turn == "older" else 2)
+    assert stats["evicted_turns"] == stats["dropped_messages"] == stats["dropped_turns"] == 0
     assert len(fitted[2:]) == len(messages)
     # Restoring just the eligible string yields the original native containers.
     restored = copy.deepcopy(fitted[2:])
@@ -115,10 +120,9 @@ def test_non_tool_oversized_text_uses_exact_non_tool_placeholder():
     assert fitted[2]["content"] == f"[COMPACTED: {ctx.estimate_tokens(content)} tokens elided. Artifact ID: {artifact['artifact_id']}]"
 
 
-@pytest.mark.parametrize("position", [0, 1])
-def test_last_two_genuine_turns_are_full_even_when_heavy(position):
-    messages = history("old " * 3000)
-    index = 4 if position == 0 else 6
+@pytest.mark.parametrize("index", [4, 5, 6, 7])
+def test_last_two_genuine_turns_keep_user_and_assistant_text_full_even_when_heavy(index):
+    messages = history("old " * 3000) + [{"role": "assistant", "content": "Current answer"}]
     messages[index]["content"] = "protected " * 3000
     original = copy.deepcopy(messages)
     with pytest.raises(ctx.ContextBudgetError):
@@ -170,6 +174,7 @@ def test_mid_chain_recovery_evidence_is_not_compacted_even_in_older_turn(metadat
 
 def test_oversized_artifact_cannot_produce_a_dangling_claim():
     messages = history("x" * (ctx.ARTIFACT_SESSION_MAX_BYTES + 1))
+    messages = messages[:4] + messages[-1:]
     with pytest.raises(ctx.ContextBudgetError):
         ctx.fit_messages(messages, 800)
 
