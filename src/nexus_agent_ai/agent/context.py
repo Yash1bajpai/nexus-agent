@@ -426,21 +426,28 @@ def _executor_closed_turn(messages):
     )
 
 
-def _omission_floor(view, starts, pinned, needs_record):
-    """Charge the actual minimum pair before dynamic content can fill its room.
+def _omission_floor(view, starts, pinned, needs_record, *, evicted_turns=0,
+                    evicted_closed_turns=0):
+    """Charge actual counts and the next reachable eviction's serialized pair.
 
-    Cover the first reachable eviction even before SESSION_RECORD exists.
-    Subsequent evictions charge their actual count/closed-turn line in the
-    eviction loop. Merely reserving headroom never injects or persists a record.
+    Counts belong to this fit, not a previous request's trim statistics. Refresh
+    them at each candidate, including a pending closed-turn suffix or digit
+    growth. Headroom alone never injects/persists a record, and cannot account
+    for assistant text/tool arguments that arrive between guarded fits.
     """
-    floor = history_tokens(_omission_pair()) if needs_record else 0
-    if len(starts) > 2:
-        start, end = starts[0], starts[1]
-        if (not any(i in pinned for i in range(start, end))
+    floor = history_tokens(_omission_pair(
+        evicted_turns=evicted_turns, turns_before=len(starts),
+        evicted_closed_turns=evicted_closed_turns,
+    )) if needs_record else 0
+    if evicted_turns < len(starts) - 2:
+        start, end = starts[evicted_turns], starts[evicted_turns + 1]
+        if ((evicted_turns or start == 0)
+                and not any(i in pinned for i in range(start, end))
                 and _completed_turn(view[start:end])):
             floor = max(floor, history_tokens(_omission_pair(
-                evicted_turns=1, turns_before=len(starts),
-                evicted_closed_turns=int(_executor_closed_turn(view[start:end])),
+                evicted_turns=evicted_turns + 1, turns_before=len(starts),
+                evicted_closed_turns=(
+                    evicted_closed_turns + int(_executor_closed_turn(view[start:end]))),
             )))
     return floor
 
@@ -549,12 +556,11 @@ def fit_messages(
     # candidate or skip around an old protected/incomplete logical turn.
     cut = 0
     for turn_index in range(max(0, len(starts) - 2)):
-        evicted = stats["evicted_turns"]
-        anchor = history_tokens(_omission_pair(
-            evicted_turns=evicted, turns_before=len(starts),
+        anchor = _omission_floor(
+            view, starts, pinned, needs_record,
+            evicted_turns=stats["evicted_turns"],
             evicted_closed_turns=stats["evicted_closed_turns"],
-        )) if needs_record else 0
-        anchor = max(anchor, omission_floor)
+        )
         if total + anchor <= budget_tokens:
             break
         start, end = starts[turn_index], starts[turn_index + 1]
@@ -568,8 +574,6 @@ def fit_messages(
         needs_record = True
     stats["turns_after"] -= stats["evicted_turns"]
     msgs = msgs[cut:]
-    if omission_floor:
-        _check_omission_budget(omission_floor, budget_tokens - total)
     if needs_record:
         collected = _collect_omission_fields(view[:active_start], record)
         note, retained = _fit_omission_fields(

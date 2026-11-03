@@ -240,3 +240,148 @@ def test_stat_preflight_refuses_output_that_would_spend_first_eviction_tax(tmp_p
     assert refused.executed is False
     assert str(tmp_path / "sample.py") not in tools._FILE_STATE
     assert agent.memory.get_session_metadata("SESSION_RECORD") is None
+
+
+def projected_margin_fixture(tmp_path, evicted, prefix_closed, next_closed, record):
+    memory = SQLiteMemory(tmp_path / "projected" / "history.db", session_id="r10")
+    history = []
+    for index in range(evicted + 2):
+        final = {"role": "assistant", "content": "Recorded."}
+        if index < prefix_closed or (index == evicted and next_closed):
+            final["metadata"] = {
+                "executor_closed": True, "executor": True, "reason": "ContextBudgetError",
+            }
+        history.extend([{"role": "user", "content": f"Earlier {index}."}, final])
+    current = ToolCall("projected", "read_file", {"path": "sample.py"})
+    history.extend([
+        {"role": "user", "content": "  Read sample.py. café\n\t"},
+        assistant_message("", [current]),
+    ])
+    for message in history:
+        memory.add_raw(message)
+    if record:
+        memory.set_session_metadata("SESSION_RECORD", RECORD)
+    agent = Agent(Offline(), memory=memory, tools=[tools.READ_FILE_TOOL], verbose=False)
+    wanted = 4096 - 512 - BUDGET - ctx.tools_tokens(agent.tools)
+    agent.system = "s" * math.ceil((wanted - 1) * ctx.CHARS_PER_TOKEN)
+    pending = {"call": current, "state": "pending", "result": None}
+    agent._pending_calls = [pending]
+    pair = ctx._omission_pair(
+        evicted_turns=evicted, turns_before=evicted + 3,
+        evicted_closed_turns=prefix_closed,
+    )
+    remaining = ctx.history_tokens(pair)
+    target = BUDGET - remaining + ctx.history_tokens(history[:2 * evicted])
+    payload = maximal_payload(agent, pending, target)
+    return agent, pending, payload, pair
+
+
+@pytest.mark.parametrize("record", [False, True], ids=["first-record", "existing-record"])
+@pytest.mark.parametrize("evicted,prefix_closed,next_closed,extra", [
+    (1, 0, True, 1), (9, 0, False, 1), (5, 2, False, 0),
+], ids=["closed-suffix", "count-digit", "actual-closed-count"])
+def test_projected_pair_razor_margin_preserves_active_content(
+        tmp_path, record, evicted, prefix_closed, next_closed, extra):
+    agent, pending, payload, current_pair = projected_margin_fixture(
+        tmp_path, evicted, prefix_closed, next_closed, record)
+    original = copy.deepcopy(agent.memory.get())
+    prospective = agent._prospective_result_messages(pending, payload)
+    assert (ctx.history_tokens(prospective[2 * evicted:])
+            + ctx.history_tokens(current_pair)) == BUDGET
+    fitted, stats = agent._plan_fit(prospective, agent.tools)
+    count = evicted + extra
+    closed = prefix_closed + int(next_closed and extra > 0)
+    expected_pair = ctx._omission_pair(
+        evicted_turns=count, turns_before=evicted + 3, evicted_closed_turns=closed)
+    assert stats["evicted_turns"] == count
+    assert stats["evicted_closed_turns"] == closed
+    assert fitted[:2] == expected_pair
+    assert fitted[2:] == prospective[2 * count:]
+    assert fitted[-3:] == prospective[-3:]
+    assert stats["tokens"] == ctx.history_tokens(fitted) <= BUDGET
+    assert stats["omission_tokens"] == ctx.history_tokens(expected_pair) <= ctx.OMISSION_MAX_TOKENS
+    assert agent.memory.get() == original
+    assert agent.memory.get_session_metadata("SESSION_RECORD") == (RECORD if record else None)
+
+
+@pytest.mark.parametrize("evicted,next_closed", [(1, True), (9, False)],
+                         ids=["closed-suffix", "count-digit"])
+def test_admission_projects_next_eviction_pair_and_exact_receipt_capacity(tmp_path, evicted, next_closed):
+    agent, pending, payload, _ = projected_margin_fixture(tmp_path, evicted, 0, next_closed, True)
+    original = copy.deepcopy(agent.memory.get())
+    result = guard_tool_result(
+        "read_file", execution_result(payload, executed=True, outcome="read_file completed."),
+        memory=agent.memory,
+        fits=lambda text: agent._tool_result_fits(pending, text, agent.tools))
+    fitted, stats = agent._plan_fit(agent._prospective_result_messages(pending, result), agent.tools)
+    assert result == payload
+    assert stats["evicted_turns"] == evicted + 1
+    assert fitted[-1]["tool_call_id"] == "projected"
+    assert fitted[-1]["content"] == payload
+    pair = ctx._omission_pair(
+        evicted_turns=evicted + 1, turns_before=evicted + 3,
+        evicted_closed_turns=int(next_closed))
+    empty = agent._prospective_result_messages(pending, "")
+    capacity = BUDGET - ctx.history_tokens(empty[2 * (evicted + 1):]) - ctx.history_tokens(pair)
+    assert agent._tool_result_fits(pending, "", agent.tools, result_tokens=capacity)
+    assert not agent._tool_result_fits(pending, "", agent.tools, result_tokens=capacity + 1)
+    assert agent.memory.get() == original
+
+
+def test_projected_reservation_without_pressure_does_not_create_record(tmp_path):
+    agent, pending, _, _ = projected_margin_fixture(tmp_path, 9, 2, True, False)
+    original = copy.deepcopy(agent.memory.get())
+    prospective = agent._prospective_result_messages(pending, "small result")
+    fitted, stats = agent._plan_fit(prospective, agent.tools)
+    assert fitted == prospective
+    assert stats["evicted_turns"] == stats["omission_tokens"] == 0
+    assert stats["session_record"] is None
+    assert agent.memory.get_session_metadata("SESSION_RECORD") is None
+    assert agent.memory.get() == original
+
+
+def test_projected_pair_does_not_suppress_irreducible_receipt_fatal(tmp_path):
+    minimum_pair = ctx.history_tokens(ctx._omission_pair())
+    minimum_receipt = "Outcome: read_file completed.\nOutput discarded."
+    binding = assistant_message("", [ToolCall("current", "read_file", {"path": "sample.py"})])
+    current = [
+        {"role": "user", "content": ""}, binding,
+        {"role": "tool", "tool_call_id": "current", "content": minimum_receipt},
+    ]
+    low, high = 0, BUDGET * 4
+    while low < high:
+        middle = (low + high + 1) // 2
+        current[0]["content"] = "q" * middle
+        if ctx.history_tokens(current) <= BUDGET - minimum_pair + 1:
+            low = middle
+        else:
+            high = middle - 1
+    current[0]["content"] = "q" * low
+    assert ctx.history_tokens(current[:-1]) + minimum_pair <= BUDGET
+    assert ctx.history_tokens(current) + minimum_pair == BUDGET + 1
+    agent, pending = fixture_agent(tmp_path, record=True, request=current[0]["content"])
+    original = copy.deepcopy(agent.memory.get())
+    with pytest.raises(ctx.ContextBudgetError, match="truthful outcome and output-omission receipt cannot fit"):
+        guard_tool_result(
+            "read_file", execution_result("x" * 20000, executed=True, outcome="read_file completed."),
+            memory=agent.memory,
+            fits=lambda text: agent._tool_result_fits(pending, text, agent.tools))
+    assert agent.memory.get() == original
+    assert agent.memory.get_session_metadata("SESSION_RECORD") == RECORD
+
+
+def test_assistant_arguments_between_fits_remain_protected(tmp_path):
+    agent, pending, payload, _ = projected_margin_fixture(tmp_path, 1, 0, True, True)
+    prospective = agent._prospective_result_messages(pending, payload)
+    fitted, _ = agent._plan_fit(prospective, agent.tools)
+    assert ctx.history_tokens(fitted) <= BUDGET
+    call = ToolCall("later", "run_code", {"code": "print('" + "x" * 600 + "')"})
+    later_binding = assistant_message("", [call])
+    assert ctx.message_tokens(later_binding) < 512
+    after = prospective + [
+        later_binding, {"role": "tool", "tool_call_id": "later", "content": "Output discarded."},
+    ]
+    before = copy.deepcopy(after)
+    with pytest.raises(ctx.ContextBudgetError):
+        agent._plan_fit(after, agent.tools)
+    assert after == before
