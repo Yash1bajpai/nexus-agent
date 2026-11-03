@@ -16,6 +16,8 @@ class Tool:
     description: str
     input_schema: Dict[str, Any]
     execute: Callable[..., str]
+    # Advisory only: never serialized into a provider's tool input schema.
+    estimate_result_tokens: Optional[Callable[..., Optional[int]]] = None
 
 @dataclass
 class ToolCall:

@@ -69,6 +69,7 @@ class SQLiteMemory:
             tool_name TEXT NOT NULL,
             byte_len INTEGER NOT NULL,
             content TEXT NOT NULL,
+            protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0, 1)),
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (session_id, artifact_id)
         )
@@ -90,6 +91,12 @@ class SQLiteMemory:
         conn.execute(cls._SCHEMA_SQL)
         conn.execute(cls._METADATA_SCHEMA_SQL)
         conn.execute(cls._ARTIFACT_SCHEMA_SQL)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(context_artifacts)")}
+        if "protected" not in columns:
+            conn.execute(
+                "ALTER TABLE context_artifacts ADD COLUMN protected INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (protected IN (0, 1))"
+            )
 
     def add(self, role: str, content: str):
         self.add_raw({"role": role, "content": content})
@@ -167,29 +174,72 @@ class SQLiteMemory:
                 (self.session_id, key, SESSION_METADATA_VERSION, encoded),
             )
 
+    @staticmethod
+    def _validate_artifact_plan(plan):
+        if not isinstance(plan, dict) or set(plan) != {"artifact_id", "tool_name", "byte_len", "content"}:
+            raise ValueError("Invalid artifact plan fields.")
+        content, name = plan["content"], plan["tool_name"]
+        if not isinstance(content, str) or not isinstance(name, str):
+            raise ValueError("Artifact content and tool name must be text.")
+        size = len(content.encode("utf-8"))
+        identity = hashlib.sha256((name + "\0" + content).encode("utf-8")).hexdigest()
+        if (type(plan["byte_len"]) is not int or plan["byte_len"] != size
+                or plan["artifact_id"] != identity):
+            raise ValueError("Artifact identity or UTF-8 byte length mismatch.")
+        return identity
+
+    def retain_tool_output(self, plan):
+        """Protect one canonical tool output atomically, without evicting any row.
+
+        Invalid plans and corrupt collisions fail closed. Capacity refusal returns
+        False; database errors propagate so callers can report discarded output.
+        """
+        identity = self._validate_artifact_plan(plan)
+        if plan["byte_len"] > self.ARTIFACT_MAX_BYTES:
+            return False
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            actual = conn.execute(
+                "SELECT tool_name, byte_len, content FROM context_artifacts "
+                "WHERE session_id = ? AND artifact_id = ?", (self.session_id, identity),
+            ).fetchone()
+            expected = (plan["tool_name"], plan["byte_len"], plan["content"])
+            if actual is not None and actual != expected:
+                raise ValueError("Artifact identity collision or corrupt retained content.")
+            total = conn.execute(
+                "SELECT COALESCE(SUM(byte_len), 0) FROM context_artifacts WHERE session_id = ?",
+                (self.session_id,),
+            ).fetchone()[0]
+            if total + (0 if actual is not None else plan["byte_len"]) > self.ARTIFACT_MAX_BYTES:
+                return False
+            if actual is None:
+                conn.execute(
+                    "INSERT INTO context_artifacts "
+                    "(artifact_id, session_id, tool_name, byte_len, content, protected) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (identity, self.session_id, *expected),
+                )
+            else:
+                conn.execute(
+                    "UPDATE context_artifacts SET protected = 1 WHERE session_id = ? AND artifact_id = ?",
+                    (self.session_id, identity),
+                )
+        return True
+
     def store_artifacts(self, plans):
         """Atomically retain all pure fitter plans, or raise without changing state.
 
         Plans have exactly artifact_id/tool_name/byte_len/content; byte_len is
         the original string's UTF-8 length. IDs hash tool_name + NUL + content.
-        The 256KiB per-session cap counts payload bytes. Existing artifacts are
-        evicted by created_at, then rowid, oldest first; artifacts referenced by
-        this batch are never evicted. An oversized batch fails closed.
+        The 256KiB per-session cap counts payload bytes. Unprotected artifacts
+        are evicted by created_at, then rowid, oldest first; protected canonical
+        outputs and artifacts in this batch are never evicted.
         """
         if not isinstance(plans, list):
             raise ValueError("Artifact plans must be a list.")
         retained = {}
         for plan in plans:
-            if not isinstance(plan, dict) or set(plan) != {"artifact_id", "tool_name", "byte_len", "content"}:
-                raise ValueError("Invalid artifact plan fields.")
-            content, name = plan["content"], plan["tool_name"]
-            if not isinstance(content, str) or not isinstance(name, str):
-                raise ValueError("Artifact content and tool name must be text.")
-            size = len(content.encode("utf-8"))
-            identity = hashlib.sha256((name + "\0" + content).encode("utf-8")).hexdigest()
-            if (type(plan["byte_len"]) is not int or plan["byte_len"] != size
-                    or plan["artifact_id"] != identity):
-                raise ValueError("Artifact identity or UTF-8 byte length mismatch.")
+            identity = self._validate_artifact_plan(plan)
             retained[identity] = plan
         if sum(plan["byte_len"] for plan in retained.values()) > self.ARTIFACT_MAX_BYTES:
             raise ValueError("Artifact batch exceeds the 256KiB session cap.")
@@ -208,14 +258,14 @@ class SQLiteMemory:
                 if actual != (plan["tool_name"], plan["byte_len"], plan["content"]):
                     raise ValueError("Artifact identity collision or corrupt retained content.")
             rows = conn.execute(
-                "SELECT artifact_id, byte_len FROM context_artifacts WHERE session_id = ? "
+                "SELECT artifact_id, byte_len, protected FROM context_artifacts WHERE session_id = ? "
                 "ORDER BY created_at ASC, rowid ASC", (self.session_id,),
             ).fetchall()
             total = sum(row[1] for row in rows)
-            for identity, size in rows:
+            for identity, size, protected in rows:
                 if total <= self.ARTIFACT_MAX_BYTES:
                     break
-                if identity not in retained:
+                if not protected and identity not in retained:
                     conn.execute("DELETE FROM context_artifacts WHERE session_id = ? AND artifact_id = ?",
                                  (self.session_id, identity))
                     total -= size

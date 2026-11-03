@@ -130,10 +130,17 @@ def is_context_overflow(error: BaseException) -> bool:
 
 
 
-def _omission_pair(files=(), topics=(), tools=(), *, evicted_turns=0, turns_before=0):
+def _omission_pair(files=(), topics=(), tools=(), *, evicted_turns=0, turns_before=0,
+                   evicted_closed_turns=0):
     lines = []
     if evicted_turns:
-        lines.append(f"Older turns evicted ({evicted_turns} of {turns_before} shown as index only).")
+        if evicted_closed_turns:
+            lines.append(
+                f"Older turns evicted ({evicted_turns}/{turns_before} index only; "
+                f"{evicted_closed_turns} ended without an answer)."
+            )
+        else:
+            lines.append(f"Older turns evicted ({evicted_turns} of {turns_before} shown as index only).")
     lines.append(_OMISSION_ANCHOR)
     if files:
         lines.append("Retained file paths: " + ", ".join(files))
@@ -201,18 +208,25 @@ def _collect_omission_fields(messages, session_record=None):
     return record
 
 
-def _fit_omission_fields(record, budget_tokens, *, evicted_turns=0, turns_before=0):
+def _fit_omission_fields(record, budget_tokens, *, evicted_turns=0, turns_before=0,
+                         evicted_closed_turns=0):
     """Expose exactly the retained fields after tools/topics/files shedding."""
     record = {key: list(value) if isinstance(value, list) else value
               for key, value in record.items()}
     files, topics, tools = (record[key] for key in ("files", "topics", "tools"))
     cap = min(OMISSION_MAX_TOKENS, budget_tokens)
-    pair = _omission_pair(files, topics, tools, evicted_turns=evicted_turns, turns_before=turns_before)
+    pair = _omission_pair(
+        files, topics, tools, evicted_turns=evicted_turns, turns_before=turns_before,
+        evicted_closed_turns=evicted_closed_turns,
+    )
     # Tool names are least valuable, then older topics, then older file references.
     for items in (tools, topics, files):
         while items and history_tokens(pair) > cap:
             items.pop(0)
-            pair = _omission_pair(files, topics, tools, evicted_turns=evicted_turns, turns_before=turns_before)
+            pair = _omission_pair(
+                files, topics, tools, evicted_turns=evicted_turns, turns_before=turns_before,
+                evicted_closed_turns=evicted_closed_turns,
+            )
     if history_tokens(pair) > cap:
         raise ContextBudgetError(
             "Historical omission coverage gap: the omission anchor and acknowledgement "
@@ -396,6 +410,18 @@ def _completed_turn(messages):
     return not pending
 
 
+def _executor_closed_turn(messages):
+    """Count executor records, never matching user/model prose about failure."""
+    return any(
+        message.get("role") in ("assistant", "model")
+        and (metadata := message.get("metadata", {})).get("executor_closed") is True
+        and metadata.get("executor") is True
+        and isinstance(metadata.get("reason"), str)
+        and bool(metadata["reason"])
+        for message in messages
+    )
+
+
 def fit_messages(
     messages: List[Dict[str, Any]], budget_tokens: int, *, session_record=None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -413,12 +439,16 @@ def fit_messages(
     The active turn is fully protected; N-1 protects structure and text but not
     ordinary tool-result payloads. Only a completed, unpinned prefix older than
     N-1 can be evicted, after the surgical pass and mandatory anchor reservation.
+    ``evicted_closed_turns`` counts only evicted completed genuine turns bearing
+    structured executor closure records; it is folded into the same bounded
+    index line without changing the omission protocol or protection rules.
     """
     record = _validated_session_record(session_record)
     stats = {"dropped_messages": 0, "truncated_messages": 0, "compacted_messages": 0,
              "tokens": 0, "omission_tokens": 0, "session_record": None,
              "fields_included": {"files": 0, "topics": 0, "tools": 0},
-             "claim_redactions": [], "artifacts": [], "elided_tokens": 0, "evicted_turns": 0}
+             "claim_redactions": [], "artifacts": [], "elided_tokens": 0, "evicted_turns": 0,
+             "evicted_closed_turns": 0}
     view = fitted_claim_view(messages)
     pinned = _pinned_read_messages(view)
     pinned.update(index for index, message in enumerate(view) if _pinned_evidence(message))
@@ -492,6 +522,7 @@ def fit_messages(
         evicted = stats["evicted_turns"]
         anchor = history_tokens(_omission_pair(
             evicted_turns=evicted, turns_before=len(starts),
+            evicted_closed_turns=stats["evicted_closed_turns"],
         )) if needs_record else 0
         if total + anchor <= budget_tokens:
             break
@@ -502,6 +533,7 @@ def fit_messages(
         total -= history_tokens(msgs[start:end])
         cut = end
         stats["evicted_turns"] += 1
+        stats["evicted_closed_turns"] += int(_executor_closed_turn(view[start:end]))
         needs_record = True
     stats["turns_after"] -= stats["evicted_turns"]
     msgs = msgs[cut:]
@@ -510,6 +542,7 @@ def fit_messages(
         note, retained = _fit_omission_fields(
             collected, budget_tokens - total, evicted_turns=stats["evicted_turns"],
             turns_before=stats["turns_before"],
+            evicted_closed_turns=stats["evicted_closed_turns"],
         )
         stats["session_record"] = retained
         stats["fields_included"] = {key: len(retained[key]) for key in _RECORD_LIMITS}

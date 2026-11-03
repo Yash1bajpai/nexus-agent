@@ -9,12 +9,15 @@ import hashlib
 import io
 import tokenize
 import json
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List
 from ..providers.base import Tool
 from ..utils.config import CODE_EXECUTION_TIMEOUT
 from ..utils.private_files import copy_file_permissions
-from .refusals import RefusalClass, RefusalText, refusal
+from .refusals import (
+    RefusalClass, RefusalText, execution_ran, execution_result, refusal,
+)
 
 def _validate_workspace_path(path: str | Path) -> Path | str:
     """Validate that path is inside the current workspace."""
@@ -316,13 +319,33 @@ def execute_read_file(path: str) -> str:
             source = stream.read()
         text = source.decode("utf-8", errors="replace")
         _remember_file(p, source)
-        return text
+        return execution_result(text, executed=True, outcome="File read completed.")
     except FileNotFoundError:
         return refusal(RefusalClass.NOT_FOUND, f"ERROR: File not found: {path}")
     except PermissionError:
         return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied: {path}")
     except Exception as e:
         return refusal(RefusalClass.OTHER, f"ERROR: Could not read file: {str(e)}")
+
+
+def estimate_read_file_tokens(path: str | None = None, **kwargs) -> int | None:
+    """Estimate bytes/4 without opening a file or granting read/edit authority.
+
+    Invalid, inaccessible and protected paths defer to the normal read handler:
+    an estimate must never replace its typed refusal with a budget rejection.
+    """
+    if not isinstance(path, str) or kwargs:
+        return None
+    try:
+        validated = _validate_workspace_path(path)
+        if not isinstance(validated, Path) or _is_sensitive_path(validated):
+            return None
+        info = validated.stat()
+        if not stat.S_ISREG(info.st_mode) or not os.access(validated, os.R_OK):
+            return None
+        return (info.st_size + 3) // 4
+    except (OSError, TypeError, ValueError, RuntimeError):
+        return None
 
 _SENSITIVE_NAMES = frozenset({
     ".git", ".env", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc",
@@ -364,8 +387,13 @@ def execute_history_read(query: str, limit: int = 2, *, memory=None) -> str:
                        "ERROR: Canonical SQLite history is unavailable for this session; no history was read or new store created.")
     try:
         entries = memory.history_entries(query, limit)
+    except PermissionError:
+        return refusal(RefusalClass.PERMISSION, "ERROR: Canonical SQLite history could not be read; no substitute history was used.")
     except Exception:
-        return refusal(RefusalClass.OTHER, "ERROR: Canonical SQLite history could not be read; no substitute history was used.")
+        return execution_result(
+            refusal(RefusalClass.OTHER, "ERROR: Canonical SQLite history could not be read; no substitute history was used."),
+            executed=True, outcome="History read failed; completion unknown.",
+        )
     records = []
     redacted = False
     for entry in entries[:limit]:
@@ -379,7 +407,10 @@ def execute_history_read(query: str, limit: int = 2, *, memory=None) -> str:
                 or type(entry_id) is not int or entry_id < 1
                 or not isinstance(timestamp, str) or len(timestamp) > 256
                 or type(truncated) is not bool):
-            return refusal(RefusalClass.OTHER, "ERROR: Canonical history record metadata or excerpt is invalid.")
+            return execution_result(
+                refusal(RefusalClass.OTHER, "ERROR: Canonical history record metadata or excerpt is invalid."),
+                executed=True, outcome="History read completed; invalid records withheld.",
+            )
         paths = entry.get("paths", [])
         kind = entry.get("content_kind")
         reason = None
@@ -409,7 +440,10 @@ def execute_history_read(query: str, limit: int = 2, *, memory=None) -> str:
     # Standard JSON escaping is lossless on decode. Never parse historical text
     # as markup or let apparent delimiters, headers, or instructions gain authority.
     result = _HISTORY_READ_HEADER + "\n" + json.dumps(records)
-    return refusal(RefusalClass.SENSITIVE_PATH, result) if redacted else result
+    return execution_result(
+        refusal(RefusalClass.SENSITIVE_PATH, result) if redacted else result,
+        executed=True, outcome="history_read query completed with redactions" if redacted else "history_read query completed",
+    )
 
 def _validate_python_content(path: Path, content: str) -> str | None:
     """Reject malformed Python before changing a file; never execute it."""
@@ -577,14 +611,21 @@ def execute_write_file(path: str, content: str) -> str:
 
         existed = p.exists()
         if not _atomic_file_update(p, content):
-            return f"No changes: '{path}' already has the requested content."
+            return execution_result(f"No changes: '{path}' already has the requested content.",
+                                    executed=True, outcome="File write completed; no changes.")
         _remember_file(p)
         backup_msg = f" (backup saved to {p.name}.bak)" if existed else ""
-        return f"Successfully wrote {len(content)} characters to {path} (absolute path: {p}){backup_msg}"
+        return execution_result(
+            f"Successfully wrote {len(content)} characters to {path} (absolute path: {p}){backup_msg}",
+            executed=True, outcome=f"File write completed; {len(content)} characters written.",
+        )
     except PermissionError:
         return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied writing to: {path}")
     except Exception as e:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not write file: {str(e)}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not write file: {str(e)}"),
+            executed=True, outcome="File write completion unknown; execution may have had effects.",
+        )
 
 def _python_line_signatures(text: str):
     """Ignore horizontal token gaps, never indentation or literal/comment content."""
@@ -742,14 +783,21 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
                     + hint.replace("{path}", path))
 
         if not _atomic_file_update(p, new_content):
-            return f"No changes: '{path}' already has the requested content."
+            return execution_result(f"No changes: '{path}' already has the requested content.",
+                                    executed=True, outcome="File patch completed; no changes.")
         _remember_file(p)
         backup_msg = f" (backup saved to {p.name}.bak)"
-        return f"Successfully patched '{path}' (absolute path: {p}): replaced {count} occurrence(s){backup_msg}.{note}"
+        return execution_result(
+            f"Successfully patched '{path}' (absolute path: {p}): replaced {count} occurrence(s){backup_msg}.{note}",
+            executed=True, outcome=f"File patch completed; replaced {count} occurrence(s).",
+        )
     except PermissionError:
         return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied patching: {path}")
     except Exception as e:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not patch file: {str(e)}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not patch file: {str(e)}"),
+            executed=True, outcome="File patch completion unknown; execution may have had effects.",
+        )
 
 
 class _FunctionRefusal(Exception):
@@ -1017,10 +1065,14 @@ def _execute_function_change(path: str, function_name: str, new_body: str,
             _function_refuse(RefusalClass.CONTENT_LOSS,
                              f"This function edit would delete {loss}. The user has not approved removing it.")
         if not _atomic_file_update(p, content, preserve_bytes=True, expected_source=source_bytes):
-            return f"No changes: '{path}' already has the requested content."
+            return execution_result(f"No changes: '{path}' already has the requested content.",
+                                    executed=True, outcome="Function edit completed; no changes.")
         _remember_file(p, candidate)
         verb = "added" if adding else "edited"
-        return f"Successfully {verb} function '{function_name}' in '{path}' (absolute path: {p}) (backup saved to {p.name}.bak)"
+        return execution_result(
+            f"Successfully {verb} function '{function_name}' in '{path}' (absolute path: {p}) (backup saved to {p.name}.bak)",
+            executed=True, outcome=f"Function {verb}.",
+        )
     except _FunctionRefusal as exc:
         return exc.result
     except FileNotFoundError:
@@ -1032,7 +1084,10 @@ def _execute_function_change(path: str, function_name: str, new_body: str,
     except (SyntaxError, tokenize.TokenError) as exc:
         return refusal(RefusalClass.SYNTAX, f"ERROR: {exc}")
     except Exception as exc:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not edit function: {exc}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not edit function: {exc}"),
+            executed=True, outcome="Function edit completion unknown; execution may have had effects.",
+        )
 
 
 def execute_edit_function(path: str, function_name: str, new_body: str,
@@ -1096,11 +1151,14 @@ def execute_list_directory(path: str = ".") -> str:
                         and not _is_sensitive_path(child)):
                     output_lines.append(f"{file_indent}[FILE] {file}")
 
-        return "\n".join(output_lines)
+        return execution_result("\n".join(output_lines), executed=True, outcome="Directory listing completed.")
     except PermissionError:
         return refusal(RefusalClass.PERMISSION, f"ERROR: Permission denied: {path}")
     except Exception as e:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not list directory: {str(e)}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not list directory: {str(e)}"),
+            executed=True, outcome="Directory listing completion unknown.",
+        )
 
 # Modules that are too dangerous to allow inside agent-generated run_code snippets.
 # Use read_file / write_file tools for file I/O; use git_status / git_diff for shell work.
@@ -1407,13 +1465,26 @@ def execute_run_code(code: str, language: str = "python") -> str:
         if err:
             output += f"STDERR:\n{err}\n"
         if not output:
-            output = "[Code executed successfully with no output]"
+            output = ("[Code executed successfully with no output]" if res.returncode == 0
+                      else f"[Code execution failed with exit code {res.returncode} and no output]")
         result = output.strip()
-        return refusal(RefusalClass.OTHER, result) if res.returncode else result
+        return execution_result(
+            refusal(RefusalClass.OTHER, result) if res.returncode else result,
+            executed=True,
+            outcome=f"Code {'FAILED' if res.returncode else 'completed'} (exit code {res.returncode}).",
+        )
     except subprocess.TimeoutExpired:
-        return refusal(RefusalClass.OTHER, f"ERROR: Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds.")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds."),
+            executed=True, outcome=f"Code timed out after {CODE_EXECUTION_TIMEOUT} seconds; completion unknown.",
+        )
+    except PermissionError as e:
+        return refusal(RefusalClass.PERMISSION, f"ERROR: Code execution failed: {str(e)}")
     except Exception as e:
-        return refusal(RefusalClass.OTHER, f"ERROR: Code execution failed: {str(e)}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Code execution failed: {str(e)}"),
+            executed=True, outcome="Code completion unknown; execution may have had effects.",
+        )
 
 def execute_search_web(query: str) -> str:
     """Return formatted results (ok), or an ERROR with a stable search category.
@@ -1493,9 +1564,11 @@ def execute_search_web(query: str) -> str:
                 empty_backends.append(backend)
                 continue
             if not _is_relevant(results, effective_query):
-                return refusal(RefusalClass.OTHER,
-                    f"ERROR: search_web [irrelevant]: Results from {backend} did not pass "
-                    f"the relevance check for query: '{query}'."
+                return execution_result(
+                    refusal(RefusalClass.OTHER,
+                            f"ERROR: search_web [irrelevant]: Results from {backend} did not pass "
+                            f"the relevance check for query: '{query}'."),
+                    executed=True, outcome="Search completed; results failed the relevance check.",
                 )
 
             formatted = [f"Search results for: '{effective_query}'\n"]
@@ -1504,7 +1577,7 @@ def execute_search_web(query: str) -> str:
                 href = r.get("href", "")
                 body = r.get("body", "")
                 formatted.append(f"{idx}. {title}\n   URL: {href}\n   Summary: {body}\n")
-            return "\n".join(formatted)
+            return execution_result("\n".join(formatted), executed=True, outcome="Search completed; relevant results returned.")
         except Exception as exc:
             execution_failures.append(backend)
             # Exception messages may contain credential-bearing URLs or tokens.
@@ -1512,16 +1585,21 @@ def execute_search_web(query: str) -> str:
 
     if empty_backends:
         details = (" " + "; ".join(failures) + ".") if failures else ""
-        return refusal(RefusalClass.OTHER,
-            f"ERROR: search_web [empty]: Backend(s) {', '.join(empty_backends)} returned no results "
-            f"for query: '{query}'." + details + " The underlying cause is unknown."
+        return execution_result(
+            refusal(RefusalClass.OTHER,
+                    f"ERROR: search_web [empty]: Backend(s) {', '.join(empty_backends)} returned no results "
+                    f"for query: '{query}'." + details + " The underlying cause is unknown."),
+            executed=True, outcome="Search completed; no results returned.",
         )
 
     category = "both_failed" if len(execution_failures) == 2 else "backend_error"
-    return refusal(RefusalClass.OTHER,
-        f"ERROR: search_web [{category}]: No live search results could be retrieved "
-        f"for query: '{query}'. " + "; ".join(failures)
-        + ". The underlying cause is unknown."
+    return execution_result(
+        refusal(RefusalClass.OTHER,
+                f"ERROR: search_web [{category}]: No live search results could be retrieved "
+                f"for query: '{query}'. " + "; ".join(failures)
+                + ". The underlying cause is unknown."),
+        executed=bool(execution_failures),
+        outcome="Search completion unknown." if execution_failures else "Search not executed; backends unavailable.",
     )
 
 def _git_root() -> Path:
@@ -1584,11 +1662,17 @@ def execute_git_status() -> str:
                 output += "\n\nDiff Statistics:\n" + stats.stdout.strip()
         if hidden:
             output += "\n[Protected or outside-workspace changes omitted.]"
-        return output
+        return execution_result(output, executed=True, outcome="Git status inspection completed.")
     except ValueError as exc:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not get git status: {exc}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not get git status: {exc}"),
+            executed=True, outcome="Git status inspection failed; completion unknown.",
+        )
     except Exception as exc:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not get git status ({type(exc).__name__}).")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not get git status ({type(exc).__name__})."),
+            executed=True, outcome="Git status completion unknown.",
+        )
 
 
 _GIT_DIFF_FLAGS = [
@@ -1634,32 +1718,61 @@ def execute_git_diff() -> str:
             paths, hidden, changed = _git_diff_paths(root, revisions)
         if not paths:
             if hidden:
-                return "Changes exist, but protected or outside-workspace changes are omitted."
+                return execution_result(
+                    "Changes exist, but protected or outside-workspace changes are omitted.",
+                    executed=True, outcome="Git diff completed; protected changes omitted.",
+                )
             visible, status_hidden, untracked = _git_status_entries(root)
             if untracked:
-                return "Untracked files exist (not included in git diff):\n" + "\n".join(visible)
+                return execution_result(
+                    "Untracked files exist (not included in git diff):\n" + "\n".join(visible),
+                    executed=True, outcome="Git diff completed; untracked files exist.",
+                )
             if visible or status_hidden:
-                return "Changes exist, but no visible textual diff is available in this workspace."
-            return "No changes to commit. Working tree is clean and nothing is staged."
+                return execution_result(
+                    "Changes exist, but no visible textual diff is available in this workspace.",
+                    executed=True, outcome="Git diff completed; no visible textual diff.",
+                )
+            return execution_result(
+                "No changes to commit. Working tree is clean and nothing is staged.",
+                executed=True, outcome="Git diff completed; working tree clean and nothing staged.",
+            )
         result = _safe_git_run([
             "git", "-C", str(root), "diff", *_GIT_DIFF_FLAGS, *revisions,
             "--no-renames", "--", *[f":(literal){name}" for name in paths],
         ])
         if result.returncode:
-            raise ValueError("Git diff inspection failed.")
+            return execution_result(
+                refusal(RefusalClass.OTHER, "ERROR: Could not read git diff: Git diff inspection failed."),
+                executed=True, outcome=f"Git diff FAILED (exit code {result.returncode}).",
+            )
         diff_text = result.stdout.strip()
         if not diff_text:
-            return "Changes exist, but no textual diff is available."
+            return execution_result(
+                "Changes exist, but no textual diff is available.",
+                executed=True, outcome=f"Git diff completed (exit code {result.returncode}); no textual diff.",
+            )
         lines = diff_text.splitlines()
         if len(lines) > 500:
             diff_text = "\n".join(lines[:500]) + f"\n\n[... diff truncated at 500 lines, {len(lines)} total ...]"
         if hidden:
             diff_text += "\n[Protected or outside-workspace changes omitted.]"
-        return diff_text
+        return execution_result(
+            diff_text, executed=True, outcome=f"Git diff completed (exit code {result.returncode}); visible changes exist.",
+        )
     except ValueError as exc:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not read git diff: {exc}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not read git diff: {exc}"),
+            executed=True, outcome="Git diff inspection failed; completion unknown.",
+        )
+    except PermissionError as exc:
+        return refusal(RefusalClass.PERMISSION,
+                       f"ERROR: Could not read git diff ({type(exc).__name__}).")
     except Exception as exc:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not read git diff ({type(exc).__name__}).")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not read git diff ({type(exc).__name__})."),
+            executed=True, outcome="Git diff completion unknown.",
+        )
 
 def execute_git_commit(message: str, approved: bool = False) -> str:
     """Run git commit after explicit command confirmation or opt-in."""
@@ -1676,15 +1789,25 @@ def execute_git_commit(message: str, approved: bool = False) -> str:
             staged_check = _safe_git_run(["git", "diff", "--cached", "--name-only"])
 
         if not staged_check.stdout.strip():
-            return refusal(RefusalClass.OTHER, "ERROR: No staged changes found to commit. Use git_status to review untracked/modified files.")
+            return execution_result(
+                refusal(RefusalClass.OTHER, "ERROR: No staged changes found to commit. Use git_status to review untracked/modified files."),
+                executed=True, outcome="Git inspection/staging completed; no staged changes to commit.",
+            )
 
         result = _safe_git_run(["git", "commit", "-m", message], execution=True)
         if result.returncode == 0:
-            return f"Committed successfully:\n{result.stdout.strip()}"
+            return execution_result(f"Committed successfully:\n{result.stdout.strip()}",
+                                    executed=True, outcome="Git commit completed (exit code 0).")
         else:
-            return refusal(RefusalClass.OTHER, f"ERROR: git commit failed:\n{result.stderr.strip() or result.stdout.strip()}")
+            return execution_result(
+                refusal(RefusalClass.OTHER, f"ERROR: git commit failed:\n{result.stderr.strip() or result.stdout.strip()}"),
+                executed=True, outcome=f"Git commit FAILED (exit code {result.returncode}).",
+            )
     except Exception as e:
-        return refusal(RefusalClass.OTHER, f"ERROR: Could not commit: {str(e)}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Could not commit: {str(e)}"),
+            executed=True, outcome="Git commit completion unknown; execution may have had effects.",
+        )
 
 READ_FILE_TOOL = Tool(
     name="read_file",
@@ -1700,6 +1823,7 @@ READ_FILE_TOOL = Tool(
         "required": ["path"],
     },
     execute=execute_read_file,
+    estimate_result_tokens=estimate_read_file_tokens,
 )
 
 HISTORY_READ_TOOL = Tool(
@@ -2033,18 +2157,30 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
         else:
             status_str = "PASSED" if exit_code == 0 else f"FAILED (exit code {exit_code})"
             result = f"=== Pytest Results: {status_str} ===\n{output}"
-        return refusal(RefusalClass.OTHER, result) if exit_code else result
+        status = "NO TESTS COLLECTED" if exit_code == 5 else "PASSED" if exit_code == 0 else "FAILED"
+        return execution_result(
+            refusal(RefusalClass.OTHER, result) if exit_code else result,
+            executed=True, outcome=f"Pytest {status} (exit code {exit_code}).",
+        )
     except subprocess.TimeoutExpired as exc:
         def timeout_text(value):
             return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
         stdout = timeout_text(exc.stdout)
         stderr = timeout_text(exc.stderr)
-        return refusal(RefusalClass.OTHER,
-                       "ERROR: Pytest execution timed out after 45 seconds.\n"
-                       "--- stdout tail ---\n" + stdout[-3000:] + "\n--- end stdout tail ---\n"
-                       "--- stderr tail ---\n" + stderr[-3000:] + "\n--- end stderr tail ---")
+        return execution_result(
+            refusal(RefusalClass.OTHER,
+                    "ERROR: Pytest execution timed out after 45 seconds.\n"
+                    "--- stdout tail ---\n" + stdout[-3000:] + "\n--- end stdout tail ---\n"
+                    "--- stderr tail ---\n" + stderr[-3000:] + "\n--- end stderr tail ---"),
+            executed=True, outcome="Pytest timed out after 45 seconds; completion unknown.",
+        )
+    except PermissionError as e:
+        return refusal(RefusalClass.PERMISSION, f"ERROR: Failed to run pytest: {str(e)}")
     except Exception as e:
-        return refusal(RefusalClass.OTHER, f"ERROR: Failed to run pytest: {str(e)}")
+        return execution_result(
+            refusal(RefusalClass.OTHER, f"ERROR: Failed to run pytest: {str(e)}"),
+            executed=True, outcome="Pytest completion unknown; execution may have had effects.",
+        )
 
 RUN_TESTS_TOOL = Tool(
     name="run_tests",
@@ -2106,19 +2242,46 @@ def execute_tool(name: str, args: Dict[str, Any], *, gated_reason=None,
             return refusal(RefusalClass.OTHER, "ERROR: Invalid private run_code gate.")
         return refusal(gated_reason, "ERROR: run_code is gated for this turn after an edit refusal "
                        f"({gated_reason.value}); use the permitted inspection/edit tools or finish honestly.")
+    if not isinstance(args, dict):
+        return refusal(RefusalClass.TARGETING,
+                       f"ERROR: Invalid arguments for tool '{name}': expected an object")
     if any(key in args for key in ("expected_state", "gated_reason", "memory")):
         return refusal(RefusalClass.TARGETING,
                        f"ERROR: Invalid arguments for tool '{name}': private dispatch state is not a tool argument")
     for t in get_all_tools():
         if t.name == name:
+            properties = getattr(t, "input_schema", {}).get("properties", {})
+            for key, value in args.items():
+                kind = properties.get(key, {}).get("type")
+                invalid = (
+                    (kind == "string" and not isinstance(value, str))
+                    or (kind == "integer" and type(value) is not int)
+                    or (kind == "boolean" and type(value) is not bool)
+                )
+                if invalid:
+                    return refusal(RefusalClass.TARGETING,
+                                   f"ERROR: Invalid arguments for tool '{name}': '{key}' must be {kind}")
+            kwargs = dict(args)
+            if name in ("edit_function", "add_function"):
+                kwargs["expected_state"] = expected_state
+            elif name == "history_read":
+                kwargs["memory"] = memory
             try:
-                if name in ("edit_function", "add_function"):
-                    return t.execute(**args, expected_state=expected_state)
-                if name == "history_read":
-                    return t.execute(**args, memory=memory)
-                return t.execute(**args)
-            except TypeError as e:
+                inspect.signature(t.execute).bind(**kwargs)
+            except (TypeError, ValueError) as e:
                 return refusal(RefusalClass.TARGETING, f"ERROR: Invalid arguments for tool '{name}': {str(e)}")
+            try:
+                result = t.execute(**kwargs)
+                if isinstance(getattr(result, "executed", None), bool):
+                    return result
+                ran = execution_ran(result)
+                return execution_result(
+                    result, executed=ran,
+                    outcome="Tool handler completed." if ran else "Not executed.",
+                )
             except Exception as e:
-                return refusal(RefusalClass.OTHER, f"ERROR: Execution failed for tool '{name}': {str(e)}")
+                return execution_result(
+                    refusal(RefusalClass.OTHER, f"ERROR: Execution failed for tool '{name}': {str(e)}"),
+                    executed=True, outcome="Tool completion unknown; execution may have had effects.",
+                )
     return refusal(RefusalClass.TARGETING, f"ERROR: Unknown tool '{name}'")

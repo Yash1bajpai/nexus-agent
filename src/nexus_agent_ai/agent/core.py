@@ -20,8 +20,9 @@ from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
 from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata, current_claim_correction
-from .refusals import RefusalClass, refusal
+from .refusals import RefusalClass, refusal, execution_result, execution_ran
 from .recovery import project_recovery, recovery_excerpt
+from .result_budget import guard_tool_result
 
 RULES_PROMPT = """RULES:
 1. Always use read_file tool before answering questions about a specific file.
@@ -370,6 +371,8 @@ class Agent:
         self._audit_seen = set()
         self._edit_recovery = None
         self._fresh_reads = {}
+        self._pending_calls = []
+        self._turn_had_execution = False
 
         # Smart Startup: Global vs. Project Context check
         cwd = os.getcwd()
@@ -556,7 +559,112 @@ class Agent:
         else:
             display.print_stream_chunk(text)
 
-    def _plan_fit(self, messages, tools, scale=1.0, *, output_reserve=None, boost=None):
+
+    def _prospective_result_messages(self, current, content):
+        """Budget probes only: empty pending receipts are never stored or sent."""
+        messages = self.memory.get()
+        for pending in self._pending_calls:
+            if pending["state"] == "recorded":
+                continue
+            message = {
+                "role": "tool", "tool_call_id": pending["call"].id,
+                "content": str(content) if pending is current else "",
+            }
+            if self._mutation_segment:
+                message["metadata"] = self._outcome_metadata()
+            messages.append(message)
+        return messages
+
+    def _tool_result_fits(self, current, content, tools, scale=1.0, *, result_tokens=0):
+        if not self.context_window:
+            return True
+        try:
+            self._plan_fit(
+                self._prospective_result_messages(current, content), tools, scale,
+                result_tokens=result_tokens,
+            )
+        except context.ContextBudgetError:
+            return False
+        return True
+
+    def _preflight_tool_result(self, current, tools, scale):
+        if not self.context_window:
+            return None
+        call = current["call"]
+        tool = next((tool for tool in tools if tool.name == call.name), None)
+        estimate = getattr(tool, "estimate_result_tokens", None)
+        if not callable(estimate):
+            return None
+        predicted = estimate(**call.args)
+        if type(predicted) is not int or predicted < 0:
+            return None
+        if self._tool_result_fits(current, "", tools, scale, result_tokens=predicted):
+            return None
+        low, high = 0, min(predicted, int(self.context_window * scale))
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self._tool_result_fits(current, "", tools, scale, result_tokens=middle):
+                low = middle
+            else:
+                high = middle - 1
+        return execution_result(
+            refusal(RefusalClass.OTHER,
+                    f"ERROR: Not executed: '{call.name}' is ~{predicted} tokens, exceeding "
+                    f"the ~{low}-token usable context budget; the file was not read."),
+            executed=False, outcome=f"{call.name} not executed: result exceeds the context budget.",
+        )
+
+    def _close_aborted_turn(self, exc):
+        """Close only executor-known calls; never invent effects or model output."""
+        reason = type(exc).__name__
+        began = self._turn_had_execution or any(
+            pending["state"] == "started" for pending in self._pending_calls
+        )
+        for pending in self._pending_calls:
+            state = pending["state"]
+            if state == "recorded":
+                continue
+            if state == "pending":
+                text = "Not executed: the turn was aborted before this call ran; no effect occurred."
+                ran = False
+            elif state == "started":
+                text = (
+                    "Execution began, but no completed tool result was recorded before the turn "
+                    "aborted. Completion and effects are unknown; do not assume failure or success."
+                )
+                ran = None
+            else:
+                result = pending["result"]
+                ran = execution_ran(result)
+                try:
+                    result = guard_tool_result(
+                        pending["call"].name, result, memory=self.memory,
+                        fits=lambda content: len(content) <= 2000,
+                    )
+                    text = str(result)
+                except Exception:
+                    outcome = getattr(result, "outcome", "")
+                    text = (outcome[:512] if isinstance(outcome, str) and outcome
+                            else "Tool execution returned; completion status is unknown.")
+                    text += "\nFull output is not included in this executor receipt."
+            self.memory.add_raw({
+                "role": "tool", "tool_call_id": pending["call"].id, "content": text,
+                "metadata": {"executor": True, "executed": ran},
+            })
+            pending["state"] = "recorded"
+        cause = ("context budget exhausted" if isinstance(exc, context.ContextBudgetError)
+                 else f"executor aborted ({reason})")
+        stage = "after tool execution" if began else "before tool execution"
+        self.memory.add_raw({
+            "role": "assistant",
+            "content": (
+                f"Executor record: Turn ended without a complete answer: {cause} {stage}; "
+                "no complete answer was produced. Partial model output (if any) was not recorded. "
+                "Recorded tool results above are accurate; nothing beyond them is claimed."
+            ),
+            "metadata": {"executor_closed": True, "executor": True, "reason": reason},
+        })
+    def _plan_fit(self, messages, tools, scale=1.0, *, output_reserve=None, boost=None, result_tokens=0):
         """Plan a request with the existing budget policy, without changing agent/provider state."""
         messages, recovery_injected = project_recovery(messages, self._edit_recovery)
         window = int(self.context_window * scale)
@@ -583,7 +691,7 @@ class Agent:
                         "the endpoint's documented capacity, or use fewer tools."
                     )
                 fitted, stats = context.fit_messages(
-                    messages, budget, session_record=self.memory.get_session_metadata("SESSION_RECORD"),
+                    messages, budget - result_tokens, session_record=self.memory.get_session_metadata("SESSION_RECORD"),
                 )
                 if stats.get("artifacts") and not callable(getattr(self.memory, "store_artifacts", None)):
                     raise context.ContextBudgetError(
@@ -722,6 +830,8 @@ class Agent:
         self._audit_seen = set()
         self._edit_recovery = None
         self._fresh_reads = {}
+        self._pending_calls = []
+        self._turn_had_execution = False
         routing_input = _routing_request(user_input, self.memory.get())
         requires_search = bool(_LIVE_SEARCH_REQUEST.search(routing_input))
         wants_edit = require_edit or (
@@ -894,6 +1004,10 @@ class Agent:
                         self._mutation_outcomes = {}
                         self._segment_complete = True
                     self._remember_assistant(response.text, response.tool_calls)
+                    self._pending_calls = [
+                        {"call": call, "state": "pending", "result": None}
+                        for call in response.tool_calls
+                    ]
 
                     # Show THINKING trace: the LLM's reasoning text before tool call
                     if response.text and not stream:
@@ -906,6 +1020,7 @@ class Agent:
 
                     for call_index, tool_call in enumerate(response.tool_calls):
                         changed = False
+                        pending = self._pending_calls[call_index]
                         # Build status display with full argument visibility (up to 150 chars)
                         args_preview = ", ".join(
                             f'{k}="{v[:120]}..."' if isinstance(v, str) and len(v) > 120 else
@@ -950,26 +1065,34 @@ class Agent:
                                 # Hard stop: the model is stuck in a loop.
                                 # Strip tools on the next request and force a direct answer.
                                 force_final = True
-                                result = ("[SYSTEM: TOOL BUDGET EXHAUSTED] You have repeated this exact tool call "
+                                result = ("[SYSTEM: TOOL BUDGET EXHAUSTED] Suppressed (duplicate): You have repeated this exact tool call "
                                           "multiple times. Do NOT call any more tools. Answer the user's original "
                                           "question directly now using the information you already have.")
                             elif reread_while_editing:
-                                result = ("[SYSTEM] You already read this file; its content is in the earlier tool result. Do not read it "
+                                result = ("[SYSTEM] Suppressed (duplicate): You already read this file; its content is in the earlier tool result. Do not read it "
                                           "again. Call patch_file (or write_file) now to make the change, then run_tests.")
                             else:
-                                result = "[SYSTEM WARNING: Duplicate Tool Call Detected] You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
+                                result = "[SYSTEM WARNING: Duplicate Tool Call Detected] Suppressed (duplicate): You have already executed this tool with these exact arguments. Synthesize your answer from existing results, or try a completely different approach."
+                            result = execution_result(result, executed=False, outcome="Suppressed (duplicate)")
+                        elif (preflight := self._preflight_tool_result(pending, use_tools, window_scale)) is not None:
+                            result = preflight
                         else:
-                            executed_tools.add(tool_sig)
                             target_path, before_state = _target_snapshot(tool_call.name, tool_call.args)
                             edit_path = target_path if tool_call.name in _WRITE_TOOLS else None
                             before_edit = before_state if edit_path is not None else None
-                            tool_executed = True
+                            pending["state"] = "started"
                             if tool_call.name in ("edit_function", "add_function"):
                                 result = execute_tool(tool_call.name, tool_call.args, expected_state=before_state)
                             elif tool_call.name == "history_read":
                                 result = execute_tool(tool_call.name, tool_call.args, memory=self.memory)
                             else:
                                 result = execute_tool(tool_call.name, tool_call.args)
+                            pending["state"] = "returned"
+                            pending["result"] = result
+                            ran = execution_ran(result)
+                            if ran:
+                                executed_tools.add(tool_sig)
+                                tool_executed = self._turn_had_execution = True
                             refusal_class = getattr(result, "refusal_class", None)
                             if tool_call.name in _GATING_EDIT_TOOLS and refusal_class in _EDIT_REFUSAL_GATES:
                                 if self._run_code_gate is None:
@@ -1001,11 +1124,11 @@ class Agent:
                                     clean_u = u.strip().rstrip(".,;)]}>\"'")
                                     if clean_u.startswith(("http://", "https://")) and clean_u not in retrieved_search_urls:
                                         retrieved_search_urls.append(clean_u)
-                            changed = (edit_path is not None and before_edit is not None
-                                       and after_state is not None
-                                       and after_state != before_edit
-                                       and not str(result).startswith(("ERROR:", "No changes:")))
-                            if changed:
+                            observed_change = (edit_path is not None and before_edit is not None
+                                               and after_state is not None and after_state != before_edit)
+                            changed = (observed_change and
+                                       not str(result).startswith(("ERROR:", "No changes:")))
+                            if observed_change:
                                 self.changed_files.add(str(edit_path))
                             if tool_call.name in _WRITE_TOOLS:
                                 self._record_mutation(
@@ -1027,17 +1150,27 @@ class Agent:
                                 elif same_chain:
                                     recovery["status"] = "resolved"
                             if guard:
+                                ran = execution_ran(result)
+                                outcome = getattr(result, "outcome", f"{tool_call.name} returned a result.")
                                 result = guard.after_tool(tool_call.name, tool_call.args, result)
+                                result = execution_result(result, executed=ran, outcome=outcome)
 
+                        pending["state"] = "returned"
+                        pending["result"] = result
+                        if tool_call.name in ("read_file", "run_tests", "git_diff", "run_code"):
+                            result = guard_tool_result(
+                                tool_call.name, result, memory=self.memory,
+                                fits=lambda content: self._tool_result_fits(
+                                    pending, content, use_tools, window_scale,
+                                ),
+                            )
+                            pending["result"] = result
                         error_key = str(tool_call.args.get("path") or tool_call.name)
-                        if str(result).startswith("ERROR:"):
+                        if str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
                             unresolved_tool[error_key] = tool_call.name
-                            # Failed calls remain executable: the state-aware tracker,
-                            # not a blanket duplicate signature, decides when to stop.
-                            executed_tools.discard(tool_sig)
-                        elif not str(result).startswith("[SYSTEM"):
+                        elif execution_ran(result) and not str(result).startswith("[SYSTEM"):
                             # A later success fixes the error only if it is the same tool succeeding, or a
                             # write. Reading the file is not a fix for a failed edit.
                             failed_tool = unresolved_tool.get(error_key)
@@ -1051,9 +1184,27 @@ class Agent:
                                     # Opt-in (NEXUS_AGENT_AUTO_CHECK=1) and already permitted: run the tests now, show the real result.
                                     from .tools import execute_run_tests
                                     check = execute_run_tests()
+                                    check_ran = execution_ran(check)
+                                    check_outcome = getattr(check, "outcome", "Automated test outcome unknown.")
                                     if guard:
                                         check = guard.after_tool("run_tests", {}, check)
-                                    result = f"{result}\n\n[AUTO CHECK after this edit, run_tests result]\n{check}"
+                                    check = execution_result(check, executed=check_ran, outcome=check_outcome)
+                                    prefix = f"{result}\n\n[AUTO CHECK after this edit, run_tests result]\n"
+                                    pending["result"] = execution_result(
+                                        prefix + str(check), executed=True,
+                                        outcome=f"{getattr(result, 'outcome', 'Edit completed.')} {check_outcome}",
+                                    )
+                                    check = guard_tool_result(
+                                        "run_tests", check, memory=self.memory,
+                                        fits=lambda content: self._tool_result_fits(
+                                            pending, prefix + str(content), use_tools, window_scale,
+                                        ),
+                                    )
+                                    result = execution_result(
+                                        prefix + str(check), executed=True,
+                                        outcome=pending["result"].outcome,
+                                    )
+                                    pending["result"] = result
                                 # State changed: re-running run_tests / read_file / git_* is legitimate now.
                                 executed_tools.clear()
                                 duplicate_counts.clear()  # repeats made before the file changed are not repeats now
@@ -1069,6 +1220,7 @@ class Agent:
                         if self._mutation_segment:
                             result_message["metadata"] = self._outcome_metadata()
                         self.memory.add_raw(result_message)
+                        pending["state"] = "recorded"
 
                     if recovery_without_edit:
                         self._edit_recovery["status"] = "stopped"
@@ -1158,7 +1310,10 @@ class Agent:
                     if retrieved_search_urls and not any(u in final_text for u in retrieved_search_urls):
                         final_text += f"\n\nSource: {retrieved_search_urls[0]}"
                     self.unresolved_errors = list(unresolved.values())
-                    if not wrote_ok and wants_edit and not _NO_CHANGE_OK.search(final_text or ""):
+                    if not wrote_ok and self.changed_files and wants_edit:
+                        final_text += ("\n\nExecutor record: file-state changes were observed during this turn; "
+                                       "requested edit completion is unverified.")
+                    if not wrote_ok and not self.changed_files and wants_edit and not _NO_CHANGE_OK.search(final_text or ""):
                         final_text += ("\n\nWarning: no file was changed. No file tool actually changed file contents "
                                        "in this run, so do not assume the edit was applied.")
                         if not _NO_CHANGE_OK.search(final_text.split("\n\nWarning: no file was changed")[0]):
@@ -1167,7 +1322,7 @@ class Agent:
                             # The requested executor action is unverified; do not infer semantic absence.
                             self.claimed_unapplied_edit = True
                             final_text += "\nExecutor record: no successful file mutation was observed in this turn."
-                    if not wrote_ok and not self.claimed_unapplied_edit:
+                    if not wrote_ok and not self.changed_files and not self.claimed_unapplied_edit:
                         _claim = _FILE_CLAIM.search(final_text or "")
                         if _claim and not _NO_CHANGE_OK.search(final_text or ""):
                             _after = (final_text or "")[_claim.start():_claim.start() + 400]
@@ -1230,6 +1385,12 @@ class Agent:
 
                     self._remember_assistant(response.text)
                     return final_text
+        except BaseException as exc:
+            try:
+                self._close_aborted_turn(exc)
+            except Exception:
+                display.print_warn("Executor history closure could not be recorded; the original error is unchanged.")
+            raise
         finally:
             display.stop_status(status)
             if managed_fallback:

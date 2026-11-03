@@ -1,5 +1,6 @@
 import sys
 from typing import Any, Dict
+from ..agent.refusals import execution_ran
 
 # Ensure safe output encoding on Windows terminals to prevent UnicodeEncodeError
 for stream in (sys.stdout, sys.stderr):
@@ -63,6 +64,16 @@ def _tool_status_label(result: str) -> tuple:
     stripped = (result or "").strip()
     if stripped.startswith("SANDBOX BLOCK"):
         return "bold yellow", "Blocked"
+    if getattr(result, "outcome", None) == "Suppressed (duplicate)" and not execution_ran(result):
+        return "bold yellow", "Suppressed (duplicate)"
+    if isinstance(getattr(result, "executed", None), bool):
+        if not result.executed:
+            return "bold yellow", "Not executed"
+        if "unknown" in getattr(result, "outcome", "").casefold():
+            return "bold yellow", "Outcome unknown"
+        if getattr(result, "refusal_class", None) is not None:
+            return "bold red", "Failed"
+        return "bold green", "Done"
     if stripped.startswith("ERROR") or "ERROR:" in stripped or stripped.startswith("[ERROR]"):
         return "bold red", "Failed"
     return "bold green", "Done"
