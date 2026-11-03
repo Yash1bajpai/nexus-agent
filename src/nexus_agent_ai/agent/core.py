@@ -1251,7 +1251,15 @@ class Agent:
             final_text += " Any partial edits remain in place; no automatic repair was attempted."
         if self.unresolved_errors:
             final_text += "\nUnresolved tool errors:\n" + "\n".join(dict.fromkeys(self.unresolved_errors))
-        self._remember_assistant(stopped_assistant_text if stopped_assistant_text is not None else final_text)
+        if stopped_assistant_text is not None:
+            # Free-form prose has no trusted file provenance; keep hash-only
+            # evidence rather than introduce a weaker secret/excerpt filter.
+            self._audit("edit_recovery_stopped", {
+                "turn": self._turn_id, "tool_call_id": self._edit_recovery["call_id"],
+                "reason": self._edit_recovery["reason"],
+                "sha256": hashlib.sha256(stopped_assistant_text.encode("utf-8")).hexdigest(),
+            })
+        self._remember_assistant(final_text)
         if self.event_callback:
             self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
         if stream and not self.event_callback:

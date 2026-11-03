@@ -1,6 +1,7 @@
 """One guarded recovery, with disposable provider-valid result augmentation."""
 import copy
 import json
+import hashlib
 
 import pytest
 
@@ -102,7 +103,7 @@ def test_no_corrected_edit_preserves_reply_and_stops(tmp_path):
     assert result.startswith(text)
     assert "No corrected edit was attempted" in result and "Executor record:" in result
     assert len(provider.seen) == 2
-    assert any(message.get("content") == text for message in agent.memory.get())
+    assert agent.memory.get()[-1]["content"] == result
     assert agent.edit_not_applied
 
 
@@ -355,3 +356,64 @@ def test_reused_historical_call_id_is_bound_to_the_actual_refusal_segment(tmp_pa
     assert projected[-1]["tool_call_id"] == earlier[-1]["tool_call_id"] == "actual"
     with pytest.raises(ValueError, match="duplicate"):
         project_recovery(messages + [copy.deepcopy(current[-1])], recovery)
+
+
+def test_stopped_false_claim_history_retrieval_includes_executor_correction(tmp_path):
+    path = tmp_path / "f.py"
+    original = "def f():\n    return 1\n"
+    path.write_text(original)
+    raw = "I have updated f.py with the requested changes."
+    events = []
+    memory = SQLiteMemory(tmp_path / "state" / "history.db", session_id="stopped-claim")
+    provider = Scripted([edit(), ProviderResponse(text=raw)])
+    agent = Agent(provider, memory=memory, verbose=False, event_callback=events.append)
+    final = agent.run("Update f.py")
+    assert len(provider.seen) == 2
+    assert path.read_text() == original
+    assert final.startswith(raw + "\n\nStopped: bounded edit recovery ended.")
+    assert "No corrected edit was attempted after the single recovery nudge." in final
+    assert "Executor record:" in final and "workspace unchanged" not in final.lower()
+    canonical = memory.get()
+    assert canonical[-1]["content"] == final
+    assert canonical[-1]["metadata"] == agent._outcome_metadata()
+    assert canonical[-1]["metadata"]["turn"] == agent._turn_id
+    assert canonical[-1]["metadata"]["segment"] == agent._mutation_segment
+    assert not any(message.get("content") == raw for message in canonical)
+    result = tools.execute_history_read("updated f.py", memory=memory)
+    records = json.loads(result.split("\n", 1)[1])
+    assert len(records) == 1 and records[0]["role"] == "assistant"
+    assert "Executor record:" in records[0]["text"]
+    assert "No corrected edit was attempted" in records[0]["text"]
+    audit = [event for event in events if event["type"] == "edit_recovery_stopped"]
+    assert len(audit) == 1
+    assert audit[0] == {
+        "type": "edit_recovery_stopped", "turn": agent._turn_id,
+        "tool_call_id": "failed", "reason": "blind_edit",
+        "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+    }
+    assert any(event["type"] == "response" and event["content"] == final for event in events)
+
+
+def test_credential_shaped_stopped_text_has_hash_only_audit_and_corrected_history(tmp_path):
+    path = tmp_path / "f.py"
+    path.write_text("def f():\n    return 1\n")
+    raw = "I have updated f.py. password=SYNTHETIC_TEST_VALUE_NOT_A_REAL_CREDENTIAL"
+    events = []
+    memory = SQLiteMemory(tmp_path / "state" / "history.db", session_id="stopped-private")
+    agent = Agent(Scripted([edit(), ProviderResponse(text=raw)]), memory=memory,
+                  verbose=False, event_callback=events.append)
+    final = agent.run("Update f.py")
+    audit = [event for event in events if event["type"] == "edit_recovery_stopped"]
+    assert len(audit) == 1
+    assert set(audit[0]) == {"type", "turn", "tool_call_id", "reason", "sha256"}
+    assert audit[0]["sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert audit[0]["turn"] == agent._turn_id
+    assert audit[0]["tool_call_id"] == "failed" and audit[0]["reason"] == "blind_edit"
+    assert raw not in json.dumps(audit)
+    assert "SYNTHETIC_TEST_VALUE" not in json.dumps(audit)
+    canonical = memory.get()
+    assert canonical[-1]["content"] == final and canonical[-1]["content"] != raw
+    assert canonical[-1]["metadata"] == agent._outcome_metadata()
+    assert "Executor record:" in canonical[-1]["content"]
+    assert "No corrected edit was attempted" in canonical[-1]["content"]
+    assert "workspace unchanged" not in final.lower()

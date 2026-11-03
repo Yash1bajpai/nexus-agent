@@ -161,7 +161,7 @@ def test_repeat_stop_pairs_unexecuted_batch_calls_without_running_them(tmp_path)
 
 
 @pytest.mark.parametrize("persistent", [False, True])
-def test_mixed_outcomes_redact_only_false_claims_in_next_fitted_view(tmp_path, persistent):
+def test_legacy_mixed_outcomes_redact_only_false_claims_in_next_fitted_view(tmp_path, persistent):
     read_b(tmp_path)
     raw = "I updated a.py.\r\nI updated b.py.\nI updated unknown.py."
     provider = Scripted([
@@ -172,6 +172,11 @@ def test_mixed_outcomes_redact_only_false_claims_in_next_fitted_view(tmp_path, p
               if persistent else ConversationMemory())
     agent = Agent(provider, memory=memory, verbose=False)
     agent.run("Update a.py and b.py")
+    # Pre-follow-up records retain raw prose: no migration is performed. Exercise
+    # their existing fitted-view redaction separately from corrected new stops.
+    legacy = memory.get()
+    legacy[-1]["content"] = raw
+    memory.replace(legacy)
     audit = copy.deepcopy(memory.get())
     original = audit[-1]
     assert original["content"].encode() == raw.encode()
