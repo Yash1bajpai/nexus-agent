@@ -134,7 +134,9 @@ def test_only_active_tool_output_is_fully_protected(active):
 
 def test_no_note_for_uncompacted_history():
     messages = old_turn() + [{"role": "user", "content": "Continue"}]
-    fitted, stats = ctx.fit_messages(messages, ctx.history_tokens(messages))
+    turns = sum(ctx.is_genuine_user_message(message) for message in messages)
+    floor = ctx.history_tokens(ctx._omission_pair(evicted_turns=1, turns_before=turns))
+    fitted, stats = ctx.fit_messages(messages, ctx.history_tokens(messages) + floor)
     assert fitted == messages
     assert stats["omission_tokens"] == stats["dropped_turns"] == 0
 

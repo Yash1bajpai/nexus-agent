@@ -208,6 +208,15 @@ def _collect_omission_fields(messages, session_record=None):
     return record
 
 
+def _check_omission_budget(tokens, budget):
+    if tokens > budget:
+        raise ContextBudgetError(
+            "Historical omission coverage gap: the omission anchor and acknowledgement "
+            "cannot fit alongside the current request and tool bindings. No over-budget "
+            "request was sent; ask the user to shorten input or adjust configured budgets."
+        )
+
+
 def _fit_omission_fields(record, budget_tokens, *, evicted_turns=0, turns_before=0,
                          evicted_closed_turns=0):
     """Expose exactly the retained fields after tools/topics/files shedding."""
@@ -227,12 +236,7 @@ def _fit_omission_fields(record, budget_tokens, *, evicted_turns=0, turns_before
                 files, topics, tools, evicted_turns=evicted_turns, turns_before=turns_before,
                 evicted_closed_turns=evicted_closed_turns,
             )
-    if history_tokens(pair) > cap:
-        raise ContextBudgetError(
-            "Historical omission coverage gap: the omission anchor and acknowledgement "
-            "cannot fit alongside the current request and tool bindings. No over-budget "
-            "request was sent; ask the user to shorten input or adjust configured budgets."
-        )
+    _check_omission_budget(history_tokens(pair), cap)
     return pair, record
 
 
@@ -422,6 +426,25 @@ def _executor_closed_turn(messages):
     )
 
 
+def _omission_floor(view, starts, pinned, needs_record):
+    """Charge the actual minimum pair before dynamic content can fill its room.
+
+    Cover the first reachable eviction even before SESSION_RECORD exists.
+    Subsequent evictions charge their actual count/closed-turn line in the
+    eviction loop. Merely reserving headroom never injects or persists a record.
+    """
+    floor = history_tokens(_omission_pair()) if needs_record else 0
+    if len(starts) > 2:
+        start, end = starts[0], starts[1]
+        if (not any(i in pinned for i in range(start, end))
+                and _completed_turn(view[start:end])):
+            floor = max(floor, history_tokens(_omission_pair(
+                evicted_turns=1, turns_before=len(starts),
+                evicted_closed_turns=int(_executor_closed_turn(view[start:end])),
+            )))
+    return floor
+
+
 def fit_messages(
     messages: List[Dict[str, Any]], budget_tokens: int, *, session_record=None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -442,6 +465,9 @@ def fit_messages(
     ``evicted_closed_turns`` counts only evicted completed genuine turns bearing
     structured executor closure records; it is folded into the same bounded
     index line without changing the omission protocol or protection rules.
+    The minimum pair is charged before payload fitting, including the first
+    reachable eviction. The same floor applies to actual requests, projections
+    and tool-result admission; unused headroom is not sent or persisted.
     """
     record = _validated_session_record(session_record)
     stats = {"dropped_messages": 0, "truncated_messages": 0, "compacted_messages": 0,
@@ -500,8 +526,12 @@ def fit_messages(
     applied, plans, planned_bytes = [], {}, 0
     total = history_tokens(msgs)
     needs_record = record is not None
+    omission_floor = _omission_floor(
+        view, starts, pinned, needs_record,
+    )
     for index, owner, key, replacement, count, plan in candidates:
         anchor = history_tokens(_omission_pair()) if needs_record else 0
+        anchor = max(anchor, omission_floor)
         if total + anchor <= budget_tokens:
             break
         if plan["artifact_id"] not in plans:
@@ -524,6 +554,7 @@ def fit_messages(
             evicted_turns=evicted, turns_before=len(starts),
             evicted_closed_turns=stats["evicted_closed_turns"],
         )) if needs_record else 0
+        anchor = max(anchor, omission_floor)
         if total + anchor <= budget_tokens:
             break
         start, end = starts[turn_index], starts[turn_index + 1]
@@ -537,6 +568,8 @@ def fit_messages(
         needs_record = True
     stats["turns_after"] -= stats["evicted_turns"]
     msgs = msgs[cut:]
+    if omission_floor:
+        _check_omission_budget(omission_floor, budget_tokens - total)
     if needs_record:
         collected = _collect_omission_fields(view[:active_start], record)
         note, retained = _fit_omission_fields(
