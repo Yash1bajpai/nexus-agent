@@ -23,6 +23,7 @@ from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata, c
 from .refusals import RefusalClass, refusal, execution_result, execution_ran
 from .recovery import project_recovery, recovery_excerpt
 from .result_budget import guard_tool_result
+from . import budget_diagnostics as diagnostics
 
 RULES_PROMPT = """RULES:
 1. Always use read_file tool before answering questions about a specific file.
@@ -575,6 +576,7 @@ class Agent:
             messages.append(message)
         return messages
 
+    @diagnostics.stage("tool_result_fit_probe")
     def _tool_result_fits(self, current, content, tools, scale=1.0, *, result_tokens=0):
         if not self.context_window:
             return True
@@ -664,6 +666,7 @@ class Agent:
             ),
             "metadata": {"executor_closed": True, "executor": True, "reason": reason},
         })
+    @diagnostics.capture_plan
     def _plan_fit(self, messages, tools, scale=1.0, *, output_reserve=None, boost=None, result_tokens=0):
         """Plan a request with the existing budget policy, without changing agent/provider state."""
         messages, recovery_injected = project_recovery(messages, self._edit_recovery)
@@ -675,23 +678,39 @@ class Agent:
         # Keep a usable reply allowance rather than shrinking all the way to a
         # single token. Explicit smaller caps remain exact.
         minimum_output = min(configured, 256)
-        overhead = context.estimate_tokens(self.system) + context.tools_tokens(tools)
+        system_tokens = context.estimate_tokens(self.system)
+        tool_tokens = context.tools_tokens(tools)
+        overhead = system_tokens + tool_tokens
         # A pending output-boost retry raises the reserve BEFORE fitting, so the
         # history budget shrinks accordingly and input + output stays within the
         # window. Planning does not consume the boost.
+        initial_reserve = reserve
         if adaptive and boost:
             reserve = max(reserve, min(boost, max(minimum_output, window - overhead - 256)))
+        if diagnostics.planner_active():
+            diagnostics.plan_projected(
+                self, messages, context_window=self.context_window, scale=scale,
+                configured_reserve=configured, initial_reserve=initial_reserve,
+                minimum_output=minimum_output, adaptive=adaptive, boost=boost,
+                system_tokens=system_tokens, tool_tokens=tool_tokens,
+                result_tokens=result_tokens,
+                artifact_store_available=callable(getattr(self.memory, "store_artifacts", None)),
+                recovery_injected=recovery_injected,
+            )
         while True:
             budget = window - reserve - overhead
             try:
                 if budget <= 0:
+                    diagnostics.plan_attempt(self, reserve, budget, None)
                     raise context.ContextBudgetError(
                         f"Configured context budget ({window} tokens) cannot fit instructions, tools and answer reserve "
                         f"({overhead + reserve} tokens). Adjust the configured context/output budgets within "
                         "the endpoint's documented capacity, or use fewer tools."
                     )
+                session_record = self.memory.get_session_metadata("SESSION_RECORD")
+                diagnostics.plan_attempt(self, reserve, budget, session_record)
                 fitted, stats = context.fit_messages(
-                    messages, budget - result_tokens, session_record=self.memory.get_session_metadata("SESSION_RECORD"),
+                    messages, budget - result_tokens, session_record=session_record,
                 )
                 if stats.get("artifacts") and not callable(getattr(self.memory, "store_artifacts", None)):
                     raise context.ContextBudgetError(
@@ -699,7 +718,8 @@ class Agent:
                         "no unretained artifact references can be sent."
                     )
                 break
-            except context.ContextBudgetError:
+            except context.ContextBudgetError as exc:
+                diagnostics.plan_rejection(self, exc)
                 if not adaptive or reserve <= minimum_output:
                     raise
                 reserve = max(minimum_output, reserve // 2)
@@ -707,6 +727,7 @@ class Agent:
                      recovery_injected=recovery_injected)
         return fitted, stats
 
+    @diagnostics.stage("outbound_fit")
     def _fit(self, messages, tools, scale: float = 1.0):
         """Trim only the sent view; retain the exact newest user request and stored history."""
         if not self.context_window:
@@ -816,6 +837,7 @@ class Agent:
             self.memory.replace(new)
         return before, context.history_tokens(self.memory.get()), info
 
+    @diagnostics.capture_turn
     def run(self, user_input: str, stream: bool = False, require_edit: bool = False) -> str:
         """Execute the ReAct loop for a user input."""
         from . import tools as tools_module
@@ -895,6 +917,7 @@ class Agent:
         try:
             while iteration < effective_max_iter:
                 iteration += 1
+                diagnostics.set_iteration(self, iteration)
                 display.update_status(status, "Thinking...")
                 self._sync_context_window()
                 local_mode = _is_local_provider(self.provider)

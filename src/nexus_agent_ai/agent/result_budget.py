@@ -10,6 +10,7 @@ import hashlib
 
 from .context import ContextBudgetError, estimate_tokens
 from .refusals import execution_ran, execution_result
+from . import budget_diagnostics as diagnostics
 
 
 def _replacement(source, text, *, executed, outcome):
@@ -22,6 +23,7 @@ def _replacement(source, text, *, executed, outcome):
     return execution_result(replacement, executed=executed, outcome=outcome)
 
 
+@diagnostics.capture_receipt
 def guard_tool_result(name, result, *, memory, fits):
     """Return an exactly fitting result or raise without misreporting execution.
 
@@ -63,9 +65,11 @@ def guard_tool_result(name, result, *, memory, fits):
                     "byte_len": len(content.encode("utf-8")), "content": content}
             try:
                 admitted = retain(plan) is True
+                diagnostics.receipt_retention("success" if admitted else "full")
                 discard_reason = "artifact store full; output discarded"
             except Exception:
                 admitted = False
+                diagnostics.receipt_retention("error")
                 discard_reason = "artifact retention failed; output discarded"
             if admitted:
                 return retained

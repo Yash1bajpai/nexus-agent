@@ -298,6 +298,24 @@ The `Windows` and `macOS` workflows' manual-only `first-run` jobs download LFM2.
 
 Release publication is maintainer-triggered through the `Publish` workflow with an existing version tag. It builds and checks the wheel/source distribution, tests the installed wheel on Linux, macOS and Windows with Python 3.11–3.13, creates the GitHub release, and uploads those same artifacts to PyPI through trusted publishing. The PyPI trusted publisher must authorize `Yash1bajpai/nexus-agent`, workflow `publish.yml`, environment `pypi`. Publication fails without that account-side authorization; committing a version does not update PyPI.
 
+### Synthetic budget diagnostics (R11, review-only)
+
+Ordinary CLI launches never activate capture, including when a diagnostic-looking environment variable is set. Explicit activation requires an exclusively created synthetic scope, matching fresh `HOME`/`USERPROFILE`, workspace and SQLite path, the exact `r11-budget-synthetic` session, and one of the seven frozen seed/filler prompts. No ordinary home/history, credentials, cookies, private prompts, tool schemas or environment dump is copied into snapshots. The wrapper runs the normal installed CLI; it adds no model request, tool execution, retry, coaching or budget/protection change.
+
+`agent/budget_diagnostics.py` records the latest completed actual-fit plan and first escaping planner/receipt failure per invocation, not every admission/binary-search probe. Inputs include exact canonical and post-recovery messages, validated record, numeric overhead/reserve attempts, stage, structured pending calls, pair/count accounting and the appended-message identity delta. A completed fit is **not** proof of server receipt. Each invocation has a 512 KiB capture allowance; oversized inputs/errors become valid JSON **unreplayable** markers, never partially qualified snapshots. Diagnostic write failures cannot replace the original runtime result/error. A missing first-fit snapshot, incomplete linkage or failed output write remains a reported evidence gap.
+
+Offline replay needs no model, provider, credentials, real artifact retention or canonical database access:
+
+```bash
+python -m nexus_agent_ai.budget_replay diagnostic-output/seed/failure.json --output diagnostic-output/seed/replay.json
+```
+
+Replay uses the unchanged fitter/planner with captured post-projection input, an explicit numeric-overhead surrogate, stub capacity flags and in-memory receipt retention events. It checks exact errors, fitted hashes/tokens and adaptive attempts. It does not reconstruct private recovery state or validate the recovery projection itself. Classification requires a protected lower-bound proof or an exact legal prefix witness; otherwise the cause remains unresolved. Newly appended assistant arguments are identifiable contributions, **not** proof of sole causality. Receipt-guard causes can remain unresolved even when the failure reproduces exactly.
+
+The separate `.github/workflows/budget-diagnostic.yml` is **workflow-dispatch only**, Windows-only, gated to a reviewed `diagnostic/*` ref and exact SHA, with a 25-minute job limit and 420 seconds per command. `.github/diagnostics/budget_diagnostic_runner.py` verifies the fresh installed wheel/checkout and the explicitly supplied R10 GGUF hash, copies only that model into a fresh cache, and executes only the frozen seed plus six fillers. Model/state files stay outside `output/`; uploads name only the dedicated synthetic output directory. Command streams are capped at 64 KiB each and runner JSON summaries at 128 KiB. Early stopping requires an exact replayed coverage failure plus a token-identical preceding actual fit from the same invocation; no failure, receipt-only failure, missing linkage and unreplayable capture are reported separately, never as model-readiness PASS.
+
+**Execution remains review-gated.** Authoring and offline tests do not authorize a push or Windows run. After independent review and safe routing approval, the candidate belongs only on a dedicated diagnostic branch, never DEV/main to make a workflow discoverable. GitHub may refuse dispatch for a workflow absent from the default-branch discovery surface; report that restriction and use an already available approved manual route or another independently reviewed execution path. Do not merge this workflow to main as a discoverability workaround. The authoritative driver/full E2E workflow are unchanged; no retention, zero-fatal or real-model qualification claim follows from this bundle.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

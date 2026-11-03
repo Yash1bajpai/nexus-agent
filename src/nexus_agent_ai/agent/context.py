@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .memory import is_genuine_user_message
 from .outcomes import fitted_claim_view
+from . import budget_diagnostics as diagnostics
 
 CHARS_PER_TOKEN = 3.5
 MESSAGE_OVERHEAD_TOKENS = 6
@@ -451,6 +452,68 @@ def _omission_floor(view, starts, pinned, needs_record, *, evicted_turns=0,
             )))
     return floor
 
+def _diagnostic_checkpoint(view, msgs, starts, pinned, stats, cut, active_start,
+                           previous_start, needs_record, budget_tokens, total, calls):
+    """Synthetic-only observation; empty payloads are a lower bound, not a fit."""
+    try:
+        if not diagnostics.planner_active():
+            return
+        evicted = stats["evicted_turns"]
+        closed = stats["evicted_closed_turns"]
+        pair = (_omission_pair(
+            evicted_turns=evicted, turns_before=len(starts), evicted_closed_turns=closed,
+        ) if needs_record else [])
+        eligibility, blocked = [], False
+        for index in range(max(0, len(starts) - 2)):
+            start, end = starts[index], starts[index + 1]
+            reason = ("blocked_by_prefix" if blocked else
+                      "leading_messages" if index == 0 and start != 0 else
+                      "pinned" if any(i in pinned for i in range(start, end)) else
+                      "incomplete" if not _completed_turn(view[start:end]) else None)
+            eligibility.append({
+                "turn": index, "start": start, "end": end, "eligible": reason is None,
+                "reason": reason, "closed": _executor_closed_turn(view[start:end]),
+            })
+            blocked = blocked or reason is not None
+        next_pair = None
+        if evicted < len(eligibility) and eligibility[evicted]["eligible"]:
+            start, end = starts[evicted], starts[evicted + 1]
+            next_pair = _omission_pair(
+                evicted_turns=evicted + 1, turns_before=len(starts),
+                evicted_closed_turns=closed + int(_executor_closed_turn(view[start:end])),
+            )
+        lower_bound = 0
+        protected = []
+        for offset, message in enumerate(msgs):
+            original_index = cut + offset
+            reason = ("pinned" if original_index in pinned else
+                      "active" if original_index >= active_start else
+                      "previous_structure" if original_index >= previous_start else None)
+            if reason is None:
+                continue
+            minimal = message
+            if reason == "previous_structure":
+                minimal = copy.deepcopy(message)
+                for owner, key, name in _payloads(minimal, calls):
+                    if name is not None:
+                        owner[key] = ""
+            cost = message_tokens(minimal)
+            lower_bound += cost
+            protected.append({"index": original_index, "reason": reason, "lower_bound_tokens": cost})
+        diagnostics.fitter_checkpoint(
+            starts=list(starts), active_start=active_start, previous_start=previous_start,
+            cut=cut, pinned_indices=sorted(pinned), prefix_eligibility=eligibility,
+            message_tokens_remaining=[message_tokens(message) for message in msgs],
+            actual_evicted=evicted, actual_closed=closed, actual_pair=pair, next_pair=next_pair,
+            actual_pair_tokens=history_tokens(pair),
+            projected_pair_tokens=max(history_tokens(pair), history_tokens(next_pair or [])),
+            needs_record=needs_record, budget_tokens=budget_tokens, remaining_tokens=total,
+            serialized_remaining_tokens=history_tokens(msgs),
+            protected_lower_bound_tokens=lower_bound, protected_messages=protected,
+        )
+    except Exception as exc:
+        diagnostics.fitter_checkpoint(accounting_error=type(exc).__name__)
+
 
 def fit_messages(
     messages: List[Dict[str, Any]], budget_tokens: int, *, session_record=None,
@@ -574,6 +637,10 @@ def fit_messages(
         needs_record = True
     stats["turns_after"] -= stats["evicted_turns"]
     msgs = msgs[cut:]
+    _diagnostic_checkpoint(
+        view, msgs, starts, pinned, stats, cut, active_start, previous_start,
+        needs_record, budget_tokens, total, calls,
+    )
     if needs_record:
         collected = _collect_omission_fields(view[:active_start], record)
         note, retained = _fit_omission_fields(

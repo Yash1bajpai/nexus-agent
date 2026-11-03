@@ -1,0 +1,95 @@
+name: Synthetic budget diagnostic (manual, Windows)
+
+# GitHub may not expose workflow_dispatch until a workflow exists on the default
+# branch. That is a discoverability restriction, NOT permission to push to DEV or
+# main as a workaround. Use a reviewed diagnostic/* branch only after independent
+# route approval; do not change the authoritative full E2E workflow or driver.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact 40-character commit SHA on the reviewed diagnostic/* branch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      startsWith(github.ref, 'refs/heads/diagnostic/') &&
+      github.sha == inputs.expected_sha
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Reject unintended ref or commit before checkout
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ACTUAL_SHA: ${{ github.sha }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if ($env:DISPATCH_REF -notmatch '^refs/heads/diagnostic/.+$') { throw 'Dedicated diagnostic branch required' }
+          if ($env:EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact lowercase commit SHA required' }
+          if ($env:ACTUAL_SHA -cne $env:EXPECTED_SHA) { throw 'Expected SHA mismatch' }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_sha }}
+          persist-credentials: false
+      - name: Confirm checkout identity before build or model access
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:EXPECTED_SHA) { throw 'Checkout SHA mismatch' }
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build one fresh wheel and install isolated environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'budget-diagnostic-build'
+          New-Item -ItemType Directory -Path $build -ErrorAction Stop | Out-Null
+          python -m pip wheel --no-deps --wheel-dir "$build/wheel" .
+          if ($LASTEXITCODE -ne 0) { throw 'Wheel build failed' }
+          $wheels = @(Get-ChildItem "$build/wheel/*.whl")
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one fresh wheel' }
+          python -m venv "$build/venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Venv creation failed' }
+          & "$build/venv/Scripts/python.exe" -m pip install --only-binary=:all: $wheels[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh wheel installation failed' }
+      - name: Fetch and hash only the explicitly approved GGUF
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $model = Join-Path $env:RUNNER_TEMP 'budget-diagnostic-model.gguf'
+          if (Test-Path $model) { throw 'Model staging path must be fresh' }
+          curl.exe --fail --location --max-time 420 --output $model 'https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/LFM2.5-1.2B-Instruct-Q4_0.gguf'
+          if ($LASTEXITCODE -ne 0) { throw 'Model fetch failed; no retry' }
+          $digest = (Get-FileHash -Algorithm SHA256 $model).Hash.ToLowerInvariant()
+          if ($digest -cne '2ea801949d760cdf1a2cc04a54262c22c3c0c54f0769d57760c9adeb0e59233f') { throw 'Model SHA256 mismatch' }
+      - name: Run only seven frozen synthetic commands with offline replay
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ACTUAL_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'budget-diagnostic-build'
+          $wheel = @(Get-ChildItem "$build/wheel/*.whl")
+          if ($wheel.Count -ne 1) { throw 'Expected exactly one fresh wheel' }
+          $runner = Join-Path $env:GITHUB_WORKSPACE '.github/diagnostics/budget_diagnostic_runner.py'
+          Set-Location $env:RUNNER_TEMP
+          & "$build/venv/Scripts/python.exe" -I $runner --root "$env:RUNNER_TEMP/budget-diagnostic-run" --model-source "$env:RUNNER_TEMP/budget-diagnostic-model.gguf" --wheel $wheel[0].FullName --source-root $env:GITHUB_WORKSPACE --commit $env:ACTUAL_SHA --expected-commit $env:EXPECTED_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic capture/replay incomplete; inspect dedicated output' }
+      - name: Upload dedicated bounded diagnostic output only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-budget-diagnostic-${{ github.sha }}
+          path: ${{ runner.temp }}/budget-diagnostic-run/output/
+          if-no-files-found: warn
+          retention-days: 7
+          include-hidden-files: false
