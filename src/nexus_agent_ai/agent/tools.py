@@ -19,47 +19,12 @@ from .refusals import (
     RefusalClass, RefusalText, execution_ran, execution_result, refusal,
 )
 
-def _validate_workspace_path(path: str | Path) -> Path | str:
-    """Validate that path is inside the current workspace."""
-    p = Path(path).resolve()
-    cwd = Path.cwd().resolve()
-    try:
-        home = Path.home().resolve()
-    except Exception:
-        home = None
-
-    # Agent tools must never edit their own grants, history, or configuration, even
-    # when a project overlaps a state directory. Check resolved paths for aliases.
-    state_dirs = [home / ".nexus-agent"] if home is not None else []
-    if os.environ.get("NEXUS_AGENT_HOME"):
-        state_dirs.append(Path(os.environ["NEXUS_AGENT_HOME"]))
-    for state_dir in state_dirs:
-        state_root = state_dir.resolve()
-        if p == state_root or state_root in p.parents:
-            return refusal(RefusalClass.SENSITIVE_PATH, "ERROR: Security Sandbox Access Denied: Nexus state directories are protected.")
-
-    # Boundary safeguard: When running in home directory (Global Mode), prevent direct operations
-    # on the home root itself or root dotfiles/configuration (e.g. ~/.bashrc, ~/.gitconfig).
-    if home and cwd == home:
-        if p == home:
-            return refusal(RefusalClass.SENSITIVE_PATH,
-                "ERROR: Security Sandbox Access Denied: Direct targeting of the root home directory is forbidden. "
-                "Nexus is running in the home folder, the home root is protected, "
-                "create a project folder (mkdir my-project, cd my-project) and relaunch."
-            )
-        if p.parent == home and p.name.startswith("."):
-            return refusal(RefusalClass.SENSITIVE_PATH, f"ERROR: Security Sandbox Access Denied: Root configuration file '{p.name}' in home directory is protected.")
-
-    try:
-        if p.is_relative_to(cwd):
-            return p
-    except AttributeError:
-        try:
-            if os.path.commonpath([str(p), str(cwd)]) == str(cwd):
-                return p
-        except ValueError:
-            pass
-    return refusal(RefusalClass.SENSITIVE_PATH, f"ERROR: Security Sandbox Access Denied: Path '{path}' is outside the project workspace ({cwd}).")
+from ._workspace_paths import (
+    _validate_workspace_path, _is_sensitive_path,
+)
+from .text_count_worker import (
+    CountArgumentError, inspect_text, validate_query,
+)
 
 def _safe_git_run(args: List[str], *, execution: bool = False) -> subprocess.CompletedProcess:
     """Inspect Git without inherited helpers; explicit writes retain normal Git behavior."""
@@ -347,26 +312,45 @@ def estimate_read_file_tokens(path: str | None = None, **kwargs) -> int | None:
     except (OSError, TypeError, ValueError, RuntimeError):
         return None
 
-_SENSITIVE_NAMES = frozenset({
-    ".git", ".env", "config", "credentials", "secrets", ".npmrc", ".pypirc", "netrc",
-    ".ssh", ".aws", ".azure", ".kube", ".gnupg", ".bashrc", ".zshrc", ".profile",
-    ".bash_profile", "authorized_keys", "known_hosts", "id_rsa", "id_ed25519",
-})
-_SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".crt", ".token", ".secret")
-_SENSITIVE_MARKERS = ("credential", "secret", "token", "password", "passwd")
 
-def _is_sensitive_path(p: Path) -> bool:
-    """Check if a path points to sensitive credentials or configuration."""
-    filename_lower = p.name.lower()
-    return (
-        filename_lower.startswith(".env")
-        or filename_lower in _SENSITIVE_NAMES
-        or any(part.lower() in _SENSITIVE_NAMES for part in p.parts)
-        or any(filename_lower.endswith(ext) for ext in _SENSITIVE_SUFFIXES)
-        or any(marker in filename_lower for marker in _SENSITIVE_MARKERS)
-        or "id_rsa" in filename_lower
-        or "id_ed25519" in filename_lower
+_COUNT_INSPECTION_OUTCOME = "Inspection ran; counts require the complete receipt."
+
+
+def minimum_count_file_text_result(**args):
+    """Pure preview of the guard's minimum truthful receipt, never an execution."""
+    if (set(args) - {"path", "literal", "whole_word", "line"}
+            or ("line" in args and args["line"] is None)):
+        return None
+    try:
+        validate_query(**args)
+    except (CountArgumentError, TypeError):
+        return None
+    return execution_result(
+        refusal(RefusalClass.CAPACITY, f"Outcome: {_COUNT_INSPECTION_OUTCOME}\nOutput discarded."),
+        executed=True, outcome=_COUNT_INSPECTION_OUTCOME,
     )
+
+
+def execute_count_file_text(path: str, literal: str, whole_word: bool = True,
+                            line: int | None = None) -> str:
+    """Return only bounded physical facts; never establish or invalidate read proof."""
+    try:
+        packet = inspect_text(path, literal, whole_word, line, timeout=CODE_EXECUTION_TIMEOUT)
+    except CountArgumentError as error:
+        return execution_result(
+            refusal(RefusalClass.TARGETING, f"ERROR: count_file_text: {error.reason}."),
+            executed=False, outcome="Inspection did not run.",
+        )
+    text = json.dumps(packet["receipt"], ensure_ascii=True, separators=(",", ":"))
+    if packet["refusal_class"] is not None:
+        text = refusal(RefusalClass(packet["refusal_class"]), text)
+    result = execution_result(
+        text, executed=packet["executed"],
+        outcome=_COUNT_INSPECTION_OUTCOME if packet["executed"] else "Inspection did not run.",
+    )
+    result.requires_full_receipt = True
+    return result
+
 
 
 _HISTORY_READ_HEADER = (
@@ -1811,7 +1795,7 @@ def execute_git_commit(message: str, approved: bool = False) -> str:
 
 READ_FILE_TOOL = Tool(
     name="read_file",
-    description="Read the contents of any file and return it as a string. Use this before answering any question about a specific file.",
+    description="Read a file's complete contents before describing them or editing it. count_file_text reports only bounded physical counts, never contents or edit proof.",
     input_schema={
         "type": "object",
         "properties": {
@@ -1824,6 +1808,29 @@ READ_FILE_TOOL = Tool(
     },
     execute=execute_read_file,
     estimate_result_tokens=estimate_read_file_tokens,
+)
+
+COUNT_FILE_TEXT_TOOL = Tool(
+    name="count_file_text",
+    description=("Count a case-sensitive raw Unicode literal in a UTF-8 file (<=256 KiB), "
+                 "optionally one 1-based PHYSICAL line. whole_word uses adjacent "
+                 "isalnum/underscore boundaries; false counts nonoverlapping substrings. "
+                 "No regex/normalization; literal <=1024 UTF-8 bytes, no CR/LF. "
+                 "Reports count, full-file total/physical-line min/max and source hash; "
+                 "no contents or edit proof. Physical lines do not establish semantic sections."),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "literal": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "whole_word": {"type": "boolean", "default": True},
+            "line": {"type": "integer", "minimum": 1},
+        },
+        "required": ["path", "literal"],
+        "additionalProperties": False,
+    },
+    execute=execute_count_file_text,
+    minimum_result=minimum_count_file_text_result,
 )
 
 HISTORY_READ_TOOL = Tool(
@@ -2205,6 +2212,7 @@ def get_all_tools() -> List[Tool]:
     """Return inspection/editing tools; project execution is opt-in."""
     tools = [
         READ_FILE_TOOL,
+        COUNT_FILE_TEXT_TOOL,
         HISTORY_READ_TOOL,
         WRITE_FILE_TOOL,
         PATCH_FILE_TOOL,
@@ -2227,6 +2235,7 @@ def get_readonly_tools() -> List[Tool]:
     """Return read-only inspection tools (safe for code review without modifying disk)."""
     return [
         READ_FILE_TOOL,
+        COUNT_FILE_TEXT_TOOL,
         HISTORY_READ_TOOL,
         LIST_DIRECTORY_TOOL,
         SEARCH_WEB_TOOL,
@@ -2280,6 +2289,10 @@ def execute_tool(name: str, args: Dict[str, Any], *, gated_reason=None,
                     outcome="Tool handler completed." if ran else "Not executed.",
                 )
             except Exception as e:
+                if name == "count_file_text":
+                    # Only the fixed worker can establish inspection facts.
+                    # Unhandled/uncertain failures close as executed=None.
+                    raise
                 return execution_result(
                     refusal(RefusalClass.OTHER, f"ERROR: Execution failed for tool '{name}': {str(e)}"),
                     executed=True, outcome="Tool completion unknown; execution may have had effects.",

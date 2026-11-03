@@ -18,6 +18,8 @@ class Tool:
     execute: Callable[..., str]
     # Advisory only: never serialized into a provider's tool input schema.
     estimate_result_tokens: Optional[Callable[..., Optional[int]]] = None
+    # Source-authored minimum receipt for pure prospective admission, not a schema.
+    minimum_result: Optional[Callable[..., Optional[str]]] = None
 
 @dataclass
 class ToolCall:

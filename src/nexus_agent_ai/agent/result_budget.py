@@ -18,7 +18,13 @@ from . import budget_diagnostics as diagnostics
 def _replacement(source, text, *, executed, outcome):
     """Replace string content without dropping refusal or private guard metadata."""
     replacement = replace_result_text(source, text)
-    return execution_result(replacement, executed=executed, outcome=outcome)
+    replacement = execution_result(replacement, executed=executed, outcome=outcome)
+    if (getattr(source, "requires_full_receipt", False) is True
+            and getattr(source, "refusal_class", None) is None):
+        # Execution can succeed while its indispensable facts are unavailable.
+        # Classify before probing so the complete metadata cost is included.
+        replacement.refusal_class = RefusalClass.CAPACITY
+    return replacement
 
 
 @diagnostics.capture_receipt

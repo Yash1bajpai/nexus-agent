@@ -28,7 +28,7 @@ _OMISSION_ACK = "Historical index acknowledged; consult history_read for past-wo
 _HISTORICAL_TOOLS = frozenset({
     "read_file", "write_file", "patch_file", "list_directory", "run_code",
     "search_web", "git_status", "git_diff", "git_commit", "run_tests",
-    "edit_function", "add_function", "history_read",
+    "edit_function", "add_function", "history_read", "count_file_text",
 })
 _HISTORICAL_TOPICS = (
     ("testing", r"\b(?:test|tests|testing|pytest|unittest)\b"),

@@ -21,13 +21,14 @@ from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
 from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata, current_claim_correction
-from .refusals import RefusalClass, refusal, execution_result, execution_ran, execution_metadata
+from .refusals import RefusalClass, ToolResult, refusal, execution_result, execution_ran, execution_metadata
 from .recovery import project_recovery, recovery_excerpt
 from .result_budget import guard_tool_result
 from . import budget_diagnostics as diagnostics
 
 RULES_PROMPT = """RULES:
-1. Always use read_file tool before answering questions about a specific file.
+1. Use read_file before describing a file's contents. count_file_text may answer
+   bounded physical literal-count questions only; it gives no contents or edit proof.
    Never guess or assume file contents.
 2. When creating new files, use write_file. For existing files, use patch_file for literal
    changes or edit_function/add_function for targeted Python function changes.
@@ -67,11 +68,11 @@ This applies to every single tool call in every iteration."""
 # Keywords/patterns that indicate a query NEEDS tool access
 _TOOL_PATTERNS = [
     # Explicit capability requests must not depend on underscores being word boundaries.
-    r'\b(?:read_file|history_read|write_file|patch_file|edit_function|add_function|list_directory|run_code|run_tests|search_web|git_status|git_diff|git_commit)\b',
+    r'\b(?:read_file|count_file_text|history_read|write_file|patch_file|edit_function|add_function|list_directory|run_code|run_tests|search_web|git_status|git_diff|git_commit)\b',
     r'\b(?:calculate|compute|calculation|arithmetic)\b',
     r'\b\d[\d,]*(?:\.\d+)?\s*(?:[+*/%−-]|plus\b|minus\b|times\b|divided by\b|multiplied by\b)\s*[-+]?\d',
     # File operations
-    r'\b(read|open|show|view|display|print)\b.*\b(file|\.py|\.js|\.ts|\.java|\.cpp|\.c\b|\.h\b|\.go|\.rs|\.rb|\.html|\.css|\.json|\.yaml|\.yml|\.toml|\.md|\.txt|\.csv|\.xml|\.sql)',
+    r'\b(read|open|show|view|display|print|count)\b.*\b(file|\.py|\.js|\.ts|\.java|\.cpp|\.c\b|\.h\b|\.go|\.rs|\.rb|\.html|\.css|\.json|\.yaml|\.yml|\.toml|\.md|\.txt|\.csv|\.xml|\.sql)',
     r'\b(write|create|generate|make|build)\b.*\b(file|class|function|script|module|program)',
     r'\b(modify|edit|update|change|refactor|fix|patch)\b.*\b(file|code|function|class)',
     r'\b(delete|remove)\b.*\b(file|line|function)',
@@ -616,9 +617,12 @@ class Agent:
         if not self.context_window:
             return True
         try:
+            policy = {}
+            if current["call"].name == "count_file_text":
+                policy["boost"] = getattr(self, "_output_boost", None)
             self._plan_fit(
                 self._prospective_result_messages(current, content), tools, scale,
-                result_tokens=result_tokens,
+                result_tokens=result_tokens, **policy,
             )
         except context.ContextBudgetError:
             return False
@@ -629,6 +633,20 @@ class Agent:
             return None
         call = current["call"]
         tool = next((tool for tool in tools if tool.name == call.name), None)
+        minimum = getattr(tool, "minimum_result", None)
+        if callable(minimum):
+            preview = minimum(**call.args)
+            if preview is not None:
+                if not isinstance(preview, ToolResult):
+                    raise TypeError("A minimum-result preview must carry source execution facts.")
+                if self._tool_result_fits(current, preview, tools, scale):
+                    return None
+                return execution_result(
+                    refusal(RefusalClass.CAPACITY,
+                            f"ERROR: Not executed: '{call.name}' cannot fit its minimum truthful "
+                            "outcome receipt in the current context budget."),
+                    executed=False, outcome=f"{call.name} not executed: result capacity.",
+                )
         estimate = getattr(tool, "estimate_result_tokens", None)
         if not callable(estimate):
             return None
@@ -675,7 +693,8 @@ class Agent:
                 result = pending["result"]
                 ran = execution_ran(result)
                 receipt_metadata = execution_metadata(result)
-                if getattr(exc, "refusal_class", None) is RefusalClass.CAPACITY:
+                if (getattr(exc, "refusal_class", None) is RefusalClass.CAPACITY
+                        or pending["call"].name == "count_file_text"):
                     # A rejected admission is not permission to alter the executor
                     # evidence. It remains canonical even when it cannot be sent.
                     text = str(result)
@@ -935,8 +954,8 @@ class Agent:
         automatic_stop_reason = None
         force_final = False
         tool_errors = []
-        unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
-        unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
+        unresolved: Dict[Any, str] = {}  # existing path keys; count facts have a separate namespace
+        unresolved_tool: Dict[Any, str] = {}  # key -> name of the tool that failed
         unresolved_class = {}  # source classification for this unresolved invocation only
         window_scale = 1.0
         length_boost_used = False
@@ -1228,7 +1247,7 @@ class Agent:
 
                         pending["state"] = "returned"
                         pending["result"] = result
-                        if tool_call.name in ("read_file", "run_tests", "git_diff", "run_code"):
+                        if tool_call.name in ("read_file", "count_file_text", "run_tests", "git_diff", "run_code"):
                             result = guard_tool_result(
                                 tool_call.name, result, memory=self.memory,
                                 fits=lambda content: self._tool_result_fits(
@@ -1237,8 +1256,14 @@ class Agent:
                             )
                             pending["result"] = result
                         error_key = str(tool_call.args.get("path") or tool_call.name)
+                        if tool_call.name == "count_file_text":
+                            # Inspection facts cannot overwrite/resolve an unrelated
+                            # read/edit/test failure just because the path is the same.
+                            error_key = (tool_call.name, error_key)
                         capacity_refused = getattr(result, "refusal_class", None) is RefusalClass.CAPACITY
-                        if capacity_refused or str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
+                        count_refused = (tool_call.name == "count_file_text"
+                                         and isinstance(getattr(result, "refusal_class", None), RefusalClass))
+                        if capacity_refused or count_refused or str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
                             unresolved_tool[error_key] = tool_call.name
@@ -1364,11 +1389,11 @@ class Agent:
                         self.claim_unverified = guard.claim_unverified
                         if getattr(guard, "claim_unverified_error", ""):
                             self.claim_unverified_error = guard.claim_unverified_error
-                    # Historical excerpts/redactions remain tool data, never replayed
-                    # inside an internal action instruction.
+                    # Historical excerpts and literal-count argument echoes remain
+                    # tool data, never replayed inside an internal action instruction.
                     actionable_errors = [
                         error for key, error in unresolved.items()
-                        if unresolved_tool.get(key) != "history_read"
+                        if unresolved_tool.get(key) not in ("history_read", "count_file_text")
                         and unresolved_class.get(key) is not RefusalClass.CAPACITY
                     ]
                     if not actionable_errors and any(
