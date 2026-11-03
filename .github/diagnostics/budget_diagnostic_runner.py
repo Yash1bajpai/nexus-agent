@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -175,7 +176,38 @@ def _drain(stream, path: Path, result: dict) -> None:
         stream.close()
 
 
-def execute_row(scope: dict, row: str, environment: dict, *, popen=None) -> dict:
+def _windows_job_factory():
+    """Load only the reviewed sibling, including when this script runs under -I."""
+    cached = getattr(_windows_job_factory, "factory", None)
+    if cached is None:
+        path = Path(__file__).resolve().with_name("windows_job.py")
+        spec = importlib.util.spec_from_file_location("_budget_diagnostic_windows_job", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("Owned Windows lifecycle module is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cached = module.WindowsJobProcess
+        _windows_job_factory.factory = cached
+    return cached
+
+
+def _cleanup_posix_process(process, timeout=10):
+    errors = []
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception as error:
+        errors.append("process_group_" + type(error).__name__)
+    try:
+        if process.poll() is None:
+            process.wait(timeout=timeout)
+    except Exception as error:
+        errors.append("owned_process_wait_" + type(error).__name__)
+    return {"ownership": "owned_posix_process_group", "confirmed": not errors, "errors": errors}
+
+
+def execute_row(scope: dict, row: str, environment: dict, *, popen=None, windows_factory=None) -> dict:
     row_output = Path(scope["output"]) / row
     row_output.mkdir(exist_ok=True)
     argv = [sys.executable, "-I", "-m", "nexus_agent_ai.diagnostic_cli",
@@ -183,53 +215,75 @@ def execute_row(scope: dict, row: str, environment: dict, *, popen=None) -> dict
     options = {"cwd": scope["workspace"], "env": environment,
                "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
                "stderr": subprocess.PIPE}
-    if os.name != "nt":
-        options["start_new_session"] = True
+    if os.name == "nt":
+        factory = windows_factory or _windows_job_factory()
     else:
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        options["start_new_session"] = True
+        factory = popen or subprocess.Popen
     started = time.monotonic()
-    process = (popen or subprocess.Popen)(argv, **options)
+    process = None
     stdout, stderr = {}, {}
-    threads = [threading.Thread(target=_drain, args=(stream, row_output / name, result), daemon=True)
-               for stream, name, result in ((process.stdout, "stdout.txt", stdout),
-                                             (process.stderr, "stderr.txt", stderr))]
-    for thread in threads:
-        thread.start()
+    threads = []
+    started_streams = []
     timed_out = False
+    failure = {}
+    cleanup = {"ownership": "not_started", "confirmed": False, "errors": ["launch_failed"]}
+
+    def capture_stream(stream, path, result):
+        try:
+            _drain(stream, path, result)
+        except Exception:
+            # Closing a reader can fail after _drain recorded its payload.
+            result.update(error="output capture failed")
+
     try:
-        process.wait(timeout=COMMAND_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        process = factory(argv, **options)
+        for stream, name, result in ((process.stdout, "stdout.txt", stdout),
+                                     (process.stderr, "stderr.txt", stderr)):
+            thread = threading.Thread(target=capture_stream, args=(stream, row_output / name, result), daemon=True)
+            thread.start()
+            threads.append(thread)
+            started_streams.append(stream)
+        try:
+            process.wait(timeout=COMMAND_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    except Exception as error:
+        failure["launch_error" if process is None else "execution_error"] = type(error).__name__
+        if process is None:
+            cleanup = getattr(error, "cleanup", cleanup)
     finally:
-        # Also reap descendant llama-server processes after normal child exit so
-        # inherited pipes and local servers cannot outlive their diagnostic row.
-        if os.name != "nt":
+        teardown_started = time.monotonic()
+        deadline = teardown_started + 10
+        if process is not None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif timed_out:
-            # Windows has no killpg; taskkill /T includes the local server child.
-            taskkill = Path(environment["SYSTEMROOT"]) / "System32" / "taskkill.exe"
-            try:
-                subprocess.run([str(taskkill), "/PID", str(process.pid), "/T", "/F"],
-                               env=environment, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=10, check=False)
-            except (OSError, subprocess.SubprocessError):
-                pass
-            finally:
-                if process.poll() is None:
-                    process.kill()
-        if timed_out:
-            process.wait(timeout=10)
+                remaining = max(0, deadline - time.monotonic())
+                cleanup = (process.cleanup(timeout=remaining) if os.name == "nt"
+                           else _cleanup_posix_process(process, timeout=remaining))
+            except Exception as error:
+                cleanup = {"ownership": "owned_process", "confirmed": False,
+                           "errors": ["cleanup_" + type(error).__name__]}
+        # Descendants must release inherited write ends before readers are joined.
         for thread in threads:
-            thread.join(timeout=10)
-    return {"row": row, "argv": argv, "exit_code": process.returncode,
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+        if process is not None:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and stream not in started_streams:
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        failure["stream_close_error"] = type(error).__name__
+        teardown_duration = round(time.monotonic() - teardown_started, 3)
+    capture_complete = (len(threads) == 2 and not any(thread.is_alive() for thread in threads)
+                        and "error" not in stdout and "error" not in stderr)
+    return {"row": row, "argv": argv,
+            "exit_code": process.returncode if process is not None else None,
             "timed_out": timed_out, "duration_seconds": round(time.monotonic() - started, 3),
-            "stdout": stdout, "stderr": stderr,
-            "output_capture_complete": (not any(thread.is_alive() for thread in threads)
-                                        and "error" not in stdout and "error" not in stderr)}
+            "teardown_duration_seconds": teardown_duration,
+            "stdout": stdout, "stderr": stderr, "cleanup": cleanup, **failure,
+            "lifecycle_safe": (cleanup.get("confirmed") is True and not cleanup.get("errors")
+                               and capture_complete and not failure),
+            "output_capture_complete": capture_complete}
 
 
 def installed_provenance(wheel: Path, source_root: Path, commit: str,
@@ -377,21 +431,34 @@ def run_bundle(root: Path, model_source: Path, provenance: dict, *,
                 command = (executor or execute_row)(scope, row, environment)
             except Exception as error:
                 command = {"row": row, "exit_code": None, "timed_out": False,
-                           "output_capture_complete": False,
+                           "output_capture_complete": False, "lifecycle_safe": False,
                            "launch_error": type(error).__name__}
             (output / row).mkdir(exist_ok=True)
-            try:
-                observation = inspect_row(scope, row, replay_snapshot)
-            except Exception as error:
+            cleanup = command.get("cleanup", {})
+            lifecycle_failed = (command.get("lifecycle_safe") is False
+                                or not command.get("output_capture_complete", True)
+                                or (cleanup and (cleanup.get("confirmed") is not True
+                                                 or cleanup.get("errors"))))
+            if lifecycle_failed:
                 observation = {"status": "unreplayable", "stop": False,
-                               "reason": "offline replay raised " + type(error).__name__}
-            if command.get("timed_out") or not command.get("output_capture_complete", True):
+                               "reason": "owned lifecycle or output capture could not be confirmed"}
+            else:
+                try:
+                    observation = inspect_row(scope, row, replay_snapshot)
+                except Exception as error:
+                    observation = {"status": "unreplayable", "stop": False,
+                                   "reason": "offline replay raised " + type(error).__name__}
+            if not lifecycle_failed and command.get("timed_out"):
                 observation.update(status="unreplayable", stop=False, reason="command or output capture did not complete")
             elif command.get("exit_code") != 0 and observation["status"] == "not_reproduced":
                 observation.update(status="unreplayable", stop=False, reason="nonzero command without a replay-qualified fatal")
             command["observation"] = observation
             summary["rows"].append(command)
             write_json(output / row / "command.json", command)
+            if lifecycle_failed:
+                summary.update(status="unreplayable", stopped_early=True,
+                               reason="fail-closed lifecycle stop; no subsequent command launched")
+                break
             if observation["stop"]:
                 summary.update(status="reproduced", stopped_early=True,
                                reason="coverage failure reproduced with token-identical same-invocation preceding success")

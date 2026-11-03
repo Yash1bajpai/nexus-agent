@@ -1,16 +1,13 @@
-name: Synthetic budget diagnostic (manual, Windows)
+name: Synthetic budget diagnostic (reviewed first push, Windows)
 
-# GitHub may not expose workflow_dispatch until a workflow exists on the default
-# branch. That is a discoverability restriction, NOT permission to push to DEV or
-# main as a workaround. Use a reviewed diagnostic/* branch only after independent
-# route approval; do not change the authoritative full E2E workflow or driver.
+# R11_ROUTE_LIFECYCLE_V1 is not approval or a server-side one-shot lock.
+# Independent review must bind the final commit/tree AND verifier before use.
+# Immediately before ONE approved push, verify this exact remote ref is absent.
+# No branch reuse/recreation, reruns, or followup commits; never use DEV/main.
 on:
-  workflow_dispatch:
-    inputs:
-      expected_sha:
-        description: Exact 40-character commit SHA on the reviewed diagnostic/* branch
-        required: true
-        type: string
+  push:
+    branches:
+      - diagnostic/r11-budget-590f748-2d91c6a7
 
 permissions:
   contents: read
@@ -18,37 +15,38 @@ permissions:
 jobs:
   diagnostic:
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      startsWith(github.ref, 'refs/heads/diagnostic/') &&
-      github.sha == inputs.expected_sha
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/diagnostic/r11-budget-590f748-2d91c6a7' &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.deleted == false &&
+      github.event.forced == false &&
+      github.event.after == github.sha &&
+      github.run_attempt == 1
     runs-on: windows-latest
     timeout-minutes: 25
     defaults:
       run:
         shell: pwsh
     steps:
-      - name: Reject unintended ref or commit before checkout
-        env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
-          ACTUAL_SHA: ${{ github.sha }}
-          DISPATCH_REF: ${{ github.ref }}
-        run: |
-          if ($env:DISPATCH_REF -notmatch '^refs/heads/diagnostic/.+$') { throw 'Dedicated diagnostic branch required' }
-          if ($env:EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact lowercase commit SHA required' }
-          if ($env:ACTUAL_SHA -cne $env:EXPECTED_SHA) { throw 'Expected SHA mismatch' }
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.expected_sha }}
+          ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
       - name: Confirm checkout identity before build or model access
         env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SHA: ${{ github.sha }}
         run: |
           $actual = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $actual -cne $env:EXPECTED_SHA) { throw 'Checkout SHA mismatch' }
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Verify R11_ROUTE_LIFECYCLE_V1 before build or model access
+        run: |
+          python -I "$env:GITHUB_WORKSPACE/.github/diagnostics/verify_reviewed_candidate.py" --repo "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed candidate invariant rejected' }
       - name: Build one fresh wheel and install isolated environment
         run: |
           $ErrorActionPreference = 'Stop'
@@ -62,6 +60,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Venv creation failed' }
           & "$build/venv/Scripts/python.exe" -m pip install --only-binary=:all: $wheels[0].FullName
           if ($LASTEXITCODE -ne 0) { throw 'Fresh wheel installation failed' }
+      - name: Native Windows lifecycle preflight before model fetch
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'budget-diagnostic-build'
+          & "$build/venv/Scripts/python.exe" -I "$env:GITHUB_WORKSPACE/tests/test_windows_diagnostic_job.py" --native-preflight
+          if ($LASTEXITCODE -ne 0) { throw 'Native owned-job lifecycle preflight failed; no model fetch' }
       - name: Fetch and hash only the explicitly approved GGUF
         run: |
           $ErrorActionPreference = 'Stop'
@@ -73,7 +77,7 @@ jobs:
           if ($digest -cne '2ea801949d760cdf1a2cc04a54262c22c3c0c54f0769d57760c9adeb0e59233f') { throw 'Model SHA256 mismatch' }
       - name: Run only seven frozen synthetic commands with offline replay
         env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SHA: ${{ github.sha }}
           ACTUAL_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'

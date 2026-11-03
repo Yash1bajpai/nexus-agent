@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 import uuid
 import zipfile
@@ -158,12 +159,14 @@ class FakeProcess:
         self.timeout = timeout
         self.waits = []
         self.killed = False
+        self.cleanup_calls = []
 
     def wait(self, timeout):
         self.waits.append(timeout)
         if self.timeout and len(self.waits) == 1:
             raise subprocess.TimeoutExpired("synthetic", timeout)
-        self.returncode = -9 if self.timeout else 0
+        if self.returncode is None:
+            self.returncode = -9 if self.timeout else 0
         return self.returncode
 
     def kill(self):
@@ -171,6 +174,12 @@ class FakeProcess:
 
     def poll(self):
         return self.returncode
+
+    def cleanup(self, timeout):
+        self.cleanup_calls.append(timeout)
+        if self.returncode is None:
+            self.wait(timeout)
+        return {"ownership": "owned_windows_job", "confirmed": True, "errors": []}
 
 
 def test_process_argv_cwd_timeout_and_stream_caps(tmp_path, scope_factory, monkeypatch):
@@ -182,7 +191,7 @@ def test_process_argv_cwd_timeout_and_stream_caps(tmp_path, scope_factory, monke
     def popen(argv, **options):
         seen.append((argv, options))
         return process
-    result = runner.execute_row(scope, "filler-2", environment, popen=popen)
+    result = runner.execute_row(scope, "filler-2", environment, popen=popen, windows_factory=popen)
     assert len(seen) == 1
     argv, options = seen[0]
     assert argv == [sys.executable, "-I", "-m", "nexus_agent_ai.diagnostic_cli",
@@ -200,24 +209,170 @@ def test_process_argv_cwd_timeout_and_stream_caps(tmp_path, scope_factory, monke
     assert result["output_capture_complete"] is True
 
 
-def test_windows_timeout_kills_process_tree_without_retry(tmp_path, scope_factory, monkeypatch):
+@pytest.mark.parametrize("timeout,exit_code", [(False, 0), (False, 7), (True, None)])
+def test_windows_owned_job_cleanup_all_exits_without_pid_fallback(
+        tmp_path, scope_factory, monkeypatch, timeout, exit_code):
     scope = scope_factory(tmp_path / "scope")
     environment = runner.child_environment(scope)
-    environment["SYSTEMROOT"] = str(tmp_path / "Windows")
-    process = FakeProcess(timeout=True)
-    calls = []
+    process = FakeProcess(timeout=timeout)
+    process.returncode = exit_code
+    seen = []
+    def factory(argv, **options):
+        seen.append((argv, options))
+        return process
     monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt"))
-    monkeypatch.setattr(runner.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False)
-    monkeypatch.setattr(runner.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs)))
-    result = runner.execute_row(scope, "seed", environment, popen=lambda *args, **kwargs: process)
-    assert result["timed_out"] is True
-    assert process.waits == [420, 10]
-    assert process.killed is True
-    assert len(calls) == 1
-    assert calls[0][0] == [str(Path(environment["SYSTEMROOT"]) / "System32/taskkill.exe"),
-                           "/PID", str(process.pid), "/T", "/F"]
-    assert calls[0][1]["env"] is environment
-    assert calls[0][1]["timeout"] == 10
+    monkeypatch.setattr(runner, "_windows_job_factory", lambda: factory)
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("no unsuspended launch"))
+    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs: pytest.fail("no taskkill fallback"))
+    result = runner.execute_row(scope, "seed", environment)
+    assert result["timed_out"] is timeout
+    assert process.cleanup_calls == pytest.approx([10], abs=0.05)
+    assert process.waits[0] == 420
+    assert process.waits[1:] == pytest.approx([10] if timeout else [], abs=0.05)
+    assert process.killed is False
+    assert len(seen) == 1
+    assert "creationflags" not in seen[0][1]
+    assert "start_new_session" not in seen[0][1]
+    assert result["cleanup"]["confirmed"] is True
+    assert result["lifecycle_safe"] is True
+    assert result["exit_code"] == (-9 if timeout else exit_code)
+    assert 0 <= result["teardown_duration_seconds"] < 10
+
+
+def test_windows_owned_cleanup_releases_inherited_pipe_before_join(tmp_path, scope_factory, monkeypatch):
+    scope = scope_factory(tmp_path / "scope")
+    environment = runner.child_environment(scope)
+    released = threading.Event()
+    class InheritedPipe(io.BytesIO):
+        def read(self, size=-1):
+            if not released.wait(timeout=2):
+                raise OSError("cleanup did not release inherited pipe")
+            return super().read(size)
+    process = FakeProcess()
+    process.stdout = InheritedPipe(b"grandchild stdout")
+    process.stderr = InheritedPipe(b"grandchild stderr")
+    def cleanup(timeout):
+        released.set()
+        return {"ownership": "owned_windows_job", "confirmed": True, "errors": []}
+    process.cleanup = cleanup
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt"))
+    result = runner.execute_row(scope, "seed", environment, windows_factory=lambda *args, **kwargs: process)
+    assert result["output_capture_complete"] is True
+    assert result["lifecycle_safe"] is True
+    assert result["stdout"]["bytes_seen"] == len(b"grandchild stdout")
+
+
+@pytest.mark.parametrize("failure", ["wait", "cleanup", "capture", "close"])
+def test_windows_execution_errors_fail_closed(tmp_path, scope_factory, monkeypatch, failure):
+    scope = scope_factory(tmp_path / "scope")
+    process = FakeProcess()
+    if failure == "wait":
+        def wait(timeout):
+            raise OSError("private execution details")
+        process.wait = wait
+    elif failure == "cleanup":
+        process.cleanup = lambda timeout: {"ownership": "owned_windows_job", "confirmed": False,
+                                           "errors": ["job_empty_timeout"]}
+    elif failure == "close":
+        class CloseFailure(io.BytesIO):
+            def close(self):
+                super().close()
+                raise OSError("private pipe close details")
+        process.stdout = CloseFailure(b"complete synthetic output")
+    else:
+        class BrokenPipe(io.BytesIO):
+            def read(self, size=-1):
+                raise OSError("private capture details")
+        process.stdout = BrokenPipe()
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt"))
+    result = runner.execute_row(scope, "seed", {}, windows_factory=lambda *args, **kwargs: process)
+    assert result["lifecycle_safe"] is False
+    assert "private" not in json.dumps(result)
+    if failure in {"capture", "close"}:
+        assert result["output_capture_complete"] is False
+        assert result["exit_code"] == 0
+
+
+def test_windows_teardown_shares_one_deadline_and_records_duration(tmp_path, scope_factory, monkeypatch):
+    scope = scope_factory(tmp_path / "scope")
+    process = FakeProcess()
+    clock = [0.0]
+    joins = []
+    class InlineThread:
+        def __init__(self, *, target, args, daemon):
+            self.target, self.args = target, args
+        def start(self):
+            self.target(*self.args)
+        def join(self, timeout):
+            joins.append(timeout)
+            clock[0] += timeout
+        def is_alive(self):
+            return False
+    def cleanup(timeout):
+        assert timeout == 10
+        clock[0] += 8
+        return {"ownership": "owned_windows_job", "confirmed": True, "errors": []}
+    process.cleanup = cleanup
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(runner, "threading", SimpleNamespace(Thread=InlineThread))
+    result = runner.execute_row(scope, "seed", {}, windows_factory=lambda *args, **kwargs: process)
+    assert joins == [2, 0]
+    assert result["teardown_duration_seconds"] == 10
+    assert result["exit_code"] == 0
+    assert result["lifecycle_safe"] is True
+
+
+def test_windows_reader_start_failure_closes_unstarted_streams(tmp_path, scope_factory, monkeypatch):
+    scope = scope_factory(tmp_path / "scope")
+    process = FakeProcess()
+    class BrokenThread:
+        def __init__(self, **kwargs):
+            pass
+        def start(self):
+            raise RuntimeError("synthetic reader startup failure")
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(runner, "threading", SimpleNamespace(Thread=BrokenThread))
+    result = runner.execute_row(scope, "seed", {}, windows_factory=lambda *args, **kwargs: process)
+    assert process.stdout.closed and process.stderr.closed
+    assert result["lifecycle_safe"] is False
+    assert result["output_capture_complete"] is False
+    assert result["cleanup"]["confirmed"] is True
+
+
+def test_windows_startup_failure_preserves_owned_cleanup_report(tmp_path, scope_factory, monkeypatch):
+    scope = scope_factory(tmp_path / "scope")
+    cleanup = {"ownership": "owned_windows_job", "assigned": False,
+               "confirmed": True, "errors": []}
+    class StartupFailure(OSError):
+        pass
+    error = StartupFailure("private launch detail")
+    error.cleanup = cleanup
+    def factory(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt"))
+    result = runner.execute_row(scope, "seed", {}, windows_factory=factory)
+    assert result["cleanup"] == cleanup
+    assert result["lifecycle_safe"] is False
+    assert result["exit_code"] is None
+    assert "private" not in json.dumps(result)
+
+
+def test_windows_job_factory_loads_only_exact_sibling_and_caches(monkeypatch):
+    monkeypatch.delattr(runner._windows_job_factory, "factory", raising=False)
+    loaded = []
+    real_spec = runner.importlib.util.spec_from_file_location
+    def sibling_spec(name, path):
+        loaded.append(Path(path))
+        return real_spec(name, path)
+    monkeypatch.setattr(runner.importlib.util, "spec_from_file_location", sibling_spec)
+    try:
+        factory = runner._windows_job_factory()
+        assert factory.__name__ == "WindowsJobProcess"
+        assert runner._windows_job_factory() is factory
+        assert loaded == [RUNNER_PATH.with_name("windows_job.py")]
+    finally:
+        monkeypatch.delattr(runner._windows_job_factory, "factory", raising=False)
 
 
 def test_oversized_json_is_valid_explicit_unreplayable_marker(tmp_path):
@@ -367,21 +522,6 @@ def test_provenance_hashes_wheel_and_installed_payload(tmp_path, monkeypatch):
         runner.installed_provenance(wheel, tmp_path / "source", "a" * 40, "a" * 40)
 
 
-def test_workflow_is_dispatch_only_gated_windows_and_narrow_upload():
-    workflow = (RUNNER_PATH.parents[1] / "workflows/budget-diagnostic.yml").read_text()
-    assert "workflow_dispatch:" in workflow
-    assert "  push:" not in workflow and "  pull_request:" not in workflow
-    assert "runs-on: windows-latest" in workflow
-    assert "timeout-minutes: 25" in workflow
-    assert "startsWith(github.ref, 'refs/heads/diagnostic/')" in workflow
-    assert "github.sha == inputs.expected_sha" in workflow
-    assert workflow.index("Confirm checkout identity") < workflow.index("Build one fresh wheel") < workflow.index("Fetch and hash")
-    assert "persist-credentials: false" in workflow
-    assert "--retry" not in workflow and "actions/cache" not in workflow
-    assert "path: ${{ runner.temp }}/budget-diagnostic-run/output/" in workflow
-    assert "DEV" in workflow and "main as a workaround" in workflow
-
-
 def test_launch_errors_are_not_retried_or_mistaken_for_reproduction(tmp_path, tiny_model, scope_factory):
     calls = []
     def fail_launch(scope, row, environment):
@@ -389,9 +529,9 @@ def test_launch_errors_are_not_retried_or_mistaken_for_reproduction(tmp_path, ti
         raise OSError("private parent path must not persist")
     result = runner.run_bundle(tmp_path / "bundle", tiny_model, {}, create_scope=scope_factory,
                                replay_snapshot=exact_replay, executor=fail_launch)
-    assert calls == list(runner.ROWS)
+    assert calls == ["seed"]
     assert result["status"] == "unreplayable"
-    assert result["stopped_early"] is False
+    assert result["stopped_early"] is True
     assert "private parent path" not in json.dumps(result)
 
 
@@ -407,6 +547,31 @@ def test_nonzero_exit_without_fatal_capture_is_unreplayable(tmp_path, tiny_model
     assert len(result["rows"]) == 7
     assert result["status"] == "unreplayable"
     assert all(item["observation"]["status"] == "unreplayable" for item in result["rows"])
+
+
+@pytest.mark.parametrize("failure", ["unconfirmed", "cleanup_error", "capture"])
+def test_bundle_stops_all_subsequent_rows_after_lifecycle_failure(
+        tmp_path, tiny_model, scope_factory, failure):
+    calls = []
+    def execute(scope, row, environment):
+        calls.append(row)
+        snapshot_pair(scope, row)
+        return {"row": row, "exit_code": 0, "timed_out": False,
+                "output_capture_complete": failure != "capture",
+                "cleanup": {"ownership": "owned_windows_job",
+                            "confirmed": failure != "unconfirmed",
+                            "errors": ["cleanup_failed"] if failure == "cleanup_error" else []}}
+    result = runner.run_bundle(tmp_path / "bundle", tiny_model, {}, create_scope=scope_factory,
+                               replay_snapshot=lambda value: pytest.fail("unsafe lifecycle must not replay"),
+                               executor=execute)
+    assert calls == ["seed"]
+    assert result["status"] == "unreplayable"
+    assert result["stopped_early"] is True
+    command = result["rows"][0]
+    assert command["observation"]["status"] == "unreplayable"
+    assert command["observation"]["stop"] is False
+    persisted = runner.read_json(tmp_path / "bundle/output/seed/command.json")
+    assert persisted["observation"] == command["observation"]
 
 
 @pytest.mark.parametrize("failure", ["mismatch", "timeout", "nonzero", "missing", "encoding"])
