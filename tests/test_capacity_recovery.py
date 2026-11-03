@@ -604,3 +604,115 @@ def test_adaptive_probe_uses_normal_reserve_floor_without_consuming_boost(minimu
     assert agent._output_boost == 2048
     assert agent.last_trim == previous_trim
     assert provider.seen == []
+
+
+def test_duplicate_forced_final_uses_next_no_tools_plan_at_fixed_4096(monkeypatch):
+    offered = probe()
+    offered.description = "a" * 11000
+    provider = Scripted([
+        *[response("probe", {"value": "same"}, str(index)) for index in range(3)],
+        ProviderResponse(text="The observed answer."),
+    ])
+    provider.context_size = 4096
+    dispatched = []
+
+    def execute(name, args, **kwargs):
+        dispatched.append((name, copy.deepcopy(args)))
+        return execution_result("observed", executed=True, outcome="Observation completed.")
+
+    monkeypatch.setattr(core, "execute_tool", execute)
+    agent = make_agent(provider, [offered])
+    actual_nudge = agent._try_automatic_nudge
+    observed = []
+
+    def observe_nudge(text, **kwargs):
+        assert agent.context_window == 4096
+        candidate = copy.deepcopy(agent.memory.get()) + [
+            {"role": "user", "content": text, "metadata": {"internal": True}},
+        ]
+        fitted, stats = agent._plan_fit(candidate, [])
+        with pytest.raises(context.ContextBudgetError):
+            agent._plan_fit(candidate, [offered])
+        accepted = actual_nudge(text, **kwargs)
+        observed.append((accepted, list(kwargs["tools"]), fitted, stats))
+        return accepted
+
+    monkeypatch.setattr(agent, "_try_automatic_nudge", observe_nudge)
+    final = agent.run("Inspect fixture.txt")
+    assert final == "The observed answer."
+    assert dispatched == [("probe", {"value": "same"})]
+    assert provider.offered == [["probe"], ["probe"], ["probe"], []]
+    assert len(provider.seen) == 4 and provider.steps == []
+    assert len(observed) == 1
+    accepted, next_tools, fitted, stats = observed[0]
+    assert accepted is True and next_tools == []
+    assert stats["request_window"] == 4096 and stats["reserve"] == 512
+    assert provider.seen[-1] == fitted
+    assert not agent.unresolved_errors
+    messages = agent.memory.get()
+    results = [message for message in messages if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in results] == ["0", "1", "2"]
+    assert [message["metadata"]["executed"] for message in results] == [True, False, False]
+    assert not any(message.get("metadata", {}).get("executor_closed") for message in messages)
+
+
+def test_duplicate_forced_final_no_tools_overflow_preserves_canonical_and_stops(tmp_path, monkeypatch):
+    original = "Exact generated assistant café\r\n  " + "x" * 1660
+    provider = Scripted([
+        response("probe", {"value": "same"}, "0"),
+        response("probe", {"value": "same"}, "1"),
+        response("probe", {"value": "same"}, "2", text=original),
+        ProviderResponse(text="This final response must not be requested."),
+    ])
+    provider.context_size = 4096
+    memory = SQLiteMemory(tmp_path / "private" / "history.db", session_id="duplicate-overflow")
+    offered = probe()
+    dispatched = []
+
+    def execute(name, args, **kwargs):
+        dispatched.append((name, copy.deepcopy(args)))
+        return execution_result("observed", executed=True, outcome="Observation completed.")
+
+    monkeypatch.setattr(core, "execute_tool", execute)
+    agent = make_agent(provider, [offered], memory=memory)
+    actual_nudge = agent._try_automatic_nudge
+    observed = []
+
+    def observe_nudge(text, **kwargs):
+        assert agent.context_window == 4096 and kwargs["tools"] == []
+        before = copy.deepcopy(memory.get())
+        before_rows = audit_rows(memory)
+        candidate = before + [
+            {"role": "user", "content": text, "metadata": {"internal": True}},
+        ]
+        with pytest.raises(context.ContextBudgetError):
+            agent._plan_fit(candidate, [])
+        accepted = actual_nudge(text, **kwargs)
+        assert memory.get() == before and audit_rows(memory) == before_rows
+        observed.append((accepted, before, before_rows))
+        return accepted
+
+    monkeypatch.setattr(agent, "_try_automatic_nudge", observe_nudge)
+    request = "Inspect fixture.txt\r\n  " + "q" * 10400
+    final = agent.run(request)
+    assert dispatched == [("probe", {"value": "same"})]
+    assert len(provider.seen) == 3 and len(provider.steps) == 1
+    assert provider.offered == [["probe"], ["probe"], ["probe"]]
+    assert len(observed) == 1
+    accepted, before, before_rows = observed[0]
+    assert accepted is False
+    messages = memory.get()
+    assert messages[:-1] == before
+    assert audit_rows(memory)[:-1] == before_rows
+    assert messages[0]["content"] == request
+    assert [message for message in messages if message.get("tool_calls")][-1]["content"] == original
+    results = [message for message in messages if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in results] == ["0", "1", "2"]
+    assert [message["metadata"]["executed"] for message in results] == [True, False, False]
+    assert not any(message.get("metadata", {}).get("internal") for message in messages)
+    assert agent.unresolved_errors
+    assert_closed(agent)
+    assert final == messages[-1]["content"]
+    with pytest.raises(cli.typer.Exit) as stopped:
+        cli._check_run_outcome(agent)
+    assert stopped.value.exit_code == 1

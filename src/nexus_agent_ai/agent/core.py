@@ -1312,7 +1312,7 @@ class Agent:
                         if not self._try_automatic_nudge(
                             "[SYSTEM] Tool budget exhausted: the same tool call was repeated. "
                             "Do not call any more tools. Give your final answer to the user's "
-                            "original question now.", tools=use_tools, scale=window_scale,
+                            "original question now.", tools=[], scale=window_scale,
                         ):
                             automatic_stop_reason = "automatic_recovery_budget"
                             repeated_failure_stop = "Stopped: the optional duplicate-call recovery cannot fit the context budget."
