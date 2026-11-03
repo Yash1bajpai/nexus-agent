@@ -14,7 +14,7 @@ from rich.console import Console
 from nexus_agent_ai.agent import context, tools
 from nexus_agent_ai.agent.core import Agent
 from nexus_agent_ai.agent.persistence import SQLiteMemory
-from nexus_agent_ai.agent.refusals import RefusalClass, execution_result, refusal
+from nexus_agent_ai.agent.refusals import RefusalClass, execution_metadata, execution_result, refusal
 from nexus_agent_ai.cli import display
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, ToolCall
 from nexus_agent_ai.providers.messages import assistant_message
@@ -80,7 +80,10 @@ def test_10495_token_stat_estimate_is_refused_without_read_or_fatal(tmp_path, mo
     available = int(re.search(r"~(\d+)-token usable context budget", text).group(1))
     assert 0 <= available < 1573
     assert str(path) not in tools._FILE_STATE
-    assert not any(message.get("metadata", {}).get("executor_closed") for message in agent.memory.get())
+    assert agent.memory.get()[-1]["metadata"]["executor_closed"] is True
+    assert results[0]["metadata"]["refusal_class"] == "capacity"
+    assert results[0]["metadata"]["executed"] is False
+    assert agent.unresolved_errors
 
 
 def test_exact_serialized_boundary_preserves_whole_file_result(tmp_path):
@@ -88,9 +91,11 @@ def test_exact_serialized_boundary_preserves_whole_file_result(tmp_path):
     (tmp_path / "small.txt").write_text(text)
     request = "Read small.txt"
     tool_call = ToolCall("boundary", "read_file", {"path": "small.txt"})
+    observed = tools.execute_read_file("small.txt")
     expected = [
         {"role": "user", "content": request}, assistant_message("", [tool_call]),
-        {"role": "tool", "tool_call_id": "boundary", "content": text},
+        {"role": "tool", "tool_call_id": "boundary", "content": text,
+         "metadata": execution_metadata(observed)},
     ]
     provider = Offline([ProviderResponse(tool_calls=[tool_call]), ProviderResponse(text="Read complete.")])
     agent = Agent(provider, tools=[tools.READ_FILE_TOOL], verbose=False)

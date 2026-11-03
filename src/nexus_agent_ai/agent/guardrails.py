@@ -17,7 +17,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from .refusals import RefusalText, refusal
+from .refusals import replace_result_text
 
 MAX_TEST_RETRIES = 2
 
@@ -653,7 +653,7 @@ class LoopGuard:
 
         if name in _PATH_ARG_TOOLS and text.startswith("ERROR: File not found"):
             text += self._missing_file_help(str(args.get("path", "")))
-        return refusal(result.refusal_class, text) if isinstance(result, RefusalText) else text
+        return replace_result_text(result, text)
 
     def _missing_file_help(self, path: str) -> str:
         parent = str(Path(path).parent) if path else "."

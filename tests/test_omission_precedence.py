@@ -114,7 +114,8 @@ def test_existing_record_and_large_result_preserve_verbatim_pair(tmp_path):
     assert fitted[0]["metadata"] == {"internal": True}
     assert fitted[-1]["content"] == result
     assert fitted[-1]["tool_call_id"] == "current"
-    assert fitted[2:] == original + [{"role": "tool", "tool_call_id": "current", "content": str(result)}]
+    assert fitted[2:-1] == original
+    assert fitted[-1]["metadata"]["executed"] is True
     assert ctx.history_tokens(fitted[:2]) <= ctx.OMISSION_MAX_TOKENS
     assert stats["tokens"] + stats["reserve"] + ctx.estimate_tokens(agent.system) + ctx.tools_tokens(agent.tools) <= 4096
     assert agent.memory.get() == original

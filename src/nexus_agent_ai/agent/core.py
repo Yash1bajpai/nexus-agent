@@ -1,4 +1,5 @@
 import os
+import copy
 import hashlib
 import json
 import re
@@ -20,7 +21,7 @@ from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
 from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata, current_claim_correction
-from .refusals import RefusalClass, refusal, execution_result, execution_ran
+from .refusals import RefusalClass, refusal, execution_result, execution_ran, execution_metadata
 from .recovery import project_recovery, recovery_excerpt
 from .result_budget import guard_tool_result
 from . import budget_diagnostics as diagnostics
@@ -418,12 +419,42 @@ class Agent:
     def _nudge(self, text: str):
         self.memory.add_raw({"role": "user", "content": text, "metadata": {"internal": True}})
 
-    def _remember_assistant(self, text, tool_calls=()):
-        """Keep original model bytes; attach only executor-observed mutation evidence."""
+    def _try_automatic_nudge(self, text, *, assistant_text=None, tools, scale=1.0):
+        """Probe the exact next canonical candidate; commit no rejected nudge."""
+        candidate = copy.deepcopy(self.memory.get())
+        if assistant_text is not None:
+            candidate.append(self._assistant_record(assistant_text))
+        candidate.append({"role": "user", "content": text, "metadata": {"internal": True}})
+        fits = True
+        try:
+            if self.context_window:
+                # Expected probe rejections must not become diagnostic turn fatals
+                # or change the last successful actual-request capture.
+                with diagnostics.suspended():
+                    self._plan_fit(
+                        candidate, tools, scale, boost=getattr(self, "_output_boost", None),
+                    )
+        except context.ContextBudgetError:
+            fits = False
+        except BaseException:
+            if assistant_text is not None:
+                self._remember_assistant(assistant_text)
+            raise
+        if assistant_text is not None:
+            self._remember_assistant(assistant_text)
+        if fits:
+            self._nudge(text)
+        return fits
+
+    def _assistant_record(self, text, tool_calls=()):
         message = assistant_message(text, tool_calls)
         if self._mutation_segment:
             message["metadata"] = self._outcome_metadata()
-        self.memory.add_raw(message)
+        return message
+
+    def _remember_assistant(self, text, tool_calls=()):
+        """Keep original model bytes; attach only executor-observed mutation evidence."""
+        self.memory.add_raw(self._assistant_record(text, tool_calls))
 
     def _outcome_metadata(self):
         return {
@@ -571,8 +602,12 @@ class Agent:
                 "role": "tool", "tool_call_id": pending["call"].id,
                 "content": str(content) if pending is current else "",
             }
+            source = content if pending is current and execution_metadata(content) else pending.get("result")
+            metadata = execution_metadata(source)
             if self._mutation_segment:
-                message["metadata"] = self._outcome_metadata()
+                metadata.update(self._outcome_metadata())
+            if metadata:
+                message["metadata"] = metadata
             messages.append(message)
         return messages
 
@@ -610,7 +645,7 @@ class Agent:
             else:
                 high = middle - 1
         return execution_result(
-            refusal(RefusalClass.OTHER,
+            refusal(RefusalClass.CAPACITY,
                     f"ERROR: Not executed: '{call.name}' is ~{predicted} tokens, exceeding "
                     f"the ~{low}-token usable context budget; the file was not read."),
             executed=False, outcome=f"{call.name} not executed: result exceeds the context budget.",
@@ -624,6 +659,7 @@ class Agent:
         )
         for pending in self._pending_calls:
             state = pending["state"]
+            receipt_metadata = {}
             if state == "recorded":
                 continue
             if state == "pending":
@@ -638,20 +674,26 @@ class Agent:
             else:
                 result = pending["result"]
                 ran = execution_ran(result)
-                try:
-                    result = guard_tool_result(
-                        pending["call"].name, result, memory=self.memory,
-                        fits=lambda content: len(content) <= 2000,
-                    )
+                receipt_metadata = execution_metadata(result)
+                if getattr(exc, "refusal_class", None) is RefusalClass.CAPACITY:
+                    # A rejected admission is not permission to alter the executor
+                    # evidence. It remains canonical even when it cannot be sent.
                     text = str(result)
-                except Exception:
-                    outcome = getattr(result, "outcome", "")
-                    text = (outcome[:512] if isinstance(outcome, str) and outcome
-                            else "Tool execution returned; completion status is unknown.")
-                    text += "\nFull output is not included in this executor receipt."
+                else:
+                    try:
+                        result = guard_tool_result(
+                            pending["call"].name, result, memory=self.memory,
+                            fits=lambda content: len(content) <= 2000,
+                        )
+                        text = str(result)
+                    except Exception:
+                        outcome = getattr(result, "outcome", "")
+                        text = (outcome[:512] if isinstance(outcome, str) and outcome
+                                else "Tool execution returned; completion status is unknown.")
+                        text += "\nFull output is not included in this executor receipt."
             self.memory.add_raw({
                 "role": "tool", "tool_call_id": pending["call"].id, "content": text,
-                "metadata": {"executor": True, "executed": ran},
+                "metadata": {"executor": True, "executed": ran, **receipt_metadata},
             })
             pending["state"] = "recorded"
         cause = ("context budget exhausted" if isinstance(exc, context.ContextBudgetError)
@@ -664,7 +706,11 @@ class Agent:
                 "no complete answer was produced. Partial model output (if any) was not recorded. "
                 "Recorded tool results above are accurate; nothing beyond them is claimed."
             ),
-            "metadata": {"executor_closed": True, "executor": True, "reason": reason},
+            "metadata": {
+                "executor_closed": True, "executor": True, "reason": reason,
+                **({"refusal_class": RefusalClass.CAPACITY.value}
+                   if getattr(exc, "refusal_class", None) is RefusalClass.CAPACITY else {}),
+            },
         })
     @diagnostics.capture_plan
     def _plan_fit(self, messages, tools, scale=1.0, *, output_reserve=None, boost=None, result_tokens=0):
@@ -886,10 +932,12 @@ class Agent:
         duplicate_counts = {}
         repeated_failure_stop = ""
         stopped_assistant_text = None
+        automatic_stop_reason = None
         force_final = False
         tool_errors = []
         unresolved: Dict[str, str] = {}  # key (path or tool name) -> error still not fixed
         unresolved_tool: Dict[str, str] = {}  # key -> name of the tool that failed
+        unresolved_class = {}  # source classification for this unresolved invocation only
         window_scale = 1.0
         length_boost_used = False
         wrote_ok = False
@@ -1189,10 +1237,12 @@ class Agent:
                             )
                             pending["result"] = result
                         error_key = str(tool_call.args.get("path") or tool_call.name)
-                        if str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
+                        capacity_refused = getattr(result, "refusal_class", None) is RefusalClass.CAPACITY
+                        if capacity_refused or str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
                             unresolved_tool[error_key] = tool_call.name
+                            unresolved_class[error_key] = getattr(result, "refusal_class", None)
                         elif execution_ran(result) and not str(result).startswith("[SYSTEM"):
                             # A later success fixes the error only if it is the same tool succeeding, or a
                             # write. Reading the file is not a fix for a failed edit.
@@ -1200,6 +1250,7 @@ class Agent:
                             if failed_tool is None or tool_call.name == failed_tool or tool_call.name in _WRITE_TOOLS:
                                 unresolved.pop(error_key, None)
                                 unresolved_tool.pop(error_key, None)
+                                unresolved_class.pop(error_key, None)
                             if tool_call.name in _WRITE_TOOLS and changed:
                                 wrote_ok = True
                                 from .consent import auto_check_enabled
@@ -1240,8 +1291,11 @@ class Agent:
                             display.print_tool_result(result, duration, tool_call.name)
 
                         result_message = {"role": "tool", "tool_call_id": tool_call.id, "content": str(result)}
+                        result_metadata = execution_metadata(result)
                         if self._mutation_segment:
-                            result_message["metadata"] = self._outcome_metadata()
+                            result_metadata.update(self._outcome_metadata())
+                        if result_metadata:
+                            result_message["metadata"] = result_metadata
                         self.memory.add_raw(result_message)
                         pending["state"] = "recorded"
 
@@ -1255,9 +1309,14 @@ class Agent:
 
                     if force_final:
                         # Anti-loop: no tools next round, model must answer directly
-                        self._nudge("[SYSTEM] Tool budget exhausted: the same tool call was repeated. "
-                                                 "Do not call any more tools. Give your final answer to the user's "
-                                                 "original question now.")
+                        if not self._try_automatic_nudge(
+                            "[SYSTEM] Tool budget exhausted: the same tool call was repeated. "
+                            "Do not call any more tools. Give your final answer to the user's "
+                            "original question now.", tools=use_tools, scale=window_scale,
+                        ):
+                            automatic_stop_reason = "automatic_recovery_budget"
+                            repeated_failure_stop = "Stopped: the optional duplicate-call recovery cannot fit the context budget."
+                            break
                         use_tools = []
                         effective_max_iter = max(effective_max_iter, iteration + 1)
 
@@ -1280,13 +1339,22 @@ class Agent:
                     if guard and not self.response_incomplete:
                         verdict, reviewed = guard.review_final(final_text)
                         if verdict == "retry":
-                            self._remember_assistant(response.text)
-                            self._nudge(reviewed)
+                            self.claim_unverified_error = getattr(guard, "claim_unverified_error", "")
+                            nudge_fits = self._try_automatic_nudge(
+                                reviewed, assistant_text=response.text, tools=use_tools, scale=window_scale,
+                            )
                             self.claim_unverified = guard.claim_unverified
                             if stream:
                                 self._stream_correction("\n\nCorrection: the preceding test-pass claim is unverified; run_tests last reported FAILED.\n")
                             if self.event_callback:
                                 self.event_callback({"type": "guardrail", "content": "blocked unverified success claim"})
+                            if not nudge_fits:
+                                automatic_stop_reason = "automatic_recovery_budget"
+                                repeated_failure_stop = (
+                                    "Stopped: the optional test-claim recovery cannot fit the context budget. "
+                                    "The preceding test-pass claim remains unverified."
+                                )
+                                break
                             effective_max_iter = max(effective_max_iter, iteration + 1)
                             messages = self.memory.get()
                             if self.verbose and status is None:
@@ -1301,13 +1369,31 @@ class Agent:
                     actionable_errors = [
                         error for key, error in unresolved.items()
                         if unresolved_tool.get(key) != "history_read"
+                        and unresolved_class.get(key) is not RefusalClass.CAPACITY
                     ]
+                    if not actionable_errors and any(
+                        kind is RefusalClass.CAPACITY for kind in unresolved_class.values()
+                    ):
+                        # The refused invocation is terminal, not every possible
+                        # approach. Other unresolved errors remain eligible above.
+                        self._remember_assistant(response.text)
+                        automatic_stop_reason = "capacity_no_progress"
+                        repeated_failure_stop = (
+                            "Stopped: a capacity-refused invocation has no unchanged-input automatic retry. "
+                            "This does not establish that every alternative approach is impossible."
+                        )
+                        break
                     if (not self.response_incomplete and local_mode and actionable_errors and use_tools and error_nudges < 2 and iteration < effective_max_iter):
                         # The model gave up (or just described a plan) with a tool error still open. Push it once or twice to act.
                         error_nudges += 1
-                        self._remember_assistant(response.text)
-                        self._nudge("[SYSTEM] Your last tool call failed: " + "; ".join(dict.fromkeys(actionable_errors))[:400]
-                                        + " Do not just describe a plan. Fix this by calling the tools now (read_file first if needed), then finish the task.")
+                        nudge = ("[SYSTEM] Your last tool call failed: " + "; ".join(dict.fromkeys(actionable_errors))[:400]
+                                 + " Do not just describe a plan. Fix this by calling the tools now (read_file first if needed), then finish the task.")
+                        if not self._try_automatic_nudge(
+                            nudge, assistant_text=response.text, tools=use_tools, scale=window_scale,
+                        ):
+                            automatic_stop_reason = "automatic_recovery_budget"
+                            repeated_failure_stop = "Stopped: the optional tool-error recovery cannot fit the context budget."
+                            break
                         messages = self.memory.get()
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
@@ -1318,9 +1404,14 @@ class Agent:
                             and not _NO_CHANGE_OK.search(final_text or "")):
                         # An edit was requested, nothing was written, and the model did not say there is nothing to change.
                         error_nudges += 1
-                        self._remember_assistant(response.text)
-                        self._nudge("[SYSTEM] No file has been changed yet. Do not explain; act. Call patch_file "
-                                        "(or write_file) now using the exact text from the file, then call run_tests to check.")
+                        if not self._try_automatic_nudge(
+                            "[SYSTEM] No file has been changed yet. Do not explain; act. Call patch_file "
+                            "(or write_file) now using the exact text from the file, then call run_tests to check.",
+                            assistant_text=response.text, tools=use_tools, scale=window_scale,
+                        ):
+                            automatic_stop_reason = "automatic_recovery_budget"
+                            repeated_failure_stop = "Stopped: the optional edit recovery cannot fit the context budget."
+                            break
                         messages = self.memory.get()
                         if self.verbose and status is None:
                             status = display.create_status("Thinking...")
@@ -1409,6 +1500,11 @@ class Agent:
                     self._remember_assistant(response.text)
                     return final_text
         except BaseException as exc:
+            if getattr(exc, "refusal_class", None) is RefusalClass.CAPACITY:
+                unresolved["context_capacity"] = (
+                    "Tool-result capacity admission failed; exact executor outcomes are preserved. "
+                    "No over-budget request was sent."
+                )
             try:
                 self._close_aborted_turn(exc)
             except Exception:
@@ -1424,11 +1520,22 @@ class Agent:
         self.unresolved_errors.append(
             repeated_failure_stop or "Maximum tool iterations reached before task completed."
         )
+        if automatic_stop_reason:
+            execution = (
+                "Tool execution occurred; its recorded outcomes are preserved."
+                if self._turn_had_execution else "No tool execution was observed in this turn."
+            )
+            final_text += (
+                "\nExecutor record: the request remains incomplete. " + execution
+                + " Per-call execution status remains recorded. No further provider request or tool call "
+                  "was made for this automatic recovery. Original assistant text and tool results remain recorded."
+            )
         if repeated_failure_stop and self.changed_files:
             final_text += " Other observed file mutations in this turn remain in place."
         if wants_edit and not self.changed_files:
             self.edit_not_applied = True
-            final_text += " No file was changed."
+            final_text += (" No successful file-tool mutation was recorded."
+                           if automatic_stop_reason else " No file was changed.")
         self.requirements_incomplete = (
             requirement_scope_errors + check_function_requirements(function_requirements)
             + check_literal_assignment_requirement(literal_assignment_requirement)
@@ -1446,7 +1553,15 @@ class Agent:
                 "reason": self._edit_recovery["reason"],
                 "sha256": hashlib.sha256(stopped_assistant_text.encode("utf-8")).hexdigest(),
             })
-        self._remember_assistant(final_text)
+        if automatic_stop_reason:
+            closure = self._assistant_record(final_text)
+            closure.setdefault("metadata", {}).update({
+                "executor_closed": True, "executor": True, "reason": automatic_stop_reason,
+                "refusal_class": RefusalClass.CAPACITY.value,
+            })
+            self.memory.add_raw(closure)
+        else:
+            self._remember_assistant(final_text)
         if self.event_callback:
             self.event_callback({"type": "response", "content": final_text, "tokens": self.total_tokens, "cost": self.estimated_cost})
         if stream and not self.event_callback:

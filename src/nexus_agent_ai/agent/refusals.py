@@ -1,5 +1,6 @@
 """Source-classified tool refusals, retaining the public string contract."""
 from enum import Enum
+import unicodedata
 
 
 class RefusalClass(str, Enum):
@@ -12,6 +13,7 @@ class RefusalClass(str, Enum):
     SENSITIVE_PATH = "sensitive_path"
     NOT_FOUND = "not_found"
     PERMISSION = "permission"
+    CAPACITY = "capacity"
     OTHER = "other"
 
 
@@ -40,6 +42,15 @@ def refusal(kind: RefusalClass, message: str) -> RefusalText:
     return RefusalText(message, kind)
 
 
+def replace_result_text(source: str, text: str) -> str:
+    """Clone private source metadata while replacing only public string content."""
+    if isinstance(source, str) and hasattr(source, "__dict__"):
+        replacement = str.__new__(type(source), text)
+        replacement.__dict__.update(vars(source))
+        return replacement
+    return text
+
+
 def execution_result(text: str, *, executed: bool, outcome: str) -> ToolResult:
     """Attach a trusted receipt without losing refusal or recovery metadata.
 
@@ -53,6 +64,26 @@ def execution_result(text: str, *, executed: bool, outcome: str) -> ToolResult:
     result.executed = bool(executed)
     result.outcome = outcome
     return result
+
+
+def execution_metadata(result: str) -> dict:
+    """Export only bounded source-authored receipt facts, never output or hints."""
+    if not isinstance(result, ToolResult):
+        return {}
+    metadata = {}
+    executed = getattr(result, "executed", None)
+    if isinstance(executed, bool):
+        metadata["executed"] = executed
+    outcome = getattr(result, "outcome", None)
+    if (
+        isinstance(outcome, str) and len(outcome) <= 256 and outcome.strip()
+        and not any(unicodedata.category(char) == "Cc" for char in outcome)
+    ):
+        metadata["outcome"] = str(outcome)
+    kind = getattr(result, "refusal_class", None)
+    if isinstance(kind, RefusalClass):
+        metadata["refusal_class"] = kind.value
+    return metadata
 
 
 def execution_ran(result: str) -> bool:

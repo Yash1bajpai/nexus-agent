@@ -9,17 +9,15 @@ from __future__ import annotations
 import hashlib
 
 from .context import ContextBudgetError, estimate_tokens
-from .refusals import execution_ran, execution_result
+from .refusals import (
+    RefusalClass, ToolResult, execution_ran, execution_result, replace_result_text,
+)
 from . import budget_diagnostics as diagnostics
 
 
 def _replacement(source, text, *, executed, outcome):
     """Replace string content without dropping refusal or private guard metadata."""
-    if isinstance(source, str) and hasattr(source, "__dict__"):
-        replacement = str.__new__(type(source), text)
-        replacement.__dict__.update(vars(source))
-    else:
-        replacement = text
+    replacement = replace_result_text(source, text)
     return execution_result(replacement, executed=executed, outcome=outcome)
 
 
@@ -81,7 +79,12 @@ def guard_tool_result(name, result, *, memory, fits):
         discarded = replacement(note)
         if fits(discarded):
             return discarded
-    raise ContextBudgetError(
+    error = ContextBudgetError(
         "The tool's truthful outcome and output-omission receipt cannot fit the current context. "
         "Execution status is preserved; no over-budget request was sent."
     )
+    error.refusal_class = RefusalClass.CAPACITY
+    if isinstance(result, ToolResult):
+        error.executed = result.executed
+        error.outcome = result.outcome
+    raise error

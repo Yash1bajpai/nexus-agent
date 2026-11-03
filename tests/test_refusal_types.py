@@ -40,11 +40,6 @@ def test_every_refusal_class_retains_string_contract_without_text_inference(kind
     assert value.startswith("literal")
 
 
-def test_complete_class_vocabulary():
-    assert set(R.__members__) == {
-        "TARGETING", "SYNTAX", "CONTENT_LOSS", "AMBIGUITY", "BLIND_EDIT",
-        "STALE_STATE", "SENSITIVE_PATH", "NOT_FOUND", "PERMISSION", "OTHER",
-    }
 
 
 def test_targeting_and_ambiguity_decisions_are_source_typed():

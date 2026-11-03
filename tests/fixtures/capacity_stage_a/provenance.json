@@ -1,0 +1,27 @@
+{
+  "origin": {
+    "run_id": 41648699327,
+    "artifact_id": 13235424980,
+    "source_commit": "0ace5019994ab49a3423f3bd3e903753bc72134e",
+    "model_sha256": "2ea801949d760cdf1a2cc04a54262c22c3c0c54f0769d57760c9adeb0e59233f"
+  },
+  "files": {
+    "filler-2-failure.json": {
+      "sha256": "060a0881ab302fce99b779d3474c03b4f24c915def1f3909a2a7abbad1d981a7",
+      "bytes": 31387
+    },
+    "filler-2-latest_success.json": {
+      "sha256": "07f37c7cc6ccbc106ec74f574c92879e39337729d2db9026b8f2d2b3a2228210",
+      "bytes": 28795
+    },
+    "filler-3-failure.json": {
+      "sha256": "0d43938a34b13b13713fc51f3882540974edbf883175279032b22161199dbe91",
+      "bytes": 45257
+    },
+    "filler-3-latest_success.json": {
+      "sha256": "8f2cd7c740b37720345ce4eb6316aaf7ed817cc03cc66987e61706770746c375",
+      "bytes": 39499
+    }
+  },
+  "scope": "Original synthetic diagnostic snapshots; not reconstructed, slimmed, or readiness evidence."
+}
