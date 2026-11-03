@@ -594,12 +594,19 @@ def main():
                      "not recover it")
 
     # --- Row e29: H1 placeholder / provider pairing integrity ---
-    # Any provider pairing break from surgical compaction must surface as an
-    # error string in the e28b session trace; placeholders must be the rigid
-    # spec format when compaction fired.
+    # Compaction/eviction placeholders are model-visible only; the observable
+    # CLI evidence is the fit warn line "Context is full: kept ... (compacted
+    # N old content block(s)[, evicted M older turn(s)], ...)". Terminal
+    # wrapping can split that line, so match on whitespace-normalized text.
+    # Green absence is not a pass: a run where the fit never fired leaves
+    # this axis unqualified (REVIEW).
     pair_err = re.compile(
         r"(tool_call_id|Bad Request|400 Client|unexpected tool|"
         r"tool_use_id.*not found|functionResponse.*missing)", re.I)
+    fit_marker = re.compile(
+        r"Context is full: kept \d+ of \d+ turn\(s\) \(compacted "
+        r"(\d+) old content block\(s\)(?:, evicted (\d+) older "
+        r"turn\(s\))?,")
     e29_bodies = []
     for stem in (["e28b-seed"] + [f"e28b-filler{i}" for i in range(1, 7)]
                  + ["e28b-query"]):
@@ -609,17 +616,22 @@ def main():
                                               errors="replace"))
     e29_joined = "\n".join(e29_bodies)
     bad_pair = pair_err.search(e29_joined)
+    markers = fit_marker.findall(re.sub(r"\s+", " ", e29_joined))
     if bad_pair:
         row_fail("e29-pairing",
                  f"FAIL - provider pairing error after surgical compaction: "
                  f"'{bad_pair.group(0)}' (H1 broke message invariants)")
-    elif "[COMPACTED:" in e29_joined:
+    elif markers:
+        compacted = sum(int(c) for c, _ in markers)
+        evicted = sum(int(e) for _, e in markers if e)
         verdict("e29-pairing",
-                "PASS - compaction placeholders present, no pairing errors")
+                f"PASS - CLI fit marker observed in {len(markers)} row "
+                f"output(s) (compacted {compacted} block(s), evicted "
+                f"{evicted} turn(s)), no provider pairing errors")
     else:
         verdict("e29-pairing",
-                "REVIEW - no compaction placeholder observed in trace; "
-                "pairing integrity unqualified this run")
+                "REVIEW - no CLI fit marker observed; compaction never "
+                "fired this run, pairing integrity unqualified")
 
     # --- Row e30: H5 single-nudge discipline over the edit rows ---
     # At most ONE recovery nudge per edit chain; terminal failure must carry
