@@ -264,6 +264,14 @@ def main():
     else:
         verdict("e06-mathutils", "math_utils.py created with exact seeded content")
         e07_precondition = True
+    # Deterministic re-seed before e07 (run 41576754866: the model reliably
+    # "corrects" a model-planted seed, voiding causation). The driver-written
+    # seed is e07's precondition; the e06 model-plant verdict stays visible
+    # above as its own exact-content task result.
+    (WORKDIR / "math_utils.py").write_text(
+        "def divide(a, b):\n    return a + b\n", encoding="utf-8")
+    seed2 = file_text("math_utils.py")
+    e07_precondition = bool(seed2 and "return a + b" in seed2)
     body = run_cli("e07-bugfix", "divide(10, 2) should give 5 but this code gives 12. find and fix the bug", extra_args=("--verbose",))
     t = file_text("math_utils.py")
     if not e07_precondition:
@@ -715,9 +723,14 @@ def main():
         # Middle-token absence alone proves nothing (the model may simply not
         # repeat it); typed-outcome proof comes from CF's unit tests.
         normalized = re.sub(r"\s+", " ", body)
+        # Executor-provenance evidence only: the guard's refusal carries the
+        # runtime-computed usable budget ("~N tokens, exceeding the ~M-token
+        # usable context budget"), which exists only if the preflight actually
+        # fired; a model can echo it only after receiving it as a tool result.
+        # Bare "too large"-style prose without the computed form does not count.
         refused = bool(re.search(
-            r"\[OBSERVE\][^\[]*?(exceed|not read|too large)[^\[]*?budget",
-            normalized, re.I))
+            r"~[\d,]+ tokens?, exceeding the ~[\d,]+-token usable context budget",
+            normalized))
         if "Fatal execution error" in body:
             row_fail("e31-bigread",
                      "FAIL - oversize read killed the turn (fatal); "
@@ -752,11 +765,21 @@ def main():
         # text in prose must not inflate the count. Whitespace-normalized
         # because terminal wrapping splits lines.
         normalized = re.sub(r"\s+", " ", body)
-        actions = len(re.findall(r"\[ACTION\] run_code", normalized))
-        blocks = len(re.findall(r"\[OBSERVE\].{0,400}?SANDBOX BLOCK",
-                                normalized))
         dup_warn = "[SYSTEM WARNING: Duplicate Tool Call Detected" in body
         suppressed_label = "Suppressed (duplicate)" in body
+        # Dispatch evidence only from executor-authored segments (unresolved/
+        # tool-errors suffixes built from dispatch state, [WARN] stop lines,
+        # typed [OBSERVE] labels). Model prose mentioning the block text is
+        # not counted; each evidenced block implies a dispatched attempt.
+        segments = re.split(
+            r"(?=Unresolved tool errors|Tool errors occurred|\[WARN\]|\[OBSERVE\])",
+            normalized)
+        exec_text = " ".join(
+            seg for seg in segments
+            if seg.startswith(("Unresolved tool errors", "Tool errors occurred",
+                               "[WARN]", "[OBSERVE]")))
+        blocks = exec_text.count("SANDBOX BLOCK")
+        actions = blocks
         if dup_warn:
             row_fail("e33-dupblock",
                      "FAIL - duplicate interception after only blocked "
@@ -764,18 +787,18 @@ def main():
                      + ("" if suppressed_label
                         else "; interception not labeled 'Suppressed "
                              "(duplicate)'"))
-        elif blocks >= 2 and actions >= 2:
+        elif blocks >= 2:
             verdict("e33-dupblock",
                     "PASS - blocked call not registered; identical retry "
-                    "executed and was blocked again (ACTION/OBSERVE paired)")
+                    "dispatched and blocked again (executor-evidenced blocks)")
         elif blocks == 1:
             verdict("e33-dupblock",
-                    "REVIEW - block fired but no identical retry observed; "
-                    "suppression axis unqualified")
+                    "REVIEW - block fired (executor-evidenced) but no "
+                    "identical retry observed; suppression axis unqualified")
         else:
             verdict("e33-dupblock",
-                    "REVIEW - model did not attempt the forbidden run_code "
-                    "call; row unqualified")
+                    "REVIEW - no executor-evidenced forbidden run_code call; "
+                    "row unqualified")
 
     # --- Row e29: H1 placeholder / provider pairing integrity ---
     # Compaction/eviction placeholders are model-visible only; the observable
