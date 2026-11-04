@@ -11,6 +11,7 @@ from nexus_agent_ai.agent import tools as T
 from nexus_agent_ai.agent.guardrails import LoopGuard
 from nexus_agent_ai.agent.refusals import RefusalClass as R, execution_metadata
 from nexus_agent_ai.agent.text_count_limits import MAX_SCAN_BYTES
+from tests._count_identity_diagnostics import count_identity_diagnostics
 
 
 @pytest.fixture(autouse=True)

@@ -567,7 +567,7 @@ def test_actual_launcher_exit_required_after_publication(tmp_path, monkeypatch, 
     def observe_join(thread, timeout=None):
         if thread.name == "q1-launcher":
             assert thread is not threading.current_thread(), "deferred cleanup attempted self-join"
-            join_attempts.append(timeout)
+            join_attempts.append({"timeout": timeout, "name": thread.name, "ident": thread.ident})
         return actual_join(thread, timeout)
 
     class BlockCreate(FakeAPI):
@@ -605,7 +605,7 @@ def test_actual_launcher_exit_required_after_publication(tmp_path, monkeypatch, 
         assert not second["confirmed"] and not second["launcher_joined"]
         assert second["deadline"] == deadline
         assert lease.launcher.is_alive()
-        assert all(timeout is not None and 0 <= timeout <= .05 for timeout in join_attempts)
+        assert all(entry["timeout"] is not None and 0 <= entry["timeout"] <= .05 for entry in join_attempts), f"Unexpected launcher join timeouts: {join_attempts}"
     finally:
         release_create.set()
         release_exit.set()
@@ -795,7 +795,7 @@ def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
 
     out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
     out_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = out_dir / "descendant_diagnostic_facts.json"
+    artifact_path = out_dir / "descendant-portable-diagnostic.json"
     try:
         d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 5.0, platform="nt", api=api, observer=diagnostic_observer)
         result = d.run(["synthetic"], capture_output=True)
@@ -823,7 +823,6 @@ def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
         payload = json.dumps({
             "facts": observed_facts,
             "cap_exceeded": cap_exceeded[0],
-            "bytes_used": bytes_used[0],
         }, ensure_ascii=True)
         assert len(payload.encode("utf-8")) <= MAX_BYTES
         artifact_path.write_text(payload, encoding="utf-8")
@@ -961,6 +960,39 @@ class TestNativeWindows:
             if line.startswith(("CHILD ", "GRANDCHILD ")):
                 pids.append(int(line.split()[1]))
         assert len(pids) == 2, "both actual descendants must have launched"
+        # Collect bounded post-cleanup typed facts before assertion
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
+            k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            k32.WaitForSingleObject.restype = wintypes.DWORD
+            k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            k32.GetExitCodeProcess.restype = wintypes.BOOL
+            post_facts = []
+            for pid in pids:
+                h = k32.OpenProcess(0x1000 | 0x00100000, False, pid)
+                fact = {"pid": pid, "psutil_exists": psutil.pid_exists(pid)}
+                if h:
+                    try:
+                        wait_code = k32.WaitForSingleObject(h, 0)
+                        ec = wintypes.DWORD()
+                        has_ec = k32.GetExitCodeProcess(h, ctypes.byref(ec))
+                        fact.update(handle_open=True, wait_code=wait_code,
+                                    exit_code=int(ec.value) if has_ec else None)
+                    finally:
+                        k32.CloseHandle(h)
+                else:
+                    fact.update(handle_open=False, last_error=ctypes.get_last_error())
+                post_facts.append(fact)
+            out_dir = os.environ.get("NEXUS_Q1_OUTPUT_DIR")
+            if out_dir:
+                p = Path(out_dir) / f"postcleanup-pids-{os.getpid()}-{record.get('command_id', 1)}.json"
+                p.write_text(json.dumps(post_facts, indent=2), encoding="utf-8")
         assert all(not psutil.pid_exists(pid) for pid in pids)
         assert record["cleanup"]["confirmed"]
         assert record["cleanup"]["job_empty"]
@@ -1117,7 +1149,7 @@ class TestNativeWindows:
 
         out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
         out_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = out_dir / "descendant_diagnostic_facts.json"
+        artifact_path = out_dir / "descendant-native-diagnostic.json"
         try:
             d = domain(tmp_path, observer=observer)
             d.run(python(self.tree_source()), capture_output=True)
@@ -1130,7 +1162,6 @@ class TestNativeWindows:
             payload = json.dumps({
                 "facts": observed_diagnostics,
                 "cap_exceeded": cap_exceeded[0],
-                "bytes_used": bytes_used[0],
             }, ensure_ascii=True)
             assert len(payload.encode("utf-8")) <= MAX_BYTES
             artifact_path.write_text(payload, encoding="utf-8")

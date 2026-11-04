@@ -1,237 +1,224 @@
-"""Test-only diagnostic capture for text_count_worker identity validation.
+"""Test-only observation of unchanged installed count-worker code.
 
-Zero production runtime impact: no extra stat calls, no receipt changes, no guard bypass.
-Passive observation of already-consumed stat tuples and opened path identity checks.
+The opt-in fixture wraps only the fixed worker launch in these test modules.
+The isolated child executes the original worker bytes under a per-thread trace;
+no production function, check, receipt, stat call or short-circuit is replaced.
+Diagnostic timing/argv differ, so these artifacts are not qualification proof.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import sys
+import uuid
+
+MAX_BYTES = 8192
+_FIELDS = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
 
 
-class CountIdentityRecorder:
-    """Bounded, test-only recorder for text_count_worker identity verification stages."""
+class WorkerTrace:
+    """Four bounded phases, with absent checks explicitly NOT_REACHED."""
 
-    MAX_BYTES = 8192
-
-    def __init__(self, workspace_root: Optional[Path | str] = None):
-        if workspace_root is not None:
-            self.workspace_root = os.path.normpath(os.path.abspath(os.fspath(workspace_root))).replace("\\", "/")
-        else:
-            self.workspace_root = None
-        self.events: List[Dict[str, Any]] = []
-        self.cap_exceeded: bool = False
-        self.first_mismatch: Optional[Dict[str, Any]] = None
-
-    def _append_event(self, event: Dict[str, Any]) -> None:
-        if self.cap_exceeded:
-            return
-        candidate_events = self.events + [event]
-        candidate_payload = {
-            "events": candidate_events,
-            "first_mismatch": self.first_mismatch,
+    def __init__(self, filename, source_sha256=None):
+        self.filename = os.path.abspath(filename)
+        self.payload = {
+            "worker_sha256": source_sha256,
+            "phases": [{"phase": name, "status": "NOT_REACHED"} for name in
+                       ("open", "after_ack", "after_scan", "receipt")],
             "cap_exceeded": False,
         }
-        raw_size = len(json.dumps(candidate_payload, ensure_ascii=True).encode("utf-8"))
-        if raw_size <= self.MAX_BYTES:
-            self.events.append(event)
+        self.states = {}
+        self.check_count = 0
+        self.previous = None
+
+    def _save(self, index, value):
+        phases = list(self.payload["phases"])
+        phases[index] = value
+        candidate = dict(self.payload, phases=phases)
+        if len(json.dumps(candidate, ensure_ascii=True).encode("ascii")) <= MAX_BYTES:
+            self.payload = candidate
         else:
-            self.cap_exceeded = True
+            self.payload["cap_exceeded"] = True
+            self.payload["phases"][index] = {
+                "phase": self.payload["phases"][index]["phase"], "status": "OMITTED_CAP"}
 
-    def _sanitize_path(self, path: Any) -> str:
-        """Pure lexical path sanitization; zero filesystem stat/resolve/timing calls."""
-        if path is None:
-            return ""
-        s = os.fspath(path)
-        try:
-            norm = os.path.normpath(os.path.abspath(s)).replace("\\", "/")
-            if self.workspace_root:
-                ws = self.workspace_root
-                if norm.startswith(ws + "/"):
-                    return norm[len(ws) + 1:]
-                elif norm == ws:
-                    return "."
-            return os.path.basename(norm) or s
-        except Exception:
-            return str(path)
-
-    @staticmethod
-    def _tuple_dict(t: Optional[Tuple]) -> Optional[Dict[str, Any]]:
-        if not t or len(t) != 6:
+    def _trace(self, frame, event, arg):
+        if frame.f_code.co_filename != self.filename:
             return None
-        return {
-            "st_dev": t[0],
-            "st_ino": t[1],
-            "st_mode": t[2],
-            "st_size": t[3],
-            "st_mtime_ns": t[4],
-            "st_ctime_ns": t[5],
-        }
+        name = frame.f_code.co_name
+        if name not in ("_open_validated", "_check_identity", "_reliable_identity", "_allowed", "_child_main"):
+            return None
+        if event == "call":
+            state = {"name": name}
+            if name == "_open_validated":
+                state.update(index=0, stats=[], checks=[])
+            elif name == "_check_identity":
+                parent = self.states.get(frame.f_back)
+                index = 0 if parent and parent["name"] == "_open_validated" else min(2, self.check_count + 1)
+                if index:
+                    self.check_count += 1
+                state.update(index=index, stats=[], allowed=[], before=list(frame.f_locals["before"]))
+            elif name == "_reliable_identity":
+                # Only read attributes of the stat_result ALREADY produced by the worker.
+                info = frame.f_locals["info"]
+                state["consumed"] = {key: getattr(info, key) for key in _FIELDS if hasattr(info, key)}
+            self.states[frame] = state
+        state = self.states.get(frame)
+        if state is None:
+            return self._trace
+        if event == "exception":
+            state["exception"] = arg[0].__name__  # No exception text or private file content.
+            if arg[0].__name__ == "_PathRefusal":
+                state["reason"] = arg[1].reason
+            elif isinstance(arg[1], OSError):
+                state["errno"] = arg[1].errno
+        elif event == "return":
+            self.states.pop(frame, None)
+            parent = self.states.get(frame.f_back)
+            if name == "_reliable_identity" and parent and "stats" in parent:
+                order = ("initial_stat", "opened_fstat") if parent["name"] == "_open_validated" else (
+                    "held_fstat", "target_stat", "original_stat")
+                value = {"operation": order[len(parent["stats"])], "consumed": state["consumed"]}
+                if "exception" in state:
+                    value["error"] = state["exception"]
+                    value.update({key: state[key] for key in ("reason", "errno") if key in state})
+                else:
+                    value["returned"] = list(arg)
+                parent["stats"].append(value)
+            elif name == "_allowed" and parent and parent["name"] == "_check_identity":
+                parent["allowed"].append({"status": "ERROR" if "exception" in state else "RETURNED",
+                                          "equals_target": arg == frame.f_back.f_locals["target"] if "exception" not in state else None})
+            elif name == "_check_identity":
+                local = frame.f_locals
+                value = {"status": "ERROR" if "exception" in state else "PASS",
+                         "stats": state["stats"], "before": state["before"],
+                         "allowed": state["allowed"],
+                         "actual_equals_target": local["actual"] == local["target"] if "actual" in local else "NOT_REACHED",
+                         "actual_allowed_equals_target": local["actual_allowed"] == local["target"] if "actual_allowed" in local else "NOT_REACHED"}
+                if "exception" in state:
+                    value["error"] = state["exception"]
+                    value.update({key: state[key] for key in ("reason", "errno") if key in state})
+                if parent and parent["name"] == "_open_validated":
+                    parent["checks"].append(value)
+                else:
+                    self._save(state["index"], dict(value, phase=self.payload["phases"][state["index"]]["phase"]))
+            elif name == "_open_validated":
+                value = {"phase": "open", "status": "ERROR" if "exception" in state else "PASS",
+                         "stats": state["stats"], "checks": state["checks"]}
+                if "exception" in state:
+                    value["error"] = state["exception"]
+                    value.update({key: state[key] for key in ("reason", "errno") if key in state})
+                self._save(0, value)
+            elif name == "_child_main":
+                receipt = frame.f_locals.get("receipt")
+                if isinstance(receipt, dict):
+                    source = receipt.get("source", {})
+                    self._save(3, {"phase": "receipt", "status": "RETURNED",
+                                   "receipt_status": receipt.get("status"), "reason": receipt.get("reason"),
+                                   "bytes": source.get("bytes"), "partial": source.get("partial"),
+                                   "acknowledged": frame.f_locals.get("acknowledged")})
+                    before = frame.f_locals.get("before")
+                    if before is not None:
+                        value = dict(self.payload["phases"][2], expected_bytes=before[3],
+                                     observed_bytes=source.get("bytes"), partial=source.get("partial"))
+                        self._save(2, value)
+                elif "exception" in state:
+                    self._save(3, {"phase": "receipt", "status": "ERROR", "error": state["exception"]})
+        return self._trace
 
-    def record_open(self, target_path: Any, initial_stat: Optional[Tuple], fd_fstat: Optional[Tuple], match: bool) -> None:
-        event = {
-            "phase": "open.initial_vs_fstat",
-            "target": self._sanitize_path(target_path),
-            "initial": self._tuple_dict(initial_stat),
-            "fd_fstat": self._tuple_dict(fd_fstat),
-            "match": match,
-        }
-        if not match and self.first_mismatch is None:
-            differing = [
-                k for k in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-                if (event["initial"] or {}).get(k) != (event["fd_fstat"] or {}).get(k)
-            ]
-            self.first_mismatch = {
-                "phase": event["phase"],
-                "differing_fields": differing,
-            }
-        self._append_event(event)
+    def __enter__(self):
+        self.previous = sys.gettrace()
+        sys.settrace(self._trace)
+        return self
 
-    def record_check_identity(self, phase: str, fd: int, original: Any, target: Any,
-                              actual: Any, actual_allowed: Any, original_allowed: Any,
-                              path_matches: Dict[str, bool],
-                              before: Optional[Tuple],
-                              fd_stat: Optional[Tuple] = None,
-                              target_stat: Optional[Tuple] = None,
-                              original_stat: Optional[Tuple] = None,
-                              identity_match: bool = True) -> None:
-        event = {
-            "phase": phase,
-            "paths": {
-                "original": self._sanitize_path(original),
-                "target": self._sanitize_path(target),
-                "actual": self._sanitize_path(actual),
-            },
-            "path_matches": path_matches,
-            "before_tuple": self._tuple_dict(before),
-            "fd_stat": self._tuple_dict(fd_stat),
-            "target_stat": self._tuple_dict(target_stat),
-            "original_stat": self._tuple_dict(original_stat),
-            "identity_match": identity_match,
-        }
-        if not identity_match and self.first_mismatch is None:
-            self.first_mismatch = {
-                "phase": phase,
-                "path_matches": path_matches,
-            }
-        self._append_event(event)
+    def __exit__(self, *exc):
+        sys.settrace(self.previous)
+        self.states.clear()
 
-    def record_postscan_bytes(self, scanned_bytes: int, expected_size: int, match: bool) -> None:
-        event = {
-            "phase": "postscan.bytes_vs_initial_size",
-            "scanned_bytes": scanned_bytes,
-            "expected_size": expected_size,
-            "match": match,
-        }
-        if not match and self.first_mismatch is None:
-            self.first_mismatch = {
-                "phase": event["phase"],
-                "scanned_bytes": scanned_bytes,
-                "expected_size": expected_size,
-            }
-        self._append_event(event)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "events": self.events,
-            "first_mismatch": self.first_mismatch,
-            "cap_exceeded": self.cap_exceeded,
-        }
+    def write(self, path):
+        raw = json.dumps(self.payload, ensure_ascii=True).encode("ascii")
+        if len(raw) > MAX_BYTES:
+            raise AssertionError("diagnostic final envelope exceeds cap")
+        with open(path, "xb") as stream:
+            stream.write(raw)
 
 
-class DiagnosticWorkerWrapper:
-    """Test-only passive wrapper around text_count_worker identity checks.
+def _diagnostic_child(worker_path, artifact):
+    # Read once, compile and execute exact source with the original filename/main
+    # bootstrap. All target filesystem checks are still performed by that code.
+    worker_path = os.path.abspath(worker_path)
+    source = Path(worker_path).read_bytes()
+    capture = WorkerTrace(worker_path, hashlib.sha256(source).hexdigest())
+    namespace = {"__name__": "__main__", "__file__": worker_path, "__package__": None}
+    sys.argv = [worker_path]
+    try:
+        with capture:
+            exec(compile(source, worker_path, "exec"), namespace)
+    finally:
+        capture.write(artifact)
 
-    Zero production changes. Zero extra stat/fstat calls.
-    Preserves exact order, returns, exceptions, receipts, and deadlines.
-    """
 
-    def __init__(self, recorder: CountIdentityRecorder, monkeypatch=None):
-        self.recorder = recorder
-        self.monkeypatch = monkeypatch
-        self._patches: List[Tuple[Any, str, Any]] = []
+def _prepare_worker_launch(argv, worker_path, helper, artifact, *, paths=None):
+    """Match lexical identities only; do not probe files or resolve aliases."""
+    paths = os.path if paths is None else paths
+    if not isinstance(argv, (list, tuple)) or len(argv) < 5:
+        return argv
+    script = argv[4]
+    if not isinstance(script, (str, bytes, os.PathLike)):
+        return argv
+    script = os.fsdecode(script)
+    if paths.normcase(paths.basename(paths.normpath(script))) != paths.normcase("text_count_worker.py"):
+        return argv
 
-    def install(self, worker_module: Any) -> None:
-        recorder = self.recorder
-        orig_check_identity = worker_module._check_identity
-        orig_open_validated = worker_module._open_validated
+    def key(path):
+        return paths.normcase(paths.abspath(paths.normpath(os.fsdecode(path))))
 
-        def wrapped_open_validated(path):
-            orig_reliable = worker_module._reliable_identity
-            tuples_seen = []
+    shape_matches = len(argv) == 5 and list(argv[1:4]) == ["-I", "-S", "-B"]
+    if shape_matches and key(script) == key(worker_path):
+        return [*argv[:4], helper, os.fspath(argv[4]), str(artifact)]
+    # No raw paths/arguments in evidence. Preserve the original launch unchanged,
+    # but make a missing child trace explicit rather than silently skipping it.
+    marker = {"status": "UNMATCHED_WORKER_LAUNCH",
+              "reason": "path_mismatch" if shape_matches else "argv_shape"}
+    with open(Path(artifact).with_suffix(".unmatched.json"), "xb") as stream:
+        stream.write(json.dumps(marker, ensure_ascii=True).encode("ascii"))
+    return argv
 
-            def capturing_reliable(info):
-                res = orig_reliable(info)
-                tuples_seen.append(res)
-                if len(tuples_seen) == 2:
-                    # Both initial stat and fd fstat are captured before _check_identity runs
-                    initial = tuples_seen[0]
-                    before = tuples_seen[1]
-                    recorder.record_open(path, initial, before, match=(initial == before))
-                return res
 
-            worker_module._reliable_identity = capturing_reliable
-            try:
-                return orig_open_validated(path)
-            finally:
-                worker_module._reliable_identity = orig_reliable
+if __name__ == "__main__":
+    _diagnostic_child(*sys.argv[1:])
+else:
+    import pytest
 
-        def wrapped_check_identity(fd, original, target, before):
-            orig_reliable = worker_module._reliable_identity
-            check_tuples = []
+    @pytest.fixture(autouse=True)
+    def count_identity_diagnostics(request, monkeypatch):
+        """Opt-in at actual test invocation paths, including real child processes."""
+        output = os.environ.get("NEXUS_Q1_OUTPUT_DIR")
+        if not output:
+            yield
+            return
+        import subprocess
+        from nexus_agent_ai.agent import text_count_worker as worker
+        output = Path(output) / "count-identity"
+        output.mkdir(parents=True, exist_ok=True)
+        original = subprocess.Popen
+        helper = os.path.abspath(__file__)
+        test_key = hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
 
-            def capturing_check_reliable(info):
-                res = orig_reliable(info)
-                check_tuples.append(res)
-                return res
+        def launch(argv, *args, **kwargs):
+            artifact = output / f"{test_key}-{uuid.uuid4().hex}.json"
+            argv = _prepare_worker_launch(argv, worker.__file__, helper, artifact)
+            return original(argv, *args, **kwargs)
 
-            worker_module._reliable_identity = capturing_check_reliable
-            try:
-                orig_check_identity(fd, original, target, before)
-                recorder.record_check_identity(
-                    phase="check_identity.pass",
-                    fd=fd,
-                    original=original,
-                    target=target,
-                    actual=target,
-                    actual_allowed=target,
-                    original_allowed=target,
-                    path_matches={"target": True},
-                    before=before,
-                    identity_match=True
-                )
-            except Exception:
-                recorder.record_check_identity(
-                    phase="check_identity.refusal",
-                    fd=fd,
-                    original=original,
-                    target=target,
-                    actual=None,
-                    actual_allowed=None,
-                    original_allowed=None,
-                    path_matches={"target": False},
-                    before=before,
-                    fd_stat=check_tuples[0] if len(check_tuples) > 0 else None,
-                    target_stat=check_tuples[1] if len(check_tuples) > 1 else None,
-                    original_stat=check_tuples[2] if len(check_tuples) > 2 else None,
-                    identity_match=False
-                )
-                raise
-            finally:
-                worker_module._reliable_identity = orig_reliable
-
-        if self.monkeypatch:
-            self.monkeypatch.setattr(worker_module, "_open_validated", wrapped_open_validated)
-            self.monkeypatch.setattr(worker_module, "_check_identity", wrapped_check_identity)
-        else:
-            self._patches.append((worker_module, "_open_validated", orig_open_validated))
-            self._patches.append((worker_module, "_check_identity", orig_check_identity))
-            worker_module._open_validated = wrapped_open_validated
-            worker_module._check_identity = wrapped_check_identity
-
-    def uninstall(self) -> None:
-        for mod, attr, orig in self._patches:
-            setattr(mod, attr, orig)
-        self._patches.clear()
+        monkeypatch.setattr(subprocess, "Popen", launch)
+        # The ninth original failure calls _open_validated in-process. Trace that
+        # thread too; child workers have their own independent trace/state.
+        capture = WorkerTrace(worker.__file__, hashlib.sha256(Path(worker.__file__).read_bytes()).hexdigest())
+        try:
+            with capture:
+                yield
+        finally:
+            if any(phase["status"] != "NOT_REACHED" for phase in capture.payload["phases"]):
+                capture.write(output / f"{test_key}-parent-{uuid.uuid4().hex}.json")
