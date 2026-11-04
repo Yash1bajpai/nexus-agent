@@ -1067,6 +1067,28 @@ def test_recovery_hint_describes_candidate_only_no_deletion_no_authority(tmp_pat
     result2 = tools_module.execute_write_file(str(path), "def divide(a, b):\n    return a / b if b else 0\n")
     assert result2.startswith("ERROR:")
 
+@pytest.mark.parametrize("special_path", [
+    r"D:\work\calc.py",
+    r"C:\Users\username\dir\file.py",
+    r'my "quoted" file.py',
+    "project/雪_file_₹.py",
+    r"dir/{path}/target.py",
+])
+def test_recovery_hint_json_serialization_handles_windows_and_special_paths(special_path):
+    from nexus_agent_ai.agent import tools as tools_module
+    import json as _json
+    old = "def add(a, b):\n    return a + b\ndef divide(a, b):\n    return a / b\n"
+    new = "def divide(a, b):\n    return a / b if b else 0\n"
+    hint = tools_module._suggest_targeted_patch(old, new, path=special_path)
+    assert hint is not None
+    assert "patch_file with these exact arguments" in hint
+    hint_json = hint[hint.index('{"path":'):hint.rindex("}") + 1]
+    # Must be 100% valid JSON, no JSONDecodeError on backslashes, quotes or literal {path}
+    args = _json.loads(hint_json)
+    assert args["path"] == special_path
+    assert "return a / b if b else 0" in args["replacement"]
+    assert "def add(" not in args["replacement"]
+
 
 def test_tool_results_carry_grounded_absolute_paths(tmp_path):
     # Deterministic path grounding: the model learns real absolute paths from
@@ -1075,14 +1097,16 @@ def test_tool_results_carry_grounded_absolute_paths(tmp_path):
     (tmp_path / "calc.py").write_text("x = 1\n")
     tools_module.execute_read_file("calc.py")
     result = tools_module.execute_write_file("calc.py", "x = 2\n")
-    assert f"absolute path: {tmp_path}/calc.py" in result
+    expected_file = (tmp_path / "calc.py").resolve()
+    expected_dir = tmp_path.resolve()
+    assert f"absolute path: {expected_file}" in result
     result = tools_module.execute_patch_file("calc.py", "x = 2", "x = 3")
-    assert f"absolute path: {tmp_path}/calc.py" in result
+    assert f"absolute path: {expected_file}" in result
     result = tools_module.execute_list_directory(".")
-    assert f"absolute path: {tmp_path}" in result
+    assert f"absolute path: {expected_dir}" in result
     # The real turn-3 failure: list_directory on a file gets a specific,
     # corrective message with the grounded path.
     result = tools_module.execute_list_directory("./calc.py")
     assert "is a file, not a directory" in result
     assert "read_file" in result
-    assert f"Absolute path: {tmp_path}/calc.py" in result
+    assert f"Absolute path: {expected_file}" in result

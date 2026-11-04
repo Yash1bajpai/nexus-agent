@@ -294,13 +294,14 @@ def _git_repo(tmp_path, track_calc=True):
     def g(*args):
         return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True)
     g("init", "-q")
+    g("config", "--local", "user.name", "t")
+    g("config", "--local", "user.email", "t@t")
     if track_calc and (tmp_path / "calc.py").is_file():
         g("add", "calc.py")
-        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "chore: add calc")
+        g("commit", "-q", "-m", "chore: add calc")
     else:
-        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "chore: init")
+        g("commit", "-q", "--allow-empty", "-m", "chore: init")
     return g
-
 
 def test_commit_subcommand_decline_does_not_commit(prepare, tmp_path):
     g = _git_repo(tmp_path)

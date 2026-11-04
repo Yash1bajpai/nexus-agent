@@ -40,7 +40,7 @@ def test_real_golden_selftest_uses_bound_alias(driver):
 @pytest.mark.parametrize('payload', ['say "hi"', 'é ₹\n$HOME %PATH% ; | & * ?', '  leading trailing  '])
 def test_real_argv_stdin_and_eof(payload):
     script = 'import sys,json; print(json.dumps([sys.argv[1:],sys.stdin.read()]))'
-    result = subprocess.run([sys.executable, '-I', '-c', script, payload],
+    result = subprocess.run([sys.executable, '-I', '-X', 'utf8', '-c', script, payload],
                             input=payload, text=True, encoding='utf-8',
                             capture_output=True, timeout=10)
     assert result.returncode == 0
@@ -66,7 +66,7 @@ def test_alias_is_local_not_global(driver):
 
 def test_all_driver_launches_use_injectable_alias(driver):
     # Explicit frozen-source contract: argv, inputs and gates cannot drift.
-    tree = ast.parse(Path(driver.__file__).read_text())
+    tree = ast.parse(Path(driver.__file__).read_text(encoding="utf-8"))
     direct = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
               and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
               and n.func.value.id == 'subprocess' and n.func.attr == 'run']
@@ -81,9 +81,9 @@ def test_all_driver_launches_use_injectable_alias(driver):
 
 
 def test_frozen_complete_call_schedule_and_inputs(driver):
-    contract = json.loads((ROOT / 'tests/fixtures/q1/frozen_contract.json').read_text())
+    contract = json.loads((ROOT / 'tests/fixtures/q1/frozen_contract.json').read_text(encoding="utf-8"))
     original = ast.parse(contract['base_driver_source'])
-    candidate = ast.parse(Path(driver.__file__).read_text())
+    candidate = ast.parse(Path(driver.__file__).read_text(encoding="utf-8"))
 
     def calls(tree, alias):
         found = []

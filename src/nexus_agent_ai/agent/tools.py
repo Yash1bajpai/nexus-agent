@@ -589,10 +589,11 @@ def execute_write_file(path: str, content: str) -> str:
                 old_content = f.read()
             loss, dropped = _describe_content_loss(p.name, old_content, content)
             if loss and not content_removal_approved(p, loss, dropped):
-                hint = _suggest_targeted_patch(old_content, content) or                     "Use patch_file for a targeted edit that keeps the existing content."
+                hint = _suggest_targeted_patch(old_content, content, path=path) or \
+                    "Use patch_file for a targeted edit that keeps the existing content."
                 return refusal(RefusalClass.CONTENT_LOSS, f"ERROR: This overwrite of '{path}' would delete {loss}. "
                         "The user has not approved removing it. Ask the user to confirm the replacement. "
-                        + hint.replace("{path}", path))
+                        + hint)
 
         existed = p.exists()
         if not _atomic_file_update(p, content):
@@ -762,10 +763,11 @@ def execute_patch_file(path: str, target: str, replacement: str, allow_multiple:
 
         loss, dropped = _describe_content_loss(p.name, content, new_content)
         if loss and not content_removal_approved(p, loss, dropped):
-            hint = _suggest_targeted_patch(content, new_content) or                 "Choose a target that keeps the existing content."
+            hint = _suggest_targeted_patch(content, new_content, path=path) or \
+                "Choose a target that keeps the existing content."
             return refusal(RefusalClass.CONTENT_LOSS, f"ERROR: This patch to '{path}' would delete {loss}. "
                     "The user has not approved removing it. Ask the user to confirm the removal. "
-                    + hint.replace("{path}", path))
+                    + hint)
 
         if not _atomic_file_update(p, new_content):
             return execution_result(f"No changes: '{path}' already has the requested content.",
@@ -1260,7 +1262,7 @@ def _fstring_violations(tree) -> list:
     return violations
 
 
-def _suggest_targeted_patch(old: str, new: str) -> str | None:
+def _suggest_targeted_patch(old: str, new: str, path: str = "{path}") -> str | None:
     """When a lossy overwrite/patch is refused, give the model a ready-to-use
     targeted patch_file call for the small localized change it actually wants."""
     import difflib
@@ -1292,7 +1294,7 @@ def _suggest_targeted_patch(old: str, new: str) -> str | None:
         if not target or len(target) > 2000 or len(replacement) > 2000:
             return None
         hints.append("patch_file with these exact arguments (JSON): "
-                     + _json.dumps({"path": "{path}", "target": target, "replacement": replacement}))
+                     + _json.dumps({"path": path, "target": target, "replacement": replacement}))
     if not hints:
         return None
     return "To apply just the change without deleting anything, call " + " and then ".join(hints)

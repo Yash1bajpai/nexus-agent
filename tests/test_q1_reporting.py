@@ -50,7 +50,7 @@ def test_same_name_body_corruption_and_ast_limits(driver):
 
 def patch_segment(driver, start, end, values):
     """Execute the actual frozen row reporting statements, not a reimplementation."""
-    tree = ast.parse(Path(driver.__file__).read_text())
+    tree = ast.parse(Path(driver.__file__).read_text(encoding="utf-8"))
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
     nodes = [n for n in main.body if start <= n.lineno < end]
     namespace = vars(driver).copy()
@@ -63,7 +63,7 @@ def patch_segment(driver, start, end, values):
 
 
 def debug_reporting(driver, rc, text, output):
-    tree = ast.parse(Path(driver.__file__).read_text())
+    tree = ast.parse(Path(driver.__file__).read_text(encoding="utf-8"))
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
     branch = next(n for n in main.body if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
                   and isinstance(n.test.left, ast.Name) and n.test.left.id == 'rc'
@@ -144,7 +144,7 @@ def test_capture_and_native_boundaries(report):
     (ADD, ADD + '# def subtract\\n', 'verdict', 'subtract added'),
 ])
 def test_actual_e08_patch_reporting(driver, before, after, kind, phrase):
-    tree = ast.parse(Path(driver.__file__).read_text())
+    tree = ast.parse(Path(driver.__file__).read_text(encoding="utf-8"))
     branch = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
                   and isinstance(n.test, ast.Compare)
                   and isinstance(n.test.left, ast.Name) and n.test.left.id == 'before_add')

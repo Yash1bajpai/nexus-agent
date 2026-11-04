@@ -54,6 +54,7 @@ def patch():
 def test_typed_refusal_matrix_controls_offering_and_dispatch_only_by_class(tmp_path, monkeypatch, kind, edit_tool):
     path = tmp_path / "f.py"
     path.write_text("x = 1\n")
+    original_bytes = path.read_bytes()
     calls = []
     real_dispatch = tools.execute_tool
 
@@ -87,7 +88,7 @@ def test_typed_refusal_matrix_controls_offering_and_dispatch_only_by_class(tmp_p
     audit = [event for event in events if event["type"] == "tool_gated"]
     assert [event["enforced_at"] for event in audit] == (["offered", "dispatch"] if gated else [])
     assert all(event["reason"] == kind.value and event["tool"] == "run_code" for event in audit)
-    assert path.read_bytes() == b"x = 1\n"
+    assert path.read_bytes() == original_bytes
 
 
 def test_untyped_error_text_is_not_used_to_guess_gate_taxonomy(tmp_path, monkeypatch):
@@ -108,6 +109,7 @@ def test_untyped_error_text_is_not_used_to_guess_gate_taxonomy(tmp_path, monkeyp
 @pytest.mark.parametrize("code_first", [False, True])
 def test_same_batch_order_gate_and_readonly_tools_are_deterministic(tmp_path, monkeypatch, code_first):
     (tmp_path / "f.py").write_text("x = 1\n")
+    original_text = (tmp_path / "f.py").read_bytes().decode("utf-8")
     tools.execute_read_file("f.py")
     code_calls = []
     monkeypatch.setattr(tools.RUN_CODE_TOOL, "execute", lambda **kwargs: code_calls.append(kwargs) or "STDOUT:\n42")
@@ -122,7 +124,7 @@ def test_same_batch_order_gate_and_readonly_tools_are_deterministic(tmp_path, mo
     assert len(code_calls) == int(code_first)
     results = {m["tool_call_id"]: m["content"] for m in agent.memory.get() if m["role"] == "tool"}
     assert set(results) == {"edit", "code", "read"}
-    assert results["read"] == "x = 1\n"
+    assert results["read"] == original_text
     assert results["code"].startswith("STDOUT:" if code_first else "ERROR:")
     assert "run_code" not in provider.seen[1][1]
     assert any(event["type"] == "tool_gated" and event["enforced_at"] == "offered" for event in events)
@@ -232,7 +234,7 @@ def test_readonly_semantic_claim_uses_only_failed_executor_facts_after_resume(tm
     assert memory.get()[:len(audit)] == audit
     assert memory.get()[-1]["content"] == text
     corrected = [event for event in events if event["type"] == "claim_corrected"]
-    assert len(corrected) == 1 and corrected[0]["file"] == str(path)
+    assert len(corrected) == 1 and os.path.normcase(os.path.abspath(corrected[0]["file"])) == os.path.normcase(os.path.abspath(path))
     assert "text" not in corrected[0]
 
 

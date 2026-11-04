@@ -310,7 +310,7 @@ def native_gate(args):
     write_json(root / "output/native-spec.json", {"provenance": provenance, "staged": staged})
     environment = child_environment(root / "state/test-home", root / "state/test-tmp")
     owner = owned_module(args.source_root)
-    command = [sys.executable, "-I", str(Path(args.source_root) / ".github/qualification/runner.py"),
+    command = [sys.executable, "-I", "-X", "utf8", str(Path(args.source_root) / ".github/qualification/runner.py"),
                "_pytest", "--root", str(root), "--wheel", str(args.wheel),
                "--source-root", str(args.source_root), "--commit", args.commit]
     with owner.ProcessDomain(root / "output/native-process", deadline=deadline_from_file(args.deadline_file)) as domain:

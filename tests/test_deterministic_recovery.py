@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 
 import pytest
 
@@ -69,6 +70,7 @@ def read_b(tmp_path):
 
 def test_second_identical_failure_ends_turn_without_another_model_request(tmp_path):
     path = read_b(tmp_path)
+    original_bytes = path.read_bytes()
     provider = Scripted([bad_patch(), bad_patch(), "I updated b.py."])
     events = []
     agent = Agent(provider, verbose=False, event_callback=events.append)
@@ -76,7 +78,7 @@ def test_second_identical_failure_ends_turn_without_another_model_request(tmp_pa
     assert len(provider.seen) == 2 and provider.steps == ["I updated b.py."]
     assert "Stopped: repeated identical tool failure" in final
     assert "target-mismatch" in final and "no observed target-file state change" in final
-    assert path.read_bytes() == b"x = 1\n"
+    assert path.read_bytes() == original_bytes
     assert len([event for event in events if event["type"] == "observe"]) == 2
     assert agent.unresolved_errors
 
@@ -94,16 +96,17 @@ def test_successful_actual_call_resets_failure_evidence(tmp_path):
 def test_changed_actual_file_hash_does_not_stop_on_second_different_state(tmp_path, monkeypatch):
     path = read_b(tmp_path)
     monkeypatch.setattr(core, "execute_tool", lambda *args: "ERROR: Target content not found in 'b.py'.")
+    changed_bytes = [None]
 
     def change_state(index):
         if index == 1:
             path.write_text("x = 10\n", encoding="utf-8")
-
+            changed_bytes[0] = path.read_bytes()
     provider = Scripted([bad_patch(), bad_patch(), bad_patch(), "unused"], change_state)
     final = Agent(provider, verbose=False).run("Fix b.py")
     assert len(provider.seen) == 3
     assert "repeated identical tool failure" in final
-    assert path.read_bytes() == b"x = 10\n"
+    assert path.read_bytes() == changed_bytes[0]
 
 
 def test_later_independent_user_request_is_not_permanently_blocked(tmp_path):
@@ -193,8 +196,10 @@ def test_legacy_mixed_outcomes_redact_only_false_claims_in_next_fitted_view(tmp_
     assert len(corrections) == 1
     correction = corrections[0]
     assert correction["role"] == "user" and not is_genuine_user_message(correction)
-    assert "no executor write to" in correction["content"] and str(tmp_path / "b.py") in correction["content"]
-    assert str(tmp_path / "a.py") not in correction["content"]
+    b_token = json.dumps(os.path.normcase(os.path.abspath(tmp_path / "b.py")), ensure_ascii=False)[1:-1]
+    a_token = json.dumps(os.path.normcase(os.path.abspath(tmp_path / "a.py")), ensure_ascii=False)[1:-1]
+    assert "no executor write to" in correction["content"] and b_token in os.path.normcase(correction["content"])
+    assert a_token not in os.path.normcase(correction["content"])
     assert "unknown.py" not in correction["content"]
     assert "not a new request or approval" in correction["content"]
     assert memory.get()[:len(audit)] == audit

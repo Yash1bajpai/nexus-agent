@@ -1015,3 +1015,29 @@ def test_cancelled_acknowledged_io_reaps_owned_worker(monkeypatch, private_worke
     assert ack.is_set()
     assert len(owned) == 1 and owned[0].poll() is not None
     assert_cleaned()
+
+
+def test_count_identity_diagnostics_passive_capture_and_stage_attribution(tmp_path):
+    """Diagnostic companion proves passive capture of consumed stat tuples and stage attribution."""
+    from tests._count_identity_diagnostics import CountIdentityRecorder
+    recorder = CountIdentityRecorder(tmp_path)
+    target = tmp_path / "sample.txt"
+    target.write_text("hello world")
+
+    t1 = (1, 100, 33188, 11, 1000, 1000)
+    t2 = (1, 100, 33188, 11, 1000, 1000)
+    recorder.record_open(target, t1, t2, match=True)
+    assert len(recorder.events) == 1
+    assert recorder.events[0]["match"] is True
+    assert recorder.first_mismatch is None
+
+    # Simulate mismatch on st_ino
+    t3 = (1, 101, 33188, 11, 1000, 1000)
+    recorder.record_open(target, t1, t3, match=False)
+    assert recorder.first_mismatch == {
+        "phase": "open.initial_vs_fstat",
+        "differing_fields": ["st_ino"],
+    }
+    data = recorder.to_dict()
+    assert len(json.dumps(data).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+

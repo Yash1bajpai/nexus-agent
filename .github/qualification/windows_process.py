@@ -339,9 +339,15 @@ class _Lease:
             finally:
                 self.launch_ready.set()
 
-    def wait_ready(self, timeout):
-        wait_timeout = None if timeout is None else max(0.0, timeout)
-        signaled = self.launch_ready.wait(timeout=wait_timeout)
+    def wait_ready(self, deadline):
+        while True:
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            wait_timeout = None if remaining is None else max(0.0, remaining)
+            signaled = self.launch_ready.wait(timeout=wait_timeout)
+            if signaled:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
         if not signaled:
             self.cancel.set()
             return False
@@ -462,8 +468,13 @@ class _Lease:
             except BaseException:
                 info["start_interrupted"] = True
                 raise
-            if not info["entered"].wait(max(0.0, deadline - time.monotonic())):
-                return False
+            while True:
+                remaining = deadline - time.monotonic() if deadline is not None else None
+                wait_timeout = None if remaining is None else max(0.0, remaining)
+                if info["entered"].wait(wait_timeout):
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
         return True
 
     def _start_facts(self):
@@ -840,33 +851,35 @@ class ProcessDomain:
         try:
             lease.start_launch(argv, os.fspath(cwd) if cwd is not None else os.getcwd(),
                                dict(os.environ) if env is None else dict(env), payload)
-
-            now = time.monotonic()
             command_deadline = started + timeout if timeout is not None else math.inf
-            launch_timeout = min(command_deadline, self.deadline) - now
-            if launch_timeout <= 0:
-                record["overall_expired"] = True
-                lease.cancel.set()
-                raise OverallDeadlineExceeded("Overall work deadline expired during launch")
-
-            ready = lease.wait_ready(launch_timeout)
-            if not ready:
+            while True:
                 now = time.monotonic()
                 if now >= self.deadline:
                     record["overall_expired"] = True
+                    lease.cancel.set()
                     raise OverallDeadlineExceeded("Overall work deadline expired during launch")
-                else:
+                if timeout is not None and now >= command_deadline:
                     record["timed_out"] = True
+                    lease.cancel.set()
                     raise subprocess.TimeoutExpired(argv, timeout)
+                effective_deadline = min(command_deadline, self.deadline)
+                if lease.wait_ready(effective_deadline):
+                    break
 
             # All bootstrap admission waits are explicit and deadline-bounded.
-            if not lease.start_io(payload, capture_output, min(command_deadline, self.deadline)):
-                if time.monotonic() >= self.deadline:
+            while True:
+                now = time.monotonic()
+                if now >= self.deadline:
                     record["overall_expired"] = True
+                    lease.cancel.set()
                     raise OverallDeadlineExceeded("Overall work deadline expired during IO adoption")
-                record["timed_out"] = True
-                raise subprocess.TimeoutExpired(argv, timeout)
-
+                if timeout is not None and now >= command_deadline:
+                    record["timed_out"] = True
+                    lease.cancel.set()
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                effective_deadline = min(command_deadline, self.deadline)
+                if lease.start_io(payload, capture_output, effective_deadline):
+                    break
             observed = set()
             observer_bytes = 0
             while True:

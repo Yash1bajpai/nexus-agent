@@ -257,6 +257,8 @@ def test_recovery_does_not_bypass_existing_edit_guards(tmp_path, monkeypatch, op
     path = tmp_path / "example.py"
     original = "def keep():\n\treturn 1\n"
     path.write_text(original, encoding="utf-8")
+    original_bytes = path.read_bytes()
+    original_text = original_bytes.decode("utf-8")
     replacement = {
         "syntax": "def keep(:\n\treturn 2\n",
         "removal": "def other():\n\treturn 2\n",
@@ -269,7 +271,7 @@ def test_recovery_does_not_bypass_existing_edit_guards(tmp_path, monkeypatch, op
         path.with_name("example.py.bak").symlink_to(outside)
 
     first = _edit(operation, "example.py", original, replacement)
-    assert _raw_data(first) == original
+    assert _raw_data(first) == original_text
     second = _edit(operation, "example.py", original, replacement)
 
     assert second.startswith("ERROR:"), second
@@ -279,7 +281,7 @@ def test_recovery_does_not_bypass_existing_edit_guards(tmp_path, monkeypatch, op
         assert "user has not approved" in second
     else:
         assert "Permission denied" in second
-    assert path.read_bytes() == original.encode("utf-8")
+    assert path.read_bytes() == original_bytes
     assert outside.read_text(encoding="utf-8") == "do not touch"
     assert T._USER_INTENT == ""
     assert T._REMOVAL_APPROVED == set()

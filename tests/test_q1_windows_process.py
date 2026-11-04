@@ -667,6 +667,63 @@ def test_caller_waits_for_actual_launcher_exit_within_existing_budget(tmp_path, 
     assert d.records[0]["cleanup"]["launcher_joined"]
     assert d.records[0]["cleanup"]["confirmed"]
     assert d._active is None
+def test_early_event_wait_false_does_not_cancel_or_fail_before_deadline(tmp_path, monkeypatch):
+    """Early or spurious False from Event.wait must not cancel or abort launch before deadline."""
+    api = FakeAPI()
+    d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 1.0, platform="nt", api=api)
+
+    original_wait = threading.Event.wait
+    wait_calls = []
+
+    def spurious_first_wait(self, timeout=None):
+        wait_calls.append(timeout)
+        if len(wait_calls) == 1:
+            return False  # Spurious wake before deadline
+        return original_wait(self, timeout)
+
+    monkeypatch.setattr(threading.Event, "wait", spurious_first_wait)
+    res = d.run(["synthetic"], capture_output=True)
+    assert res.stdout == b"stdout"
+    assert len(wait_calls) >= 2
+    assert d._active is None
+
+
+def test_early_wait_ready_false_without_timeout_raises_overall_deadline_not_timeout_expired_none(tmp_path, monkeypatch):
+    """When timeout=None, deadline expiration must raise OverallDeadlineExceeded, never TimeoutExpired(argv, None)."""
+    api = FakeAPI()
+    d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 0.05, platform="nt", api=api)
+
+    def hung_launch(owner, argv, cwd, env):
+        api.handle(owner, "process")
+        api.handle(owner, "thread")
+        owner.pid = 321
+        time.sleep(0.1)  # Sleep past domain deadline without signaling ready
+
+    monkeypatch.setattr(api, "create_into", hung_launch)
+    with pytest.raises(q1.OverallDeadlineExceeded):
+        d.run(["synthetic"], timeout=None)
+    record = d.records[0]
+    assert record["overall_expired"] is True
+    assert record["timed_out"] is False
+
+
+def test_individual_timeout_shorter_than_overall_deadline_raises_timeout_expired_with_timeout_value(tmp_path, monkeypatch):
+    api = FakeAPI()
+    d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 10.0, platform="nt", api=api)
+
+    def slow_launch(owner, argv, cwd, env):
+        api.handle(owner, "process")
+        api.handle(owner, "thread")
+        owner.pid = 321
+        time.sleep(0.08)  # Exceeds individual timeout (0.03), well within overall deadline (10.0)
+
+    monkeypatch.setattr(api, "create_into", slow_launch)
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        d.run(["synthetic"], timeout=0.03)
+    assert raised.value.timeout == 0.03
+    record = d.records[0]
+    assert record["timed_out"] is True
+    assert record["overall_expired"] is False
 
 
 
@@ -689,6 +746,67 @@ def test_cleanup_second_cancellation_preserves_original_and_unknown_owner(tmp_pa
     assert d._active.handles
     assert d.records[0]["cleanup"] == {"confirmed": False, "errors": ["cleanup_KeyboardInterrupt"]}
     assert actual_cleanup(d._active)["confirmed"]
+def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
+    """Portable check of the bounded diagnostic recording companion with append-time bounding."""
+    import psutil
+    api = FakeAPI()
+    observed_facts = []
+    MAX_BYTES = 8192
+    bytes_used = [2]
+    cap_exceeded = [False]
+
+    def diagnostic_observer(members):
+        for m in members:
+            pid = m.get("pid")
+            create_time = None
+            is_in_job = None
+            status = "missing_UNKNOWN"
+            try:
+                p = psutil.Process(pid)
+                create_time = p.create_time()
+                status = "owned_active" if p.is_running() else "terminated"
+                is_in_job = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                status = "missing_UNKNOWN"
+                is_in_job = False
+
+            entry = {
+                "pid": pid,
+                "create_time": create_time,
+                "is_in_job": is_in_job,
+                "status": status,
+                "observed_at": time.monotonic(),
+            }
+            entry_bytes = len(json.dumps(entry, ensure_ascii=True).encode("utf-8")) + 2
+            if bytes_used[0] + entry_bytes <= MAX_BYTES:
+                observed_facts.append(entry)
+                bytes_used[0] += entry_bytes
+            else:
+                cap_exceeded[0] = True
+        return {"members": members}
+
+    d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 5.0, platform="nt", api=api, observer=diagnostic_observer)
+    result = d.run(["synthetic"], capture_output=True)
+    assert result.stdout == b"stdout"
+    assert len(observed_facts) >= 1
+    assert observed_facts[0]["pid"] == 321
+    assert observed_facts[0]["status"] in ("owned_active", "missing_UNKNOWN")
+
+    # Exercise the REAL adapter logic with an actual non-existent / inaccessible PID
+    diagnostic_observer([{"pid": 99999999}])
+    assert len(observed_facts) >= 2
+    missing_entry = observed_facts[-1]
+    assert missing_entry["pid"] == 99999999
+    assert missing_entry["status"] == "missing_UNKNOWN"
+    assert missing_entry["create_time"] is None
+    assert missing_entry["is_in_job"] is False
+
+    # Exercise append-time bounding: flood with members and verify bound is enforced AT APPEND TIME
+    flood_members = [{"pid": 10000000 + i} for i in range(500)]
+    diagnostic_observer(flood_members)
+    assert cap_exceeded[0] is True
+    assert bytes_used[0] <= MAX_BYTES
+    assert len(json.dumps(observed_facts).encode("utf-8")) <= MAX_BYTES
 
 
 @pytest.mark.skipif(os.name != "posix", reason="portable POSIX transport test, not native Windows proof")
@@ -901,3 +1019,62 @@ class TestNativeWindows:
                            Path(d.records[0]["stdout"]["path"]).read_text().splitlines()}
         assert descendant_pids <= observed
         assert len(observed) >= 3
+
+    def test_owned_member_observer_diagnostic_companion(self, tmp_path):
+        """Diagnostic companion recording creation timestamps and handle states alongside mandatory observer."""
+        import psutil
+        observed_diagnostics = []
+        MAX_BYTES = 8192
+        bytes_used = [2]
+        cap_exceeded = [False]
+
+        def observer(members):
+            for fact in members:
+                pid = fact.get("pid")
+                create_time = None
+                is_in_job = None
+                status = "missing_UNKNOWN"
+                try:
+                    p = psutil.Process(pid)
+                    create_time = p.create_time()
+                    status = "owned_active" if p.is_running() else "terminated"
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    status = "missing_UNKNOWN"
+
+                # Query IsProcessInJob on native Windows
+                if hasattr(psutil, "WINDOWS") and psutil.WINDOWS and d._active and d._active.handles.get("job"):
+                    import ctypes
+                    from ctypes import wintypes
+                    job_h = d._active.handles["job"]
+                    h = ctypes.windll.kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)
+                    if h:
+                        try:
+                            in_job = wintypes.BOOL()
+                            if ctypes.windll.kernel32.IsProcessInJob(h, job_h, ctypes.byref(in_job)):
+                                is_in_job = bool(in_job.value)
+                        finally:
+                            ctypes.windll.kernel32.CloseHandle(h)
+                    else:
+                        status = "inaccessible_UNKNOWN"
+
+                entry = {
+                    "pid": pid,
+                    "create_time": create_time,
+                    "is_in_job": is_in_job,
+                    "status": status,
+                    "observed_at": time.monotonic(),
+                }
+                entry_bytes = len(json.dumps(entry, ensure_ascii=True).encode("utf-8")) + 2
+                if bytes_used[0] + entry_bytes <= MAX_BYTES:
+                    observed_diagnostics.append(entry)
+                    bytes_used[0] += entry_bytes
+                else:
+                    cap_exceeded[0] = True
+
+        d = domain(tmp_path, observer=observer)
+        d.run(python(self.tree_source()), capture_output=True)
+        self.assert_members_dead(d.records[0])
+        assert len(observed_diagnostics) >= 3
+        assert all(item["status"] in ("owned_active", "terminated", "missing_UNKNOWN", "inaccessible_UNKNOWN") for item in observed_diagnostics)
+        assert bytes_used[0] <= MAX_BYTES
+        assert len(json.dumps(observed_diagnostics).encode("utf-8")) <= MAX_BYTES
