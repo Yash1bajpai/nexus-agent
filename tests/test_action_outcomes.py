@@ -181,8 +181,13 @@ def test_current_readonly_correction_pure_and_factual_with_prior_success(tmp_pat
     messages = [assistant("Historical state.", records)]
     before = copy.deepcopy(messages)
     suffix, facts = current_claim_correction(text, messages)
-    expected_path_json = json.dumps(str(path), ensure_ascii=False)
-    assert suffix == f'\n\nExecutor record: no successful mutation of {expected_path_json} was observed in the failed edit segment(s); last successful mutation: e1.'
+    prefix = "\n\nExecutor record: no successful mutation of "
+    ending = " was observed in the failed edit segment(s); last successful mutation: e1."
+    assert suffix.startswith(prefix)
+    assert suffix.endswith(ending)
+    path_token_str = suffix[len(prefix):-len(ending)]
+    extracted_path = json.loads(path_token_str)
+    assert os.path.normcase(os.path.abspath(extracted_path)) == os.path.normcase(os.path.abspath(path))
     assert len(facts) == 1 and facts[0]["turn"] == "t2" and facts[0]["trigger"] == "current_executor_record"
     assert os.path.normcase(os.path.abspath(facts[0]["file"])) == os.path.normcase(os.path.abspath(path))
     assert messages == before

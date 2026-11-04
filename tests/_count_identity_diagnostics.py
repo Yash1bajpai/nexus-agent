@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import stat
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -17,29 +16,46 @@ class CountIdentityRecorder:
 
     MAX_BYTES = 8192
 
-    def __init__(self, workspace_root: Optional[Path] = None):
-        self.workspace_root = workspace_root.resolve() if workspace_root is not None else None
+    def __init__(self, workspace_root: Optional[Path | str] = None):
+        if workspace_root is not None:
+            self.workspace_root = os.path.normpath(os.path.abspath(os.fspath(workspace_root))).replace("\\", "/")
+        else:
+            self.workspace_root = None
         self.events: List[Dict[str, Any]] = []
-        self.bytes_used: int = 2
         self.cap_exceeded: bool = False
         self.first_mismatch: Optional[Dict[str, Any]] = None
 
     def _append_event(self, event: Dict[str, Any]) -> None:
-        raw = json.dumps(event, ensure_ascii=True).encode("utf-8")
-        if self.bytes_used + len(raw) + 2 <= self.MAX_BYTES:
+        if self.cap_exceeded:
+            return
+        candidate_events = self.events + [event]
+        candidate_payload = {
+            "events": candidate_events,
+            "first_mismatch": self.first_mismatch,
+            "cap_exceeded": False,
+        }
+        raw_size = len(json.dumps(candidate_payload, ensure_ascii=True).encode("utf-8"))
+        if raw_size <= self.MAX_BYTES:
             self.events.append(event)
-            self.bytes_used += len(raw) + 2
         else:
             self.cap_exceeded = True
+
     def _sanitize_path(self, path: Any) -> str:
-        p = Path(path)
+        """Pure lexical path sanitization; zero filesystem stat/resolve/timing calls."""
+        if path is None:
+            return ""
+        s = os.fspath(path)
         try:
-            resolved = p.resolve()
-            if self.workspace_root is not None and resolved.is_relative_to(self.workspace_root):
-                return str(resolved.relative_to(self.workspace_root)).replace("\\", "/")
-            return p.name
+            norm = os.path.normpath(os.path.abspath(s)).replace("\\", "/")
+            if self.workspace_root:
+                ws = self.workspace_root
+                if norm.startswith(ws + "/"):
+                    return norm[len(ws) + 1:]
+                elif norm == ws:
+                    return "."
+            return os.path.basename(norm) or s
         except Exception:
-            return p.name
+            return str(path)
 
     @staticmethod
     def _tuple_dict(t: Optional[Tuple]) -> Optional[Dict[str, Any]]:
@@ -54,7 +70,7 @@ class CountIdentityRecorder:
             "st_ctime_ns": t[5],
         }
 
-    def record_open(self, target_path: Any, initial_stat: Tuple, fd_fstat: Tuple, match: bool) -> None:
+    def record_open(self, target_path: Any, initial_stat: Optional[Tuple], fd_fstat: Optional[Tuple], match: bool) -> None:
         event = {
             "phase": "open.initial_vs_fstat",
             "target": self._sanitize_path(target_path),
@@ -76,7 +92,7 @@ class CountIdentityRecorder:
     def record_check_identity(self, phase: str, fd: int, original: Any, target: Any,
                               actual: Any, actual_allowed: Any, original_allowed: Any,
                               path_matches: Dict[str, bool],
-                              before: Tuple,
+                              before: Optional[Tuple],
                               fd_stat: Optional[Tuple] = None,
                               target_stat: Optional[Tuple] = None,
                               original_stat: Optional[Tuple] = None,
@@ -118,11 +134,104 @@ class CountIdentityRecorder:
         self._append_event(event)
 
     def to_dict(self) -> Dict[str, Any]:
-        result = {
+        return {
             "events": self.events,
             "first_mismatch": self.first_mismatch,
+            "cap_exceeded": self.cap_exceeded,
         }
-        serialized = json.dumps(result, ensure_ascii=True)
-        if self.cap_exceeded:
-            result["cap_exceeded"] = True
-        return result
+
+
+class DiagnosticWorkerWrapper:
+    """Test-only passive wrapper around text_count_worker identity checks.
+
+    Zero production changes. Zero extra stat/fstat calls.
+    Preserves exact order, returns, exceptions, receipts, and deadlines.
+    """
+
+    def __init__(self, recorder: CountIdentityRecorder, monkeypatch=None):
+        self.recorder = recorder
+        self.monkeypatch = monkeypatch
+        self._patches: List[Tuple[Any, str, Any]] = []
+
+    def install(self, worker_module: Any) -> None:
+        recorder = self.recorder
+        orig_check_identity = worker_module._check_identity
+        orig_open_validated = worker_module._open_validated
+
+        def wrapped_open_validated(path):
+            orig_reliable = worker_module._reliable_identity
+            tuples_seen = []
+
+            def capturing_reliable(info):
+                res = orig_reliable(info)
+                tuples_seen.append(res)
+                if len(tuples_seen) == 2:
+                    # Both initial stat and fd fstat are captured before _check_identity runs
+                    initial = tuples_seen[0]
+                    before = tuples_seen[1]
+                    recorder.record_open(path, initial, before, match=(initial == before))
+                return res
+
+            worker_module._reliable_identity = capturing_reliable
+            try:
+                return orig_open_validated(path)
+            finally:
+                worker_module._reliable_identity = orig_reliable
+
+        def wrapped_check_identity(fd, original, target, before):
+            orig_reliable = worker_module._reliable_identity
+            check_tuples = []
+
+            def capturing_check_reliable(info):
+                res = orig_reliable(info)
+                check_tuples.append(res)
+                return res
+
+            worker_module._reliable_identity = capturing_check_reliable
+            try:
+                orig_check_identity(fd, original, target, before)
+                recorder.record_check_identity(
+                    phase="check_identity.pass",
+                    fd=fd,
+                    original=original,
+                    target=target,
+                    actual=target,
+                    actual_allowed=target,
+                    original_allowed=target,
+                    path_matches={"target": True},
+                    before=before,
+                    identity_match=True
+                )
+            except Exception:
+                recorder.record_check_identity(
+                    phase="check_identity.refusal",
+                    fd=fd,
+                    original=original,
+                    target=target,
+                    actual=None,
+                    actual_allowed=None,
+                    original_allowed=None,
+                    path_matches={"target": False},
+                    before=before,
+                    fd_stat=check_tuples[0] if len(check_tuples) > 0 else None,
+                    target_stat=check_tuples[1] if len(check_tuples) > 1 else None,
+                    original_stat=check_tuples[2] if len(check_tuples) > 2 else None,
+                    identity_match=False
+                )
+                raise
+            finally:
+                worker_module._reliable_identity = orig_reliable
+
+        if self.monkeypatch:
+            self.monkeypatch.setattr(worker_module, "_open_validated", wrapped_open_validated)
+            self.monkeypatch.setattr(worker_module, "_check_identity", wrapped_check_identity)
+        else:
+            self._patches.append((worker_module, "_open_validated", orig_open_validated))
+            self._patches.append((worker_module, "_check_identity", orig_check_identity))
+            worker_module._open_validated = wrapped_open_validated
+            worker_module._check_identity = wrapped_check_identity
+
+    def uninstall(self) -> None:
+        for mod, attr, orig in self._patches:
+            setattr(mod, attr, orig)
+        self._patches.clear()

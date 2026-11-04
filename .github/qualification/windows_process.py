@@ -447,27 +447,30 @@ class _Lease:
             info["complete"].set()
 
     def start_io(self, payload, capture, deadline):
-        targets = [("stdout", self.drain, ("stdout", capture)),
-                   ("stderr", self.drain, ("stderr", capture))]
-        if payload is not None:
-            targets.append(("stdin", self.feed, (payload,)))
-        for name, target, args in targets:
-            with self.lock:
-                if self.cleaning or self.cancel.is_set():
-                    raise Q1LifecycleError("Cleanup won before IO adoption")
-                info = {"start_attempted": False, "entered": threading.Event(),
-                        "complete": threading.Event(), "joined": False,
-                        "start_interrupted": False}
-                info["thread"] = threading.Thread(
-                    target=self._io_entry, args=(info, target, args),
-                    name="q1-io-" + name, daemon=True)
-                self.io_threads.append(info)
-                info["start_attempted"] = True
-            try:
-                _start_thread_without_bootstrap_wait(info["thread"])
-            except BaseException:
-                info["start_interrupted"] = True
-                raise
+        if not getattr(self, "_io_started", False):
+            self._io_started = True
+            targets = [("stdout", self.drain, ("stdout", capture)),
+                       ("stderr", self.drain, ("stderr", capture))]
+            if payload is not None:
+                targets.append(("stdin", self.feed, (payload,)))
+            for name, target, args in targets:
+                with self.lock:
+                    if self.cleaning or self.cancel.is_set():
+                        raise Q1LifecycleError("Cleanup won before IO adoption")
+                    info = {"start_attempted": False, "entered": threading.Event(),
+                            "complete": threading.Event(), "joined": False,
+                            "start_interrupted": False}
+                    info["thread"] = threading.Thread(
+                        target=self._io_entry, args=(info, target, args),
+                        name="q1-io-" + name, daemon=True)
+                    self.io_threads.append(info)
+                    info["start_attempted"] = True
+                try:
+                    _start_thread_without_bootstrap_wait(info["thread"])
+                except BaseException:
+                    info["start_interrupted"] = True
+                    raise
+        for info in self.io_threads:
             while True:
                 remaining = deadline - time.monotonic() if deadline is not None else None
                 wait_timeout = None if remaining is None else max(0.0, remaining)
@@ -867,19 +870,20 @@ class ProcessDomain:
                     break
 
             # All bootstrap admission waits are explicit and deadline-bounded.
-            while True:
+            if not lease.start_io(payload, capture_output, effective_deadline):
                 now = time.monotonic()
                 if now >= self.deadline:
                     record["overall_expired"] = True
                     lease.cancel.set()
                     raise OverallDeadlineExceeded("Overall work deadline expired during IO adoption")
-                if timeout is not None and now >= command_deadline:
+                elif timeout is not None and now >= command_deadline:
                     record["timed_out"] = True
                     lease.cancel.set()
                     raise subprocess.TimeoutExpired(argv, timeout)
-                effective_deadline = min(command_deadline, self.deadline)
-                if lease.start_io(payload, capture_output, effective_deadline):
-                    break
+                else:
+                    record["overall_expired"] = True
+                    lease.cancel.set()
+                    raise OverallDeadlineExceeded("Overall work deadline expired during IO adoption")
             observed = set()
             observer_bytes = 0
             while True:

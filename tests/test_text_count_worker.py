@@ -1018,7 +1018,7 @@ def test_cancelled_acknowledged_io_reaps_owned_worker(monkeypatch, private_worke
 
 
 def test_count_identity_diagnostics_passive_capture_and_stage_attribution(tmp_path):
-    """Diagnostic companion proves passive capture of consumed stat tuples and stage attribution."""
+    """Diagnostic companion proves passive capture of consumed stat tuples, stage attribution, and strict 8 KiB bound."""
     from tests._count_identity_diagnostics import CountIdentityRecorder
     recorder = CountIdentityRecorder(tmp_path)
     target = tmp_path / "sample.txt"
@@ -1039,5 +1039,75 @@ def test_count_identity_diagnostics_passive_capture_and_stage_attribution(tmp_pa
         "differing_fields": ["st_ino"],
     }
     data = recorder.to_dict()
-    assert len(json.dumps(data).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+    assert len(json.dumps(data, ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
 
+    # Exact repro from triage: flooding with repeated events must NEVER exceed 8192 bytes
+    r = CountIdentityRecorder(tmp_path)
+    for n in range(1, 100):
+        r.record_open("x" * n, t1, t1, True)
+        for i in range(10):
+            r.record_open("y" * n, t1, t1, True)
+        size = len(json.dumps(r.to_dict(), ensure_ascii=True).encode("utf-8"))
+        assert size <= 8192, f"Total serialized size {size} exceeded 8192 at n={n}"
+
+
+def test_count_identity_diagnostics_installed_worker_passive_wrapper(tmp_path, monkeypatch):
+    """DiagnosticWorkerWrapper captures consumed tuples from actual worker checks without extra stat calls."""
+    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
+    recorder = CountIdentityRecorder(tmp_path)
+    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
+    wrapper.install(worker)
+
+    target = tmp_path / "sample.txt"
+    target.write_text("hello world\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    fd, target_path, before = worker._open_validated("sample.txt")
+    try:
+        assert target_path == (tmp_path / "sample.txt").resolve()
+        assert len(recorder.events) >= 1
+        assert recorder.events[0]["phase"] == "open.initial_vs_fstat"
+        assert recorder.events[0]["match"] is True
+        assert recorder.first_mismatch is None
+
+        # Exercise _check_identity through the wrapper
+        worker._check_identity(fd, "sample.txt", target_path, before)
+        assert len(recorder.events) >= 2
+        assert recorder.events[1]["phase"] == "check_identity.pass"
+        assert recorder.events[1]["identity_match"] is True
+    finally:
+        os.close(fd)
+
+    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+
+
+def test_count_identity_diagnostics_installed_worker_mismatch_refusal(tmp_path, monkeypatch):
+    """DiagnosticWorkerWrapper captures actual refusal on stat mismatch with zero extra stat calls."""
+    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
+    recorder = CountIdentityRecorder(tmp_path)
+    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
+    wrapper.install(worker)
+
+    target = tmp_path / "sample.txt"
+    target.write_text("hello world\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    # Intercept _reliable_identity to simulate mismatch between initial and fstat
+    calls = []
+    orig_reliable = worker._reliable_identity
+
+    def mismatched_reliable(info):
+        calls.append(info)
+        res = orig_reliable(info)
+        if len(calls) == 2:  # On second call (fstat during open), shift mtime
+            return (res[0], res[1], res[2], res[3], res[4] + 9999, res[5])
+        return res
+
+    monkeypatch.setattr(worker, "_reliable_identity", mismatched_reliable)
+    with pytest.raises(worker._PathRefusal) as caught:
+        worker._open_validated("sample.txt")
+    assert caught.value.reason == "changed"
+    assert recorder.first_mismatch is not None
+    assert recorder.first_mismatch["phase"] == "open.initial_vs_fstat"
+    assert "st_mtime_ns" in recorder.first_mismatch["differing_fields"]
+    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES

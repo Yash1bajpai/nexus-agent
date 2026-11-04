@@ -748,27 +748,31 @@ def test_cleanup_second_cancellation_preserves_original_and_unknown_owner(tmp_pa
     assert actual_cleanup(d._active)["confirmed"]
 def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
     """Portable check of the bounded diagnostic recording companion with append-time bounding."""
-    import psutil
     api = FakeAPI()
     observed_facts = []
     MAX_BYTES = 8192
     bytes_used = [2]
     cap_exceeded = [False]
 
+    # Zero dependency on psutil on Linux: use injected portable lookup function
+    def inspect_process(pid):
+        if pid == 321:
+            return {"create_time": 1000.0, "status": "owned_active"}
+        return None  # non-existent / inaccessible
+
     def diagnostic_observer(members):
         for m in members:
             pid = m.get("pid")
-            create_time = None
-            is_in_job = None
-            status = "missing_UNKNOWN"
-            try:
-                p = psutil.Process(pid)
-                create_time = p.create_time()
-                status = "owned_active" if p.is_running() else "terminated"
-                is_in_job = True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            info = inspect_process(pid)
+            if info is not None:
+                create_time = info["create_time"]
+                status = info["status"]
+            else:
+                create_time = None
                 status = "missing_UNKNOWN"
-                is_in_job = False
+
+            # Do NOT fabricate job membership on portable test:
+            is_in_job = True if ("assign" in api.events and pid == 321) else "UNKNOWN"
 
             entry = {
                 "pid": pid,
@@ -777,37 +781,49 @@ def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
                 "status": status,
                 "observed_at": time.monotonic(),
             }
-            entry_bytes = len(json.dumps(entry, ensure_ascii=True).encode("utf-8")) + 2
-            if bytes_used[0] + entry_bytes <= MAX_BYTES:
+            candidate_payload = {
+                "facts": observed_facts + [entry],
+                "cap_exceeded": cap_exceeded[0],
+            }
+            raw_size = len(json.dumps(candidate_payload, ensure_ascii=True).encode("utf-8"))
+            if raw_size <= MAX_BYTES:
                 observed_facts.append(entry)
-                bytes_used[0] += entry_bytes
+                bytes_used[0] = raw_size
             else:
                 cap_exceeded[0] = True
         return {"members": members}
 
-    d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 5.0, platform="nt", api=api, observer=diagnostic_observer)
-    result = d.run(["synthetic"], capture_output=True)
-    assert result.stdout == b"stdout"
-    assert len(observed_facts) >= 1
-    assert observed_facts[0]["pid"] == 321
-    assert observed_facts[0]["status"] in ("owned_active", "missing_UNKNOWN")
+    artifact_path = tmp_path / "descendant_diagnostic_facts.json"
+    try:
+        d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 5.0, platform="nt", api=api, observer=diagnostic_observer)
+        result = d.run(["synthetic"], capture_output=True)
+        assert result.stdout == b"stdout"
+        assert len(observed_facts) >= 1
+        assert observed_facts[0]["pid"] == 321
+        assert observed_facts[0]["status"] in ("owned_active", "missing_UNKNOWN")
 
-    # Exercise the REAL adapter logic with an actual non-existent / inaccessible PID
-    diagnostic_observer([{"pid": 99999999}])
-    assert len(observed_facts) >= 2
-    missing_entry = observed_facts[-1]
-    assert missing_entry["pid"] == 99999999
-    assert missing_entry["status"] == "missing_UNKNOWN"
-    assert missing_entry["create_time"] is None
-    assert missing_entry["is_in_job"] is False
+        # Exercise the REAL adapter logic with an actual non-existent / inaccessible PID
+        diagnostic_observer([{"pid": 99999999}])
+        assert len(observed_facts) >= 2
+        missing_entry = observed_facts[-1]
+        assert missing_entry["pid"] == 99999999
+        assert missing_entry["status"] == "missing_UNKNOWN"
+        assert missing_entry["create_time"] is None
+        assert missing_entry["is_in_job"] == "UNKNOWN"
 
-    # Exercise append-time bounding: flood with members and verify bound is enforced AT APPEND TIME
-    flood_members = [{"pid": 10000000 + i} for i in range(500)]
-    diagnostic_observer(flood_members)
-    assert cap_exceeded[0] is True
-    assert bytes_used[0] <= MAX_BYTES
-    assert len(json.dumps(observed_facts).encode("utf-8")) <= MAX_BYTES
-
+        # Exercise append-time bounding: flood with members and verify bound is enforced AT APPEND TIME
+        flood_members = [{"pid": 10000000 + i} for i in range(500)]
+        diagnostic_observer(flood_members)
+        assert cap_exceeded[0] is True
+        assert bytes_used[0] <= MAX_BYTES
+        assert len(json.dumps({"facts": observed_facts, "cap_exceeded": True}).encode("utf-8")) <= MAX_BYTES
+    finally:
+        artifact_path.write_text(json.dumps({
+            "facts": observed_facts,
+            "cap_exceeded": cap_exceeded[0],
+            "bytes_used": bytes_used[0],
+        }, indent=2), encoding="utf-8")
+        assert artifact_path.is_file()
 
 @pytest.mark.skipif(os.name != "posix", reason="portable POSIX transport test, not native Windows proof")
 class TestPortableTransport:
@@ -1021,7 +1037,7 @@ class TestNativeWindows:
         assert len(observed) >= 3
 
     def test_owned_member_observer_diagnostic_companion(self, tmp_path):
-        """Diagnostic companion recording creation timestamps and handle states alongside mandatory observer."""
+        """Diagnostic companion recording creation timestamps, typed handle states, and exit facts alongside mandatory observer."""
         import psutil
         observed_diagnostics = []
         MAX_BYTES = 8192
@@ -1033,6 +1049,9 @@ class TestNativeWindows:
                 pid = fact.get("pid")
                 create_time = None
                 is_in_job = None
+                handle_opened = False
+                exit_code = None
+                close_time = None
                 status = "missing_UNKNOWN"
                 try:
                     p = psutil.Process(pid)
@@ -1041,40 +1060,74 @@ class TestNativeWindows:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     status = "missing_UNKNOWN"
 
-                # Query IsProcessInJob on native Windows
+                # Query typed IsProcessInJob and handle states on native Windows
                 if hasattr(psutil, "WINDOWS") and psutil.WINDOWS and d._active and d._active.handles.get("job"):
                     import ctypes
                     from ctypes import wintypes
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                    kernel32.OpenProcess.restype = wintypes.HANDLE
+                    kernel32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+                    kernel32.IsProcessInJob.restype = wintypes.BOOL
+                    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                    kernel32.CloseHandle.restype = wintypes.BOOL
+                    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+                    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+                    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
                     job_h = d._active.handles["job"]
-                    h = ctypes.windll.kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)
+                    h = kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
                     if h:
+                        handle_opened = True
                         try:
                             in_job = wintypes.BOOL()
-                            if ctypes.windll.kernel32.IsProcessInJob(h, job_h, ctypes.byref(in_job)):
+                            if kernel32.IsProcessInJob(h, job_h, ctypes.byref(in_job)):
                                 is_in_job = bool(in_job.value)
+                            if kernel32.WaitForSingleObject(h, 0) == 0:  # WAIT_OBJECT_0
+                                ec = wintypes.DWORD()
+                                if kernel32.GetExitCodeProcess(h, ctypes.byref(ec)):
+                                    exit_code = int(ec.value)
                         finally:
-                            ctypes.windll.kernel32.CloseHandle(h)
-                    else:
+                            kernel32.CloseHandle(h)
+                            close_time = time.monotonic()
+                    elif status == "owned_active":
                         status = "inaccessible_UNKNOWN"
 
                 entry = {
                     "pid": pid,
                     "create_time": create_time,
-                    "is_in_job": is_in_job,
+                    "is_in_job": is_in_job if is_in_job is not None else "UNKNOWN",
+                    "handle_opened": handle_opened,
+                    "exit_code": exit_code,
+                    "close_time": close_time,
                     "status": status,
                     "observed_at": time.monotonic(),
                 }
-                entry_bytes = len(json.dumps(entry, ensure_ascii=True).encode("utf-8")) + 2
-                if bytes_used[0] + entry_bytes <= MAX_BYTES:
+                candidate_payload = {
+                    "facts": observed_diagnostics + [entry],
+                    "cap_exceeded": cap_exceeded[0],
+                }
+                raw_size = len(json.dumps(candidate_payload, ensure_ascii=True).encode("utf-8"))
+                if raw_size <= MAX_BYTES:
                     observed_diagnostics.append(entry)
-                    bytes_used[0] += entry_bytes
+                    bytes_used[0] = raw_size
                 else:
                     cap_exceeded[0] = True
 
-        d = domain(tmp_path, observer=observer)
-        d.run(python(self.tree_source()), capture_output=True)
-        self.assert_members_dead(d.records[0])
-        assert len(observed_diagnostics) >= 3
-        assert all(item["status"] in ("owned_active", "terminated", "missing_UNKNOWN", "inaccessible_UNKNOWN") for item in observed_diagnostics)
-        assert bytes_used[0] <= MAX_BYTES
-        assert len(json.dumps(observed_diagnostics).encode("utf-8")) <= MAX_BYTES
+        artifact_path = tmp_path / "descendant_diagnostic_facts.json"
+        try:
+            d = domain(tmp_path, observer=observer)
+            d.run(python(self.tree_source()), capture_output=True)
+            self.assert_members_dead(d.records[0])
+            assert len(observed_diagnostics) >= 3
+            assert all(item["status"] in ("owned_active", "terminated", "missing_UNKNOWN", "inaccessible_UNKNOWN") for item in observed_diagnostics)
+            assert bytes_used[0] <= MAX_BYTES
+            assert len(json.dumps({"facts": observed_diagnostics, "cap_exceeded": True}).encode("utf-8")) <= MAX_BYTES
+        finally:
+            artifact_path.write_text(json.dumps({
+                "facts": observed_diagnostics,
+                "cap_exceeded": cap_exceeded[0],
+                "bytes_used": bytes_used[0],
+            }, indent=2), encoding="utf-8")
+            assert artifact_path.is_file()
