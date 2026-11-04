@@ -17,6 +17,7 @@ from nexus_agent_ai.agent.persistence import SQLiteMemory
 from nexus_agent_ai.agent.refusals import RefusalClass, execution_metadata
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, Tool, ToolCall
 from nexus_agent_ai.providers.messages import assistant_message
+from tests._count_identity_diagnostics import count_identity_diagnostics
 
 
 class ScriptedCountProvider(BaseProvider):

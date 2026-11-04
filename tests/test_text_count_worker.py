@@ -19,6 +19,7 @@ from nexus_agent_ai.agent import _workspace_paths as paths
 from nexus_agent_ai.agent import text_count_worker as worker
 from nexus_agent_ai.agent import tools
 from nexus_agent_ai.agent.text_count_limits import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_SCAN_BYTES
+from tests._count_identity_diagnostics import count_identity_diagnostics
 
 
 @pytest.fixture(autouse=True)
@@ -1017,167 +1018,144 @@ def test_cancelled_acknowledged_io_reaps_owned_worker(monkeypatch, private_worke
     assert_cleaned()
 
 
-def test_count_identity_diagnostics_passive_capture_and_stage_attribution(tmp_path):
-    """Diagnostic companion proves passive capture of consumed stat tuples, stage attribution, and strict 8 KiB bound."""
-    from tests._count_identity_diagnostics import CountIdentityRecorder
-    recorder = CountIdentityRecorder(tmp_path)
-    target = tmp_path / "sample.txt"
-    target.write_text("hello world")
-
-    t1 = (1, 100, 33188, 11, 1000, 1000)
-    t2 = (1, 100, 33188, 11, 1000, 1000)
-    recorder.record_open(target, t1, t2, match=True)
-    assert len(recorder.events) == 1
-    assert recorder.events[0]["match"] is True
-    assert recorder.first_mismatch is None
-
-    # Simulate mismatch on st_ino
-    t3 = (1, 101, 33188, 11, 1000, 1000)
-    recorder.record_open(target, t1, t3, match=False)
-    assert recorder.first_mismatch == {
-        "phase": "open.initial_vs_fstat",
-        "differing_fields": ["st_ino"],
-    }
-    data = recorder.to_dict()
-    assert len(json.dumps(data, ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
-
-    # Exact repro from triage: flooding with repeated events must NEVER exceed 8192 bytes
-    r = CountIdentityRecorder(tmp_path)
-    for n in range(1, 100):
-        r.record_open("x" * n, t1, t1, True)
-        for i in range(10):
-            r.record_open("y" * n, t1, t1, True)
-        size = len(json.dumps(r.to_dict(), ensure_ascii=True).encode("utf-8"))
-        assert size <= 8192, f"Total serialized size {size} exceeded 8192 at n={n}"
-
-
-def test_count_identity_diagnostics_installed_worker_passive_wrapper(tmp_path, monkeypatch):
-    """DiagnosticWorkerWrapper captures consumed tuples from actual worker checks without extra stat calls."""
-    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
-    recorder = CountIdentityRecorder(tmp_path)
-    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
-    wrapper.install(worker)
-
-    target = tmp_path / "sample.txt"
-    target.write_text("hello world\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-
-    fd, target_path, before = worker._open_validated("sample.txt")
-    try:
-        assert target_path == (tmp_path / "sample.txt").resolve()
-        assert len(recorder.events) >= 1
-        assert recorder.events[0]["phase"] == "open.initial_vs_fstat"
-        assert recorder.events[0]["match"] is True
-        assert recorder.first_mismatch is None
-
-        # Exercise _check_identity through the wrapper
-        worker._check_identity(fd, "sample.txt", target_path, before)
-        assert len(recorder.events) >= 2
-        assert recorder.events[1]["phase"] == "check_identity.pass"
-        assert recorder.events[1]["identity_match"] is True
-    finally:
-        os.close(fd)
-        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
-        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
-        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
-
-    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+@pytest.mark.parametrize("data", [b"a a\n", b"\xff", None])
+def test_diagnostic_child_preserves_actual_receipt_and_consumed_checks(tmp_path, data):
+    """Execute original worker bytes, not an in-process substitute for the child."""
+    from tests import _count_identity_diagnostics as diagnostic
+    if data is not None:
+        Path("sample.txt").write_bytes(data)
+    args = worker.validate_query("sample.txt", "a")
+    request = {"nonce": "a" * 32, "args": args}
+    wire = io.BytesIO()
+    worker._write_frame(wire, request, MAX_REQUEST_BYTES)
+    payload = wire.getvalue() + b"\x06"
+    actual_worker = os.path.abspath(worker.__file__)
+    original = [sys.executable, "-I", "-S", "-B", actual_worker]
+    artifact = tmp_path / "observed.json"
+    traced = [*original[:4], os.path.abspath(diagnostic.__file__), actual_worker, str(artifact)]
+    baseline = subprocess.run(original, input=payload, capture_output=True, timeout=5)
+    observed = subprocess.run(traced, input=payload, capture_output=True, timeout=5)
+    assert (observed.returncode, observed.stdout, observed.stderr) == (
+        baseline.returncode, baseline.stdout, baseline.stderr)
+    raw = artifact.read_bytes()
+    assert len(raw) <= diagnostic.MAX_BYTES
+    facts = json.loads(raw)
+    assert facts["worker_sha256"] == hashlib.sha256(Path(actual_worker).read_bytes()).hexdigest()
+    phases = facts["phases"]
+    if data is None:
+        assert phases[0]["status"] == "ERROR"
+        assert phases[0]["error"] == "FileNotFoundError"
+        assert phases[1]["status"] == phases[2]["status"] == "NOT_REACHED"
+        assert phases[3]["reason"] == "not_found"
+    else:
+        assert phases[0]["stats"][0]["consumed"]["st_size"] == len(data)
+        assert phases[0]["checks"][0]["actual_equals_target"] is True
+        assert phases[1]["actual_allowed_equals_target"] is True
+        assert phases[3]["receipt_status"] == ("complete" if data == b"a a\n" else "incomplete")
+        assert phases[3]["reason"] == (None if data == b"a a\n" else "decode_error")
+        assert len(phases[1]["stats"]) == 3
 
 
-def test_count_identity_diagnostics_installed_worker_mismatch_refusal(tmp_path, monkeypatch):
-    """DiagnosticWorkerWrapper captures actual refusal on stat mismatch with zero extra stat calls."""
-    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
-    recorder = CountIdentityRecorder(tmp_path)
-    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
-    wrapper.install(worker)
-
-    target = tmp_path / "sample.txt"
-    target.write_text("hello world\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-
-    # Intercept _reliable_identity to simulate mismatch between initial and fstat
+def test_identity_trace_preserves_short_circuit_stat_order_and_exception(tmp_path, monkeypatch):
+    from tests._count_identity_diagnostics import WorkerTrace
+    Path("sample.txt").write_bytes(b"a")
+    fd, target, before = worker._open_validated("sample.txt")
+    Path("sample.txt").write_bytes(b"changed")
     calls = []
-    orig_reliable = worker._reliable_identity
+    real_stat, real_fstat = os.stat, os.fstat
 
-    def mismatched_reliable(info):
-        calls.append(info)
-        res = orig_reliable(info)
-        if len(calls) == 2:  # On second call (fstat during open), shift mtime
-            return (res[0], res[1], res[2], res[3], res[4] + 9999, res[5])
-        return res
+    def logged_stat(*args, **kwargs):
+        calls.append("stat")
+        return real_stat(*args, **kwargs)
 
-    monkeypatch.setattr(worker, "_reliable_identity", mismatched_reliable)
+    def logged_fstat(*args, **kwargs):
+        calls.append("fstat")
+        return real_fstat(*args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", logged_stat)
+    monkeypatch.setattr(os, "fstat", logged_fstat)
     try:
-        with pytest.raises(worker._PathRefusal) as caught:
-            worker._open_validated("sample.txt")
-        assert caught.value.reason == "changed"
-        assert recorder.first_mismatch is not None
-        assert recorder.first_mismatch["phase"] == "open.initial_vs_fstat"
-        assert "st_mtime_ns" in recorder.first_mismatch["differing_fields"]
-    finally:
-        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
-        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
-        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
-    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
-
-
-def test_count_identity_diagnostics_check_identity_path_mismatch_refusal(tmp_path, monkeypatch):
-    """DiagnosticWorkerWrapper captures path mismatch in check_identity without extra stat calls."""
-    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
-    recorder = CountIdentityRecorder(tmp_path)
-    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
-    wrapper.install(worker)
-
-    target = tmp_path / "sample.txt"
-    target.write_text("hello world\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-
-    fd, target_path, before = worker._open_validated("sample.txt")
-    try:
-        monkeypatch.setattr(worker, "_opened_path", lambda f: tmp_path / "other.txt")
-        with pytest.raises(worker._PathRefusal) as caught:
-            worker._check_identity(fd, "sample.txt", target_path, before)
-        assert caught.value.reason == "changed"
-        assert recorder.first_mismatch is not None
-        assert recorder.first_mismatch["phase"] == "check_identity.refusal"
+        with pytest.raises(worker._PathRefusal) as baseline:
+            worker._check_identity(fd, "sample.txt", target, before)
+        baseline_calls = list(calls)
+        calls.clear()
+        capture = WorkerTrace(worker.__file__)
+        with capture, pytest.raises(worker._PathRefusal) as observed:
+            worker._check_identity(fd, "sample.txt", target, before)
+        assert observed.value.reason == baseline.value.reason == "changed"
+        assert calls == baseline_calls
+        check = capture.payload["phases"][1]
+        assert check["status"] == "ERROR"
+        assert len(check["stats"]) == 1  # Later stat predicates were short-circuited.
+        assert check["stats"][0]["consumed"]["st_size"] == 7
+        error = PermissionError("sentinel")
+        monkeypatch.setattr(worker, "_opened_path", lambda fd: (_ for _ in ()).throw(error))
+        with WorkerTrace(worker.__file__) as failed, pytest.raises(PermissionError) as raised:
+            worker._check_identity(fd, "sample.txt", target, before)
+        assert raised.value is error
+        assert failed.payload["phases"][1]["actual_equals_target"] == "NOT_REACHED"
     finally:
         os.close(fd)
-        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
-        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
-        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
-    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
 
 
-def test_count_identity_diagnostics_check_identity_stat_mismatch_refusal(tmp_path, monkeypatch):
-    """DiagnosticWorkerWrapper captures stat mismatch in check_identity recheck without extra stat calls."""
-    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
-    recorder = CountIdentityRecorder(tmp_path)
-    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
-    wrapper.install(worker)
+def test_identity_trace_caps_final_envelope_and_retains_not_reached(tmp_path):
+    from tests._count_identity_diagnostics import MAX_BYTES, WorkerTrace
+    capture = WorkerTrace(worker.__file__)
+    capture._save(0, {"phase": "open", "status": "ERROR", "values": [1] * MAX_BYTES})
+    artifact = tmp_path / "bounded.json"
+    capture.write(artifact)
+    raw = artifact.read_bytes()
+    assert len(raw) <= MAX_BYTES
+    assert json.loads(raw)["cap_exceeded"] is True
+    phases = json.loads(raw)["phases"]
+    assert phases[0]["status"] == "OMITTED_CAP"
+    assert all(phase["status"] == "NOT_REACHED" for phase in phases[1:])
 
-    target = tmp_path / "sample.txt"
-    target.write_text("hello world\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
 
-    fd, target_path, before = worker._open_validated("sample.txt")
-    try:
-        different_before = (before[0], before[1], before[2], before[3], before[4] + 1234, before[5])
-        with pytest.raises(worker._PathRefusal) as caught:
-            worker._check_identity(fd, "sample.txt", target_path, different_before)
-        assert caught.value.reason == "changed"
-        assert recorder.first_mismatch is not None
-        assert recorder.first_mismatch["phase"] == "check_identity.refusal"
-    finally:
-        os.close(fd)
-        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
-        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
-        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
-    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+def test_diagnostic_launcher_matches_windows_lexical_case_and_separator_aliases(tmp_path, monkeypatch):
+    import ntpath
+    from tests._count_identity_diagnostics import _prepare_worker_launch
+    script = r"d:/SITE/agent/temporary/../TEXT_COUNT_WORKER.PY"
+    installed = r"D:\site\agent\text_count_worker.py"
+    argv = ["python.exe", "-I", "-S", "-B", script]
+    artifact = tmp_path / "matched.json"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("launcher matching probed the filesystem")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", forbidden)
+        patch.setattr(os, "lstat", forbidden)
+        patch.setattr(Path, "resolve", forbidden)
+        actual = _prepare_worker_launch(argv, installed, "diagnostic-helper.py", artifact, paths=ntpath)
+    assert actual == [*argv[:4], "diagnostic-helper.py", script, str(artifact)]
+    assert not artifact.with_suffix(".unmatched.json").exists()
+
+
+@pytest.mark.parametrize("flags,script,reason", [
+    (["-I", "-S", "-B"], r"E:\site\agent\text_count_worker.py", "path_mismatch"),
+    (["-I", "-S", "-X"], r"D:\site\agent\text_count_worker.py", "argv_shape"),
+])
+def test_diagnostic_launcher_records_unmatched_worker_without_changing_launch(tmp_path, flags, script, reason):
+    import ntpath
+    from tests._count_identity_diagnostics import MAX_BYTES, _prepare_worker_launch
+    argv = ["python.exe", *flags, script]
+    artifact = tmp_path / "invocation.json"
+    actual = _prepare_worker_launch(
+        argv, r"D:\site\agent\text_count_worker.py", "diagnostic-helper.py", artifact, paths=ntpath)
+    assert actual is argv
+    marker = artifact.with_suffix(".unmatched.json").read_bytes()
+    assert json.loads(marker) == {"status": "UNMATCHED_WORKER_LAUNCH", "reason": reason}
+    assert len(marker) <= MAX_BYTES
+    assert not artifact.exists()
+
+
+def test_diagnostic_launcher_preserves_posix_case_distinction(tmp_path):
+    import posixpath
+    from tests._count_identity_diagnostics import _prepare_worker_launch
+    argv = ["python", "-I", "-S", "-B", "/Site/agent/text_count_worker.py"]
+    artifact = tmp_path / "posix.json"
+    actual = _prepare_worker_launch(
+        argv, "/site/agent/text_count_worker.py", "diagnostic-helper.py", artifact, paths=posixpath)
+    assert actual is argv
+    assert json.loads(artifact.with_suffix(".unmatched.json").read_bytes())["reason"] == "path_mismatch"

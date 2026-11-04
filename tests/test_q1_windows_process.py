@@ -795,7 +795,7 @@ def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
 
     out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
     out_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = out_dir / "descendant_diagnostic_facts.json"
+    artifact_path = out_dir / "descendant-portable-diagnostic.json"
     try:
         d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 5.0, platform="nt", api=api, observer=diagnostic_observer)
         result = d.run(["synthetic"], capture_output=True)
@@ -823,7 +823,6 @@ def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
         payload = json.dumps({
             "facts": observed_facts,
             "cap_exceeded": cap_exceeded[0],
-            "bytes_used": bytes_used[0],
         }, ensure_ascii=True)
         assert len(payload.encode("utf-8")) <= MAX_BYTES
         artifact_path.write_text(payload, encoding="utf-8")
@@ -1117,7 +1116,7 @@ class TestNativeWindows:
 
         out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
         out_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = out_dir / "descendant_diagnostic_facts.json"
+        artifact_path = out_dir / "descendant-native-diagnostic.json"
         try:
             d = domain(tmp_path, observer=observer)
             d.run(python(self.tree_source()), capture_output=True)
@@ -1130,7 +1129,6 @@ class TestNativeWindows:
             payload = json.dumps({
                 "facts": observed_diagnostics,
                 "cap_exceeded": cap_exceeded[0],
-                "bytes_used": bytes_used[0],
             }, ensure_ascii=True)
             assert len(payload.encode("utf-8")) <= MAX_BYTES
             artifact_path.write_text(payload, encoding="utf-8")
