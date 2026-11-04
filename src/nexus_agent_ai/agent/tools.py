@@ -1800,7 +1800,7 @@ def execute_git_commit(message: str, approved: bool = False) -> str:
 
 READ_FILE_TOOL = Tool(
     name="read_file",
-    description="Read a file's complete contents before describing them or editing it. count_file_text reports only bounded physical counts, never contents or edit proof.",
+    description="Read a file's complete contents for filename inspection before describing them or editing it. count_file_text reports only bounded physical counts, never contents or edit proof.",
     input_schema={
         "type": "object",
         "properties": {
@@ -1960,13 +1960,13 @@ LIST_DIRECTORY_TOOL = Tool(
 
 RUN_CODE_TOOL = Tool(
     name="run_code",
-    description="Execute a snippet of Python code safely and capture stdout/stderr output. Use for calculation, testing, or verifying logic.",
+    description="Execute a snippet of Python code safely and capture stdout/stderr output. Takes a Python code snippet, not a filename or script path. To inspect a file use read_file; to run project tests use run_tests.",
     input_schema={
         "type": "object",
         "properties": {
             "code": {
                 "type": "string",
-                "description": "The Python code snippet to execute.",
+                "description": "The Python code snippet to execute directly (not a filename or script path).",
             },
             "language": {
                 "type": "string",

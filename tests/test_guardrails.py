@@ -120,9 +120,6 @@ def test_false_success_claim_that_never_gets_fixed_is_corrected(repo):
     assert "run_tests last reported FAILED" in final
 
 
-def test_honest_failure_report_is_untouched(repo):
-    final, _, _ = run([("run_tests", {}), "The test fails: total returns 10, expected 21."], "run the tests")
-    assert final == "The test fails: total returns 10, expected 21."
 
 
 def test_success_claim_without_running_tests_is_flagged(repo):

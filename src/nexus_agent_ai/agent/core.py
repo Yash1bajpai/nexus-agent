@@ -21,21 +21,25 @@ from ..cli import display
 from ..utils.config import estimate_cost
 from ..providers.messages import assistant_message
 from .outcomes import MAX_OUTCOME_FILES, fitted_claim_view, mutation_metadata, current_claim_correction
-from .refusals import RefusalClass, ToolResult, refusal, execution_result, execution_ran, execution_metadata
+from .refusals import (
+    RefusalClass, RunnerStatus, ToolResult, refusal, execution_result,
+    execution_ran, execution_metadata, runner_status,
+)
 from .recovery import project_recovery, recovery_excerpt
 from .result_budget import guard_tool_result
 from . import budget_diagnostics as diagnostics
 
 RULES_PROMPT = """RULES:
-1. Use read_file before describing a file's contents. count_file_text may answer
+1. Use read_file for filename inspection before describing a file's contents. count_file_text may answer
    bounded physical literal-count questions only; it gives no contents or edit proof.
    Never guess or assume file contents.
 2. When creating new files, use write_file. For existing files, use patch_file for literal
-   changes or edit_function/add_function for targeted Python function changes.
+   changes (target is literal OLD text copied from the file) or edit_function with function_name selector and full
+   new definition for targeted Python function changes.
    Read the file with read_file first; edits to unread or changed files are refused.
    patch_file.target is OLD text already in the file; replacement is the desired NEW text.
    If the target was not found, copy the exact target JSON from the error and retry once.
-3. When testing calculations or standalone algorithms, use run_code tool.
+3. When testing calculations or standalone algorithms, use run_code tool with a Python code snippet (not a filename or script path; use read_file for file inspection).
    When verifying bug fixes, test passes, or regressions, use run_tests tool to execute pytest.
 4. Use list_directory to understand project structure before project-level questions.
 5. Use git_status to inspect modified files or repository diffs.
@@ -1260,10 +1264,18 @@ class Agent:
                             # Inspection facts cannot overwrite/resolve an unrelated
                             # read/edit/test failure just because the path is the same.
                             error_key = (tool_call.name, error_key)
+                        r_status = runner_status(result, tool_call.name) if tool_call.name in ("run_code", "run_tests") else None
+                        runner_failed = (
+                            r_status is not None
+                            and not (
+                                (tool_call.name == "run_code" and r_status is RunnerStatus.COMPLETED)
+                                or (tool_call.name == "run_tests" and r_status is RunnerStatus.PASSED)
+                            )
+                        )
                         capacity_refused = getattr(result, "refusal_class", None) is RefusalClass.CAPACITY
                         count_refused = (tool_call.name == "count_file_text"
                                          and isinstance(getattr(result, "refusal_class", None), RefusalClass))
-                        if capacity_refused or count_refused or str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
+                        if runner_failed or capacity_refused or count_refused or str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
                             unresolved_tool[error_key] = tool_call.name
@@ -1271,8 +1283,13 @@ class Agent:
                         elif execution_ran(result) and not str(result).startswith("[SYSTEM"):
                             # A later success fixes the error only if it is the same tool succeeding, or a
                             # write. Reading the file is not a fix for a failed edit.
+                            # An unrelated success (including write_file at the same path) must not clear a runner failure.
                             failed_tool = unresolved_tool.get(error_key)
-                            if failed_tool is None or tool_call.name == failed_tool or tool_call.name in _WRITE_TOOLS:
+                            if failed_tool in ("run_code", "run_tests"):
+                                cleared = tool_call.name == failed_tool
+                            else:
+                                cleared = failed_tool is None or tool_call.name == failed_tool or tool_call.name in _WRITE_TOOLS
+                            if cleared:
                                 unresolved.pop(error_key, None)
                                 unresolved_tool.pop(error_key, None)
                                 unresolved_class.pop(error_key, None)
