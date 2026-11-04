@@ -35,6 +35,8 @@ HELPERS = (
     ".github/qualification/runner.py", ".github/qualification/windows_process.py",
     ".github/qualification/report.py", ".github/qualification/verify_candidate.py",
     ".github/workflows/q1-windows-qualification.yml",
+    ".github/qualification/verify_windows_diagnostics.py",
+    ".github/workflows/q1-windows-diagnostics.yml",
 )
 
 

@@ -1,0 +1,96 @@
+name: Q1 Windows TRACED diagnostics (not qualification)
+
+# Local construction is not authorization to push or execute this route.
+# The executor must recover original owner authority and verify live ref/run
+# absence immediately before a separately approved first ref-creation push.
+on:
+  push:
+    branches:
+      - qualification/q1-windows-fix-79ac-1845-d8f3a102
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/qualification/q1-windows-fix-79ac-1845-d8f3a102' &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.deleted == false && github.event.forced == false &&
+      github.event.after == github.sha && github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Establish fresh diagnostic root and absolute work deadline
+        timeout-minutes: 1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-diag'
+          if (Test-Path $root) { throw 'Diagnostic root is not fresh' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 110 * 60
+          @{ work_deadline_utc = $deadline; job_limit_minutes = 120; reserve_minutes = 10 } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $root 'deadline.json')
+      - name: Checkout exact event SHA and grounded ancestry
+        timeout-minutes: 3
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 6
+          persist-credentials: false
+      - name: Select Python 3.12
+        timeout-minutes: 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify new exact diagnostic candidate and creation event
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -I -B .github/qualification/verify_windows_diagnostics.py verify --source-root "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic candidate verification failed' }
+      - name: Build exact wheel and isolated declared extras environment
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-diag'
+          python -I -m pip wheel --no-deps --wheel-dir "$root/wheels" .
+          if ($LASTEXITCODE -ne 0) { throw 'Wheel build failed' }
+          $wheels = @(Get-ChildItem "$root/wheels/*.whl" -File)
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one fresh wheel' }
+          python -I -m venv "$root/venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Venv creation failed' }
+          & "$root/venv/Scripts/python.exe" -I -m pip install "$($wheels[0].FullName)[dev,cloud]"
+          if ($LASTEXITCODE -ne 0) { throw 'Declared wheel extras install failed' }
+      - name: Collect TRACED native diagnostic evidence only
+        timeout-minutes: 110
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-diag'
+          $wheel = (Get-ChildItem "$root/wheels/*.whl" -File).FullName
+          # Legacy native-gate status is raw harness evidence, not final qualification.
+          # This workflow has no consumer granting model execution or download.
+          & "$root/venv/Scripts/python.exe" -I -B "$env:GITHUB_WORKSPACE/.github/qualification/runner.py" native-gate --source-root "$env:GITHUB_WORKSPACE" --root "$root" --wheel "$wheel" --commit "$env:GITHUB_SHA" --deadline-file "$root/deadline.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Native diagnostics failed or are incomplete; retain failure artifacts' }
+      - name: Bound dedicated output for publication even on failure
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-diag'
+          python -I -B "$env:GITHUB_WORKSPACE/.github/qualification/verify_windows_diagnostics.py" collect --output-root "$root/output" --upload-root "$root/diagnostic-upload"
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic output is incomplete; bounded manifest retained' }
+      - name: Upload bounded diagnostic evidence (never qualification)
+        if: always()
+        timeout-minutes: 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: q1-windows-traced-diagnostics
+          path: ${{ runner.temp }}/q1-windows-diag/diagnostic-upload
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7

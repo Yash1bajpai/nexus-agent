@@ -134,6 +134,8 @@ def _result(receipt, executed):
 
 
 def _snapshot(info):
+    if sys.platform == "win32":
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
