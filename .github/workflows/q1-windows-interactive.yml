@@ -1,0 +1,124 @@
+name: Q1 Windows normal interactive core coverage
+
+# LOCAL PREPARATION ONLY. Before a separately approved push, executor must
+# validate current free/account/provider/model terms, exact independent B seal,
+# and LIVE unused literal ref/run. Never reuse consumed refs or rerun attempts.
+on:
+  push:
+    branches:
+      - qualification/q1-windows-interactive-ceee-20261104-2040-6c83e21f
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  interactive:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/qualification/q1-windows-interactive-ceee-20261104-2040-6c83e21f' &&
+      github.event.created == true && github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.deleted == false && github.event.forced == false &&
+      github.event.after == github.sha && github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Establish fresh root and absolute 110 minute work deadline
+        timeout-minutes: 1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
+          if (Test-Path $root) { throw 'B root is not fresh' }
+          New-Item -ItemType Directory $root | Out-Null
+          @{work_deadline_utc=([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()+110*60);job_limit_minutes=120;reserve_minutes=10} | ConvertTo-Json | Set-Content -Encoding utf8 "$root/deadline.json"
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 6
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        timeout-minutes: 3
+        with:
+          python-version: '3.12'
+      - name: Verify exact B candidate and creation event
+        timeout-minutes: 2
+        run: |
+          python -I -B .github/qualification/verify_windows_interactive.py verify --source-root "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw 'B candidate not sealed' }
+      - name: Require actual successful attempt-one A untraced run
+        id: native
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
+          gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/q1-windows-native.yml/runs?branch=qualification%2Fq1-windows-native-ceee-20261104-2015-f7a93c61&event=push&status=success&per_page=100" | Set-Content -Encoding utf8 "$root/a-runs.json"
+          if ($LASTEXITCODE -ne 0) { throw 'A run lookup failed; no model execution' }
+          $selected = python -I -B .github/qualification/verify_windows_interactive.py select-native-run --metadata "$root/a-runs.json" --repository "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'No exact successful A run; no model execution' }
+          $runId = ($selected | ConvertFrom-Json).run_id
+          "run_id=$runId" | Add-Content $env:GITHUB_OUTPUT
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 3
+        with:
+          name: q1-windows-untraced-native
+          path: ${{ runner.temp }}/q1-interactive/native-evidence
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.native.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify actual A gate before installing or starting model consumer
+        timeout-minutes: 2
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
+          python -I -B .github/qualification/verify_windows_interactive.py check-native --native-evidence "$root/native-evidence/native-gate.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Actual untraced A PASS absent; model forbidden' }
+      - name: Build fresh wheel and isolated declared environment
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
+          python -I -m pip wheel --no-deps --wheel-dir "$root/wheels" .
+          if ($LASTEXITCODE -ne 0) { throw 'Wheel build failed' }
+          $wheels = @(Get-ChildItem "$root/wheels/*.whl" -File)
+          if ($wheels.Count -ne 1) { throw 'Expected one fresh wheel' }
+          python -I -m venv "$root/venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh venv failed' }
+          & "$root/venv/Scripts/python.exe" -I -m pip install "$($wheels[0].FullName)[dev,cloud]" 'pywinpty==2.0.15'
+          if ($LASTEXITCODE -ne 0) { throw 'Declared dependencies install failed' }
+      - name: One normal interactive protocol without warmup or retry
+        timeout-minutes: 110
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
+          $wheel = (Get-ChildItem "$root/wheels/*.whl" -File).FullName
+          & "$root/venv/Scripts/python.exe" -I -B "$env:GITHUB_WORKSPACE/.github/qualification/interactive_core.py" run --source-root "$env:GITHUB_WORKSPACE" --root "$root" --wheel "$wheel" --commit "$env:GITHUB_SHA" --deadline-file "$root/deadline.json" --native-evidence "$root/native-evidence/native-gate.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Interactive evidence failed/incomplete; no rerun' }
+      - name: Always clean owned trees and explicitly check owned llama-server
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
+          if (Test-Path "$root/venv/Scripts/python.exe") {
+            & "$root/venv/Scripts/python.exe" -I -B "$env:GITHUB_WORKSPACE/.github/qualification/interactive_core.py" cleanup --root "$root"
+            if ($LASTEXITCODE -ne 0) { throw 'Owned process cleanup incomplete' }
+          }
+      - name: Always collect synthetic evidence only under one cap
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
+          python -I -B "$env:GITHUB_WORKSPACE/.github/qualification/verify_windows_interactive.py" collect --output-root "$root/output" --upload-root "$root/upload"
+          if ($LASTEXITCODE -ne 0) { throw 'Evidence incomplete; bounded manifest retained' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 6
+        with:
+          name: q1-windows-interactive-core
+          path: ${{ runner.temp }}/q1-interactive/upload
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 7
