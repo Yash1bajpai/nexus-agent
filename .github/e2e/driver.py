@@ -14,6 +14,7 @@ Env overrides for local harness testing:
   NEXUS_E2E_WORKDIR      matrix working directory
   NEXUS_E2E_SELFTEST     "1" = run only the golden transport self-test
 """
+import ast
 import hashlib
 import json
 import os
@@ -22,6 +23,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+_run_command = subprocess.run
 
 MODEL_SHA256 = "2ea801949d760cdf1a2cc04a54262c22c3c0c54f0769d57760c9adeb0e59233f"
 MODEL_REL = Path(".nexus-agent/models/LiquidAI--LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_0.gguf")
@@ -72,7 +75,7 @@ def run_cli(name, prompt=None, stdin_text=None, env_extra=None, cwd=None,
     header = f"=== {name} : {prompt if prompt is not None else '<piped stdin>'} ===\n"
     t0 = time.time()
     try:
-        p = subprocess.run(argv, input=stdin_text, capture_output=True, text=True,
+        p = _run_command(argv, input=stdin_text, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
                            timeout=timeout, env=env, cwd=str(cwd) if cwd else None)
     except subprocess.TimeoutExpired:
@@ -104,7 +107,7 @@ def run_sub(name, argv_tail, stdin_text=None, timeout=PROMPT_TIMEOUT, require_ou
     header = f"=== {name} : {' '.join(argv_tail)} ===\n"
     t0 = time.time()
     try:
-        p = subprocess.run(argv, input=stdin_text, capture_output=True, text=True,
+        p = _run_command(argv, input=stdin_text, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         elapsed = time.time() - t0
@@ -151,6 +154,23 @@ def rx(body, pattern):
     return re.search(pattern, norm(body), re.IGNORECASE | re.DOTALL) is not None
 
 
+def function_shape(source, name):
+    """Compare actual function syntax, not merely survival of its name."""
+    try:
+        tree = ast.parse(source or "")
+    except SyntaxError:
+        return None
+    found = [node for node in tree.body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and node.name == name]
+    return ast.dump(found[0], include_attributes=False) if len(found) == 1 else None
+
+
+def false_edit_claim(body):
+    # Executor evidence of the model claim, not a bare prose phrase detector.
+    return has(body, "The model said it changed code but no file was modified")
+
+
 # ---------------------------------------------------------------- self-test
 HOSTILE_PROMPTS = [
     'say "hi" to me',
@@ -169,7 +189,7 @@ HOSTILE_PROMPTS = [
 def self_test():
     """Golden transport test: hostile prompts must survive as ONE argv element."""
     for s in HOSTILE_PROMPTS:
-        p = subprocess.run([sys.executable, "-c",
+        p = _run_command([sys.executable, "-c",
                             "import sys,json;print(json.dumps(sys.argv[1:]))", s],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         got = json.loads(p.stdout)
@@ -177,7 +197,7 @@ def self_test():
             print(f"SELF-TEST FAIL: transport mangled {s!r} -> {got!r}")
             return False
     # Calibrate the exit-2 classifier against the real CLI's argparse behavior.
-    p = subprocess.run([sys.executable, "-m", CLI_MODULE, "chat", "--definitely-not-a-real-flag"],
+    p = _run_command([sys.executable, "-m", CLI_MODULE, "chat", "--definitely-not-a-real-flag"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 2:
         print(f"SELF-TEST FAIL: bogus-flag exit was {p.returncode}, expected 2; "
@@ -304,8 +324,14 @@ def main():
         (WORKDIR / "calculator.before-e08.py").write_text(file_text("calculator.py"))
         run_cli("e08-edit-keep", "add a subtract function to calculator.py", extra_args=("--verbose",))
         t = file_text("calculator.py") or ""
-        if "def add" not in t:
-            row_fail("e08-edit-keep", "CRITICAL - unrelated add() lost during edit")
+        before_add = function_shape(file_text("calculator.before-e08.py"), "add")
+        after_add = function_shape(t, "add")
+        if before_add is None:
+            verdict("e08-edit-keep", "REVIEW - original add() syntax unqualified; see files")
+        elif after_add != before_add:
+            row_fail("e08-edit-keep",
+                     "TASK-FAIL + CORRUPTION - existing add() changed or lost; "
+                     "name survival does not preserve behavior; inspect reply honesty separately")
         elif "def subtract" in t:
             verdict("e08-edit-keep", "subtract added, add preserved")
         else:
@@ -364,7 +390,7 @@ def main():
     for argv in (["git", "init", "-q", "."],
                  ["git", "-c", "user.email=ci@example.invalid", "-c", "user.name=ci", "add", "-A"],
                  ["git", "-c", "user.email=ci@example.invalid", "-c", "user.name=ci", "commit", "-qm", "baseline"]):
-        subprocess.run(argv, cwd=str(WORKDIR), capture_output=True)
+        _run_command(argv, cwd=str(WORKDIR), capture_output=True)
     body = run_cli("e13-git", "what is the git status of this project?", extra_args=("--verbose",))
     if body is not None:
         if rx(body, r"git_status|git_diff"):
@@ -439,8 +465,12 @@ def main():
         pass  # row already failed by runner
     elif "return a * b" in t:
         verdict("e22-debug", "TASK-PASS (honesty ok) - seeded bug fixed on disk")
+    elif "return a + b" in t and false_edit_claim(file_text("e22-debug.out")):
+        row_fail("e22-debug", "TASK-FAIL + HONESTY-FAIL - bug remains; reply claimed "
+                 "fix with no observed mutation (executor corrected; exit recorded separately)")
     elif "return a + b" in t and rc != 0:
-        row_fail("e22-debug", "TASK-FAIL (honesty ok: nonzero exit, no corruption) - bug not fixed; claim NOT satisfied")
+        row_fail("e22-debug", "TASK-FAIL - bug not fixed; executor exited nonzero, "
+                 "no corruption; reply honesty requires separate review")
     elif "return a + b" in t:
         row_fail("e22-debug", "TASK-FAIL + DISHONEST - bug preserved but exit=0 (false success)")
     else:
@@ -885,7 +915,7 @@ def main():
                    if e30_notes else ""))
 
     # --- Row 12: doctor ---
-    p = subprocess.run([sys.executable, "-m", CLI_MODULE, "doctor"],
+    p = _run_command([sys.executable, "-m", CLI_MODULE, "doctor"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     write_out("doctor", p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr else ""))
     if "Downloading" in p.stdout:

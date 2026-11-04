@@ -1,0 +1,109 @@
+name: Q1 full Windows qualification
+
+# Q1_FULL_WINDOWS_V1. Local preparation is not push authorization.
+on:
+  push:
+    branches:
+      - qualification/q1-f016eb8-8c73d412
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/qualification/q1-f016eb8-8c73d412' &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.deleted == false && github.event.forced == false &&
+      github.event.after == github.sha && github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Establish internal work deadline
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1'
+          if (Test-Path $root) { throw 'Q1 root is not fresh' }
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 110 * 60
+          @{ work_deadline_utc = $deadline; job_limit_minutes = 120; reserve_minutes = 10 } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $root 'deadline.json')
+      - name: Checkout exact event SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Select Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify exact candidate and event before build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -I .github/qualification/verify_candidate.py --source-root "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate verification failed' }
+      - name: Build fresh wheel and isolated declared extras environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1'
+          python -I -m pip wheel --no-deps --wheel-dir "$root/wheels" .
+          if ($LASTEXITCODE -ne 0) { throw 'Wheel build failed' }
+          $wheels = @(Get-ChildItem "$root/wheels/*.whl" -File)
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one fresh wheel' }
+          python -I -m venv "$root/venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Venv creation failed' }
+          & "$root/venv/Scripts/python.exe" -I -m pip install "$($wheels[0].FullName)[dev,cloud]"
+          if ($LASTEXITCODE -ne 0) { throw 'Declared wheel extras install failed' }
+      - name: Installed wheel full native gate before model fetch
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1'
+          $wheel = (Get-ChildItem "$root/wheels/*.whl" -File).FullName
+          & "$root/venv/Scripts/python.exe" -I "$env:GITHUB_WORKSPACE/.github/qualification/runner.py" native-gate --source-root "$env:GITHUB_WORKSPACE" --root "$root" --wheel "$wheel" --commit "$env:GITHUB_SHA" --deadline-file "$root/deadline.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Native gate incomplete; model fetch prohibited' }
+      - name: Fetch single exact approved GGUF after native success
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1'
+          $gatePath = Join-Path $root 'output/native-gate.json'
+          if (-not (Test-Path $gatePath)) { throw 'native-gate.json not found' }
+          $gate = Get-Content $gatePath -Raw | ConvertFrom-Json
+          if ($gate.success -cne $true -or $gate.qualified -cne $true -or $gate.model_fetch_permitted_by_gate -cne $true) { throw 'Native gate is not qualified' }
+          if ($gate.commit -cne $env:GITHUB_SHA) { throw 'Gate commit mismatch' }
+          if ($gate.platform -cne 'win32') { throw 'Gate platform must be win32' }
+          $wheel = (Get-ChildItem "$root/wheels/*.whl" -File).FullName
+          $wheelHash = (Get-FileHash $wheel -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($gate.wheel_sha256 -cne $wheelHash) { throw 'Gate wheel hash mismatch' }
+          $resultsPath = Join-Path $root 'output/native-results.json'
+          $resultsHash = (Get-FileHash $resultsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($gate.native_results_sha256 -cne $resultsHash) { throw 'Native results hash mismatch' }
+          $deadline = (Get-Content "$root/deadline.json" -Raw | ConvertFrom-Json).work_deadline_utc
+          $remaining = [int]([Math]::Floor($deadline - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
+          if ($remaining -le 0) { throw 'Work deadline expired before model fetch' }
+          $fetchLimit = [Math]::Min(420, $remaining)
+          curl.exe --fail --location --max-time "$fetchLimit" --output "$root/verified.gguf" 'https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/LFM2.5-1.2B-Instruct-Q4_0.gguf'
+          if ($LASTEXITCODE -ne 0) { throw 'Single model fetch failed; no retry' }
+          $hash = (Get-FileHash "$root/verified.gguf" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -cne '2ea801949d760cdf1a2cc04a54262c22c3c0c54f0769d57760c9adeb0e59233f') { throw 'GGUF hash mismatch' }
+      - name: Run frozen full workload exactly once
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1'
+          $wheel = (Get-ChildItem "$root/wheels/*.whl" -File).FullName
+          & "$root/venv/Scripts/python.exe" -I "$env:GITHUB_WORKSPACE/.github/qualification/runner.py" workload --source-root "$env:GITHUB_WORKSPACE" --root "$root" --wheel "$wheel" --commit "$env:GITHUB_SHA" --deadline-file "$root/deadline.json" --model-source "$root/verified.gguf"
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen workload failed or incomplete; no retry' }
+      - name: Upload only bounded dedicated output
+        if: always()
+        timeout-minutes: 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: q1-windows-output
+          path: ${{ runner.temp }}/q1/output
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7
