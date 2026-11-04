@@ -6,7 +6,9 @@ import pytest
 
 from nexus_agent_ai.agent import tools as T
 from nexus_agent_ai.agent.guardrails import LoopGuard
-from nexus_agent_ai.agent.refusals import RefusalClass as R, RefusalText, refusal
+from nexus_agent_ai.agent.refusals import (
+    RefusalClass as R, RefusalText, RunnerStatus, execution_result, refusal, runner_result,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -186,17 +188,29 @@ def test_guard_preserves_even_a_category_not_predictable_from_text(kind):
 
 
 @pytest.mark.parametrize("name", ["edit_function", "add_function"])
-def test_new_operations_invalidate_existing_test_and_code_evidence(name):
+def test_new_operations_invalidate_suite_evidence_not_detached_completion(name):
     guard = LoopGuard(lambda path: "Directory tree")
-    guard.last_tests = "passed"
-    guard.ran_code_success = True
+    guard.after_tool("run_tests", {}, runner_result(
+        execution_result("Fixture suite passed.", executed=True, outcome="Fixture pytest process completed."),
+        tool="run_tests", status=RunnerStatus.PASSED,
+    ))
+    guard.after_tool("run_code", {}, runner_result(
+        execution_result("Fixture snippet completed.", executed=True, outcome="Fixture Python process completed."),
+        tool="run_code", status=RunnerStatus.COMPLETED,
+    ))
     guard.post_edit_read_paths.add("module.py")
     result = guard.after_tool(name, {"path": "module.py"}, "Successfully edited")
     assert result == "Successfully edited"
     assert guard.edited_since_tests
-    assert guard.edited_since_code
     assert "module.py" in guard.edited_paths
     assert "module.py" not in guard.post_edit_read_paths
+    verdict, reviewed = guard.review_final("All tests pass.")
+    assert verdict == "ok" and guard.claim_unverified
+    assert "files changed after" in reviewed
+
+    answer = "The snippet completed successfully."
+    verdict, reviewed = guard.review_final(answer)
+    assert verdict == "ok" and reviewed == answer and not guard.claim_unverified
 
 
 @pytest.mark.parametrize("name", ["edit_function", "add_function"])

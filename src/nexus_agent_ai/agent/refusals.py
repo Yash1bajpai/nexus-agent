@@ -17,6 +17,18 @@ class RefusalClass(str, Enum):
     OTHER = "other"
 
 
+class RunnerStatus(str, Enum):
+    COMPLETED = "completed"
+    PASSED = "passed"
+    FAILED = "failed"
+    NO_TESTS = "no_tests"
+    TIMED_OUT = "timed_out"
+    NOT_APPROVED = "not_approved"
+    UNAVAILABLE = "unavailable"
+    NOT_EXECUTED = "not_executed"
+    UNKNOWN = "unknown"
+
+
 class ToolResult(str):
     """Public tool text with a private, source-authored execution receipt."""
 
@@ -64,6 +76,42 @@ def execution_result(text: str, *, executed: bool, outcome: str) -> ToolResult:
     result.executed = bool(executed)
     result.outcome = outcome
     return result
+
+
+def runner_result(result: str, *, tool: str, status: RunnerStatus) -> ToolResult:
+    """Attach private runner facts without changing public text or receipts."""
+    if not isinstance(result, str):
+        raise TypeError("Runner results must be strings.")
+    if type(tool) is not str or tool not in ("run_code", "run_tests"):
+        raise ValueError("Unknown runner tool.")
+    if not isinstance(status, RunnerStatus):
+        raise TypeError("Runner status must be a RunnerStatus.")
+    if ((status is RunnerStatus.PASSED and tool != "run_tests")
+            or (status is RunnerStatus.COMPLETED and tool != "run_code")):
+        raise ValueError("Runner status does not match the tool.")
+    result_type = type(result) if isinstance(result, ToolResult) else ToolResult
+    tagged = str.__new__(result_type, result)
+    tagged.__dict__.update(getattr(result, "__dict__", {}))
+    tagged._runner_tool = tool
+    tagged._runner_status = status
+    return tagged
+
+
+def runner_status(result: str, tool: str) -> RunnerStatus:
+    """Read live typed evidence only; serialized or inconsistent facts are unknown."""
+    if (not isinstance(result, ToolResult) or type(tool) is not str
+            or tool not in ("run_code", "run_tests")
+            or type(getattr(result, "_runner_tool", None)) is not str
+            or getattr(result, "_runner_tool", None) != tool):
+        return RunnerStatus.UNKNOWN
+    status = getattr(result, "_runner_status", None)
+    if not isinstance(status, RunnerStatus):
+        return RunnerStatus.UNKNOWN
+    if status in (RunnerStatus.PASSED, RunnerStatus.COMPLETED):
+        expected = RunnerStatus.PASSED if tool == "run_tests" else RunnerStatus.COMPLETED
+        if status is not expected or getattr(result, "executed", None) is not True:
+            return RunnerStatus.UNKNOWN
+    return status
 
 
 def execution_metadata(result: str) -> dict:

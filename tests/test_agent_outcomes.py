@@ -6,6 +6,7 @@ from nexus_agent_ai.agent import core
 from nexus_agent_ai.agent.core import Agent
 from nexus_agent_ai.agent.memory import ConversationMemory, is_genuine_user_message
 from nexus_agent_ai.agent.persistence import SQLiteMemory
+from nexus_agent_ai.agent.refusals import RunnerStatus, execution_result, runner_result
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, RateLimitError, Tool, ToolCall
 from nexus_agent_ai.providers.messages import assistant_message
 
@@ -63,7 +64,10 @@ def test_noop_write_does_not_count_as_edit_or_invalidate_tests(tmp_path, monkeyp
 
     def execute(name, args):
         if name == "run_tests":
-            return "Pytest Results: PASSED"
+            return runner_result(
+                execution_result("Pytest Results: PASSED", executed=True, outcome="Fixture pytest process completed."),
+                tool="run_tests", status=RunnerStatus.PASSED,
+            )
         path.write_text("original")
         return "No changes: result.py already contains the requested content."
 
@@ -128,7 +132,12 @@ def test_stream_without_callback_visibly_appends_grounded_git_output(monkeypatch
 
 
 def test_force_final_still_reviews_failed_tests(monkeypatch):
-    monkeypatch.setattr(core, "execute_tool", lambda *args: "Pytest Results: FAILED\nassert 1 == 2")
+    failed = runner_result(
+        execution_result("Pytest Results: FAILED\nassert 1 == 2", executed=True,
+                         outcome="Fixture pytest process completed."),
+        tool="run_tests", status=RunnerStatus.FAILED,
+    )
+    monkeypatch.setattr(core, "execute_tool", lambda *args: failed)
     turns = [("run_tests", {})] * 3 + ["Tests pass."] * 3
     agent = Agent(Scripted(turns), tools=[tool("run_tests")], max_iterations=3, verbose=False)
     final = agent.run("verify the suite")

@@ -6,6 +6,7 @@ import pytest
 
 from nexus_agent_ai.agent.core import Agent
 from nexus_agent_ai.agent.guardrails import LoopGuard, guardrails_enabled
+from nexus_agent_ai.agent.refusals import RunnerStatus, execution_result, runner_result
 from nexus_agent_ai.agent.tools import execute_list_directory, reset_file_tracking
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, ToolCall
 
@@ -62,6 +63,13 @@ def run(turns, prompt, **kw):
 
 def observed(events):
     return [e["result"] for e in events if e["type"] == "observe"]
+
+
+def suite_result(text, status):
+    return runner_result(
+        execution_result(text, executed=True, outcome="Fixture pytest process completed."),
+        tool="run_tests", status=status,
+    )
 
 
 def test_missing_file_result_lists_directory_and_suggests_match(repo):
@@ -168,7 +176,7 @@ def test_negative_quoted_and_fix_only_answers_are_not_test_success_claims(answer
 
 def test_stale_success_claim_sets_unverified_flag():
     guard = LoopGuard(lambda path: "")
-    guard.after_tool("run_tests", {}, "Pytest Results: PASSED")
+    guard.after_tool("run_tests", {}, suite_result("Pytest Results: PASSED", RunnerStatus.PASSED))
     guard.after_tool("patch_file", {"path": "a.py"}, "Successfully patched a.py")
     verdict, reviewed = guard.review_final("Tests pass now.")
     assert verdict == "ok" and "files changed after" in reviewed
@@ -177,7 +185,7 @@ def test_stale_success_claim_sets_unverified_flag():
 
 def test_failure_admission_does_not_hide_separate_false_success_claim():
     guard = LoopGuard(lambda path: "")
-    guard.after_tool("run_tests", {}, "Pytest Results: FAILED")
+    guard.after_tool("run_tests", {}, suite_result("Pytest Results: FAILED", RunnerStatus.FAILED))
     verdict, _ = guard.review_final("Some tests failed. All tests pass now.")
     assert verdict == "retry" and guard.claim_unverified
 
@@ -222,26 +230,39 @@ def test_file_verification_claim_requires_post_edit_read_of_exact_path():
     assert "unverified" not in reviewed.lower()
 
 
-def test_test_claims_backed_by_run_tests_or_run_code():
-    # Backed by run_tests
+def test_test_claims_require_suite_evidence_not_untyped_run_code():
+    # An intentionally simulated suite pass carries source-authored runner facts.
     guard = LoopGuard(lambda path: "")
-    guard.after_tool("run_tests", {}, "Pytest Results: PASSED\n1 passed")
+    guard.after_tool("run_tests", {}, suite_result("Pytest Results: PASSED\n1 passed", RunnerStatus.PASSED))
     verdict, reviewed = guard.review_final("I ran the test suite - everything passes.")
     assert not guard.claim_unverified
 
-    # Backed by successful run_code (test claim)
+    # D1 policy correction: preserve this exact old assert/STDOUT case, now NEGATIVE.
+    # Neither the code text nor untyped output proves a test reached an assertion
+    # or confirmed the project fix.
     guard2 = LoopGuard(lambda path: "")
     guard2.after_tool("run_code", {"code": "assert 1 == 1"}, "STDOUT:\nok")
     verdict, reviewed = guard2.review_final("I ran a test to confirm the fix.")
-    assert not guard2.claim_unverified
+    assert guard2.claim_unverified
+    assert verdict == "ok" and "unverified" in reviewed.lower()
 
     # Backed when both file edit + post-edit read and test execution occur
     guard3 = LoopGuard(lambda path: "")
     guard3.after_tool("patch_file", {"path": "buggy.py"}, "Successfully patched buggy.py")
     guard3.after_tool("read_file", {"path": "buggy.py"}, "def divide(a, b): return a / b if b else 0")
-    guard3.after_tool("run_tests", {}, "Pytest Results: PASSED\n1 passed")
+    guard3.after_tool("run_tests", {}, suite_result("Pytest Results: PASSED\n1 passed", RunnerStatus.PASSED))
     verdict, reviewed = guard3.review_final("I verified the changes and ran a test to confirm the fix.")
     assert not guard3.claim_unverified
+
+    # A typed successful snippet still supports truthful completion, not test proof.
+    guard4 = LoopGuard(lambda path: "")
+    guard4.after_tool("run_code", {"code": "print(42)"}, runner_result(
+        execution_result("STDOUT:\n42", executed=True, outcome="Python snippet completed with exit code 0."),
+        tool="run_code", status=RunnerStatus.COMPLETED,
+    ))
+    answer = "The snippet completed successfully and printed 42."
+    verdict, reviewed = guard4.review_final(answer)
+    assert verdict == "ok" and reviewed == answer and not guard4.claim_unverified
 
 
 def test_assertions_passed_phrasing_counts_as_test_claim():

@@ -16,7 +16,8 @@ from ..providers.base import Tool
 from ..utils.config import CODE_EXECUTION_TIMEOUT
 from ..utils.private_files import copy_file_permissions
 from .refusals import (
-    RefusalClass, RefusalText, execution_ran, execution_result, refusal,
+    RefusalClass, RefusalText, RunnerStatus, execution_ran, execution_result, refusal,
+    runner_result,
 )
 
 from ._workspace_paths import (
@@ -1386,12 +1387,13 @@ def _child_rlimits_supported() -> bool:
 def execute_run_code(code: str, language: str = "python") -> str:
     """Run Python code snippet in a sandboxed subprocess with AST analysis + timeout."""
     if language.lower() not in ["python", "py"]:
-        return refusal(RefusalClass.OTHER, f"ERROR: Running language '{language}' is not supported yet. Only Python is supported.")
+        return runner_result(refusal(RefusalClass.OTHER, f"ERROR: Running language '{language}' is not supported yet. Only Python is supported."),
+                             tool="run_code", status=RunnerStatus.NOT_EXECUTED)
 
     # AST sandbox check before any execution
     sandbox_error = _sandbox_check(code)
     if sandbox_error:
-        return sandbox_error
+        return runner_result(sandbox_error, tool="run_code", status=RunnerStatus.NOT_EXECUTED)
 
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as tf:
@@ -1452,23 +1454,24 @@ def execute_run_code(code: str, language: str = "python") -> str:
             output = ("[Code executed successfully with no output]" if res.returncode == 0
                       else f"[Code execution failed with exit code {res.returncode} and no output]")
         result = output.strip()
-        return execution_result(
+        return runner_result(execution_result(
             refusal(RefusalClass.OTHER, result) if res.returncode else result,
             executed=True,
             outcome=f"Code {'FAILED' if res.returncode else 'completed'} (exit code {res.returncode}).",
-        )
+        ), tool="run_code", status=RunnerStatus.FAILED if res.returncode else RunnerStatus.COMPLETED)
     except subprocess.TimeoutExpired:
-        return execution_result(
+        return runner_result(execution_result(
             refusal(RefusalClass.OTHER, f"ERROR: Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds."),
             executed=True, outcome=f"Code timed out after {CODE_EXECUTION_TIMEOUT} seconds; completion unknown.",
-        )
+        ), tool="run_code", status=RunnerStatus.TIMED_OUT)
     except PermissionError as e:
-        return refusal(RefusalClass.PERMISSION, f"ERROR: Code execution failed: {str(e)}")
+        return runner_result(refusal(RefusalClass.PERMISSION, f"ERROR: Code execution failed: {str(e)}"),
+                             tool="run_code", status=RunnerStatus.NOT_EXECUTED)
     except Exception as e:
-        return execution_result(
+        return runner_result(execution_result(
             refusal(RefusalClass.OTHER, f"ERROR: Code execution failed: {str(e)}"),
             executed=True, outcome="Code completion unknown; execution may have had effects.",
-        )
+        ), tool="run_code", status=RunnerStatus.UNKNOWN)
 
 def execute_search_web(query: str) -> str:
     """Return formatted results (ok), or an ERROR with a stable search category.
@@ -2054,12 +2057,14 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
     from .consent import execution_allowed
     allowed, why = execution_allowed()
     if not allowed:
-        return refusal(RefusalClass.PERMISSION, "ERROR: Project test execution is not approved. Pytest imports arbitrary project code "
-                "with your user permissions; it is NOT sandboxed. " + why)
+        return runner_result(refusal(RefusalClass.PERMISSION, "ERROR: Project test execution is not approved. Pytest imports arbitrary project code "
+                "with your user permissions; it is NOT sandboxed. " + why),
+                tool="run_tests", status=RunnerStatus.NOT_APPROVED)
     import importlib.util
     if importlib.util.find_spec("pytest") is None:
-        return refusal(RefusalClass.OTHER, f"ERROR: pytest is not installed for the Python Nexus runs on. Install it with: "
-                f"\"{sys.executable}\" -m pip install pytest")
+        return runner_result(refusal(RefusalClass.OTHER, f"ERROR: pytest is not installed for the Python Nexus runs on. Install it with: "
+                f"\"{sys.executable}\" -m pip install pytest"),
+                tool="run_tests", status=RunnerStatus.UNAVAILABLE)
     cmd = [sys.executable, "-m", "pytest", "-o", "addopts="]
 
     # A pytest node ID is a real path followed by an opaque :: selector. Validate
@@ -2070,18 +2075,22 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
         clean_path = path.strip()
         filesystem_path, separator, node_id = clean_path.partition("::")
         if not filesystem_path or (separator and not node_id):
-            return refusal(RefusalClass.TARGETING, "ERROR: A pytest node ID needs a file path and nonempty selector.")
+            return runner_result(refusal(RefusalClass.TARGETING, "ERROR: A pytest node ID needs a file path and nonempty selector."),
+                                 tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
         validated = _validate_workspace_path(filesystem_path)
         if isinstance(validated, str):
-            return validated
+            return runner_result(validated, tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
         p = validated
         if _is_sensitive_path(Path(filesystem_path)) or _is_sensitive_path(p):
-            return refusal(RefusalClass.SENSITIVE_PATH, "ERROR: Security Blocked: Sensitive test targets are restricted.")
+            return runner_result(refusal(RefusalClass.SENSITIVE_PATH, "ERROR: Security Blocked: Sensitive test targets are restricted."),
+                                 tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
         if not p.exists():
-            return refusal(RefusalClass.NOT_FOUND, f"ERROR: Target test path does not exist: {filesystem_path}")
+            return runner_result(refusal(RefusalClass.NOT_FOUND, f"ERROR: Target test path does not exist: {filesystem_path}"),
+                                 tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
         target_kind = "file" if p.is_file() else "directory" if p.is_dir() else "other"
         if separator and not p.is_file():
-            return refusal(RefusalClass.TARGETING, "ERROR: A pytest node ID must select an existing file.")
+            return runner_result(refusal(RefusalClass.TARGETING, "ERROR: A pytest node ID must select an existing file."),
+                                 tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
         target = str(p) + (separator + node_id if separator else "")
         cmd.append(target)
 
@@ -2106,30 +2115,35 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
                 if re.match(r'^[a-zA-Z0-9_\s\(\)]+$', k_val):
                     cmd.extend(["-k", k_val])
                 else:
-                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid or unsafe -k filter expression: '{k_val}'")
+                    return runner_result(refusal(RefusalClass.TARGETING, f"ERROR: Invalid or unsafe -k filter expression: '{k_val}'"),
+                                         tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
                 i += 2
             elif token.startswith("-k="):
                 if re.match(r'^-k=[a-zA-Z0-9_\s\(\)]+$', token):
                     cmd.append(token)
                 else:
-                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid or unsafe -k filter expression: '{token}'")
+                    return runner_result(refusal(RefusalClass.TARGETING, f"ERROR: Invalid or unsafe -k filter expression: '{token}'"),
+                                         tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
                 i += 1
             elif token.startswith("--maxfail="):
                 val = token.split("=", 1)[1]
                 if val.isdigit() and int(val) > 0:
                     cmd.append(token)
                 else:
-                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer.")
+                    return runner_result(refusal(RefusalClass.TARGETING, f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer."),
+                                         tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
                 i += 1
             elif token == "--maxfail" and i + 1 < len(tokens):
                 val = tokens[i + 1]
                 if val.isdigit() and int(val) > 0:
                     cmd.extend(["--maxfail", val])
                 else:
-                    return refusal(RefusalClass.TARGETING, f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer.")
+                    return runner_result(refusal(RefusalClass.TARGETING, f"ERROR: Invalid --maxfail value: '{val}'. Must be a positive integer."),
+                                         tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
                 i += 2
             else:
-                return refusal(RefusalClass.TARGETING, f"ERROR: Unsupported or unsafe pytest argument: '{token}'. Allowed flags: -v, -q, -x, -s, -k <expr>, --disable-warnings, --tb=short, --maxfail=N.")
+                return runner_result(refusal(RefusalClass.TARGETING, f"ERROR: Unsupported or unsafe pytest argument: '{token}'. Allowed flags: -v, -q, -x, -s, -k <expr>, --disable-warnings, --tb=short, --maxfail=N."),
+                                     tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
 
     try:
         proc = subprocess.run(
@@ -2165,29 +2179,30 @@ def execute_run_tests(path: str = "", args: str = "") -> str:
             status_str = "PASSED" if exit_code == 0 else f"FAILED (exit code {exit_code})"
             result = f"=== Pytest Results: {status_str} ===\n{output}"
         status = "NO TESTS COLLECTED" if exit_code == 5 else "PASSED" if exit_code == 0 else "FAILED"
-        return execution_result(
+        return runner_result(execution_result(
             refusal(RefusalClass.OTHER, result) if exit_code else result,
             executed=True, outcome=f"Pytest {status} (exit code {exit_code}).",
-        )
+        ), tool="run_tests", status=RunnerStatus.NO_TESTS if exit_code == 5 else RunnerStatus.PASSED if exit_code == 0 else RunnerStatus.FAILED)
     except subprocess.TimeoutExpired as exc:
         def timeout_text(value):
             return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
         stdout = timeout_text(exc.stdout)
         stderr = timeout_text(exc.stderr)
-        return execution_result(
+        return runner_result(execution_result(
             refusal(RefusalClass.OTHER,
                     "ERROR: Pytest execution timed out after 45 seconds.\n"
                     "--- stdout tail ---\n" + stdout[-3000:] + "\n--- end stdout tail ---\n"
                     "--- stderr tail ---\n" + stderr[-3000:] + "\n--- end stderr tail ---"),
             executed=True, outcome="Pytest timed out after 45 seconds; completion unknown.",
-        )
+        ), tool="run_tests", status=RunnerStatus.TIMED_OUT)
     except PermissionError as e:
-        return refusal(RefusalClass.PERMISSION, f"ERROR: Failed to run pytest: {str(e)}")
+        return runner_result(refusal(RefusalClass.PERMISSION, f"ERROR: Failed to run pytest: {str(e)}"),
+                             tool="run_tests", status=RunnerStatus.NOT_EXECUTED)
     except Exception as e:
-        return execution_result(
+        return runner_result(execution_result(
             refusal(RefusalClass.OTHER, f"ERROR: Failed to run pytest: {str(e)}"),
             executed=True, outcome="Pytest completion unknown; execution may have had effects.",
-        )
+        ), tool="run_tests", status=RunnerStatus.UNKNOWN)
 
 RUN_TESTS_TOOL = Tool(
     name="run_tests",

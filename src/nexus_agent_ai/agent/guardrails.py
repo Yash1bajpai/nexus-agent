@@ -17,7 +17,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from .refusals import replace_result_text
+from .refusals import RunnerStatus, replace_result_text, runner_status
 
 MAX_TEST_RETRIES = 2
 
@@ -25,16 +25,26 @@ _TEST_CLAIM = re.compile(
     r"\b(?:"
     r"(?:i\s+)?(?:ran|run|executed|conducted)\s+(?:a\s+|the\s+)?(?:tests?|test\s+suite|pytest)\b|"
     r"(?:ran|run|executed)\s+(?:a\s+|the\s+)?tests?\s+to\s+(?:confirm|verify|check|ensure)\b|"
-    r"(?:tests?|test\s+suite|pytest)\s+(?:(?:all|now|both)\s+)?(?:(?:has|have)\s+)?(?:pass(?:es|ed|ing)?|succeed(?:s|ed)?|"
+    r"(?:tests?|test\s+suite|pytest|run_tests)\s+(?:(?:all|now|both)\s+)?(?:(?:has|have)\s+)?(?:pass(?:es|ed|ing)?|succeed(?:s|ed)?|"
     r"(?:is|are)\s+(?:green|passing)|(?:is|are)\s+now\s+passing)\b|"
     r"\ball\s+(?:tests?\s+)?(?:pass(?:es|ed)?|green)\b|"
-    r"\ball\s+assertions?\s+pass(?:es|ed)?\b|"
+    r"\b(?:all\s+)?assertions?\s+(?:(?:has|have)\s+)?pass(?:es|ed)?\b|"
     r"\b(?:the\s+)?tests?\s+completed\s+successfully\b|"
+    r"(?:tests?|test\s+suite|pytest)\s+(?:(?:has|have)\s+)?(?:runs?|ran)\s+"
+    r"(?:correctly|properly|successfully|without\s+errors?)\b|"
     r"(?:everything|all)\s+passes\b|"
     r"tested\s+(?:the\s+)?(?:changes?|fix|code|file|implementation)\b|"
     r"tested\s+and\s+(?:confirmed|verified)\b|"
     r"(?:confirmed|verified)\s+(?:the\s+)?(?:fix|changes?|code)\s+(?:by\s+running|with|via)\s+(?:a\s+|the\s+)?tests?"
     r")\b",
+    re.IGNORECASE,
+)
+_INLINE_TEST_SCOPE = re.compile(r"\b(?:inline|detached|snippets?|run_code|scratchpad|assertions?)\b", re.IGNORECASE)
+_SNIPPET_SUCCESS_CLAIM = re.compile(
+    r"\b(?:(?P<quantifier>all|both|the|a)\s+)?(?:code\s+)?"
+    r"(?P<subject>snippets?|run_code|(?:inline|detached)\s+(?:code|scripts?))\s+"
+    r"(?:(?:has|have)\s+)?(?:completed|finished|succeeded|"
+    r"(?:executed|ran)\s+(?:successfully|without\s+errors?))\b",
     re.IGNORECASE,
 )
 _FILE_VERIFY_CLAIM = re.compile(
@@ -201,15 +211,21 @@ def _clean_for_claims(text: str) -> str:
     return text
 
 
-def claims_tests_pass(text: str) -> bool:
-    """Recognize test assertions, not quoted examples, proposals, or negative admissions."""
-    clean = _clean_for_claims(text)
-    for clause in re.split(r"[\n.!?;]+", clean):
-        if clause.lstrip().startswith(">"):
+def _test_claim_clauses(text: str):
+    # Quoted contractions are data too. Normalize only this disposable matching
+    # view; file-verification grammar and canonical model bytes stay unchanged.
+    quoted = (text or "").replace("\u2019", "'").replace("\u2018", "'")
+    quoted = re.sub(r"(?<!\w)'(?:[^'\n]|(?<=\w)'(?=\w))*'(?!\w)", "", quoted)
+    for clause in re.split(r"[\n.!?;]+", _clean_for_claims(quoted)):
+        if re.match(r"\s*(?:for\s+example|example|sample\s+(?:reply|answer))\s*[:,]", clause, re.IGNORECASE):
             continue
-        if _TEST_CLAIM.search(clause) and not _NEGATION_OR_PROPOSAL.search(clause):
-            return True
-    return False
+        if not clause.lstrip().startswith(">") and not _NEGATION_OR_PROPOSAL.search(clause):
+            yield clause
+
+
+def claims_tests_pass(text: str) -> bool:
+    """Recognize bounded affirmative test claims, never execution evidence."""
+    return any(_TEST_CLAIM.search(clause) for clause in _test_claim_clauses(text))
 
 
 def claims_file_verification(text: str) -> bool:
@@ -618,13 +634,14 @@ class LoopGuard:
 
     def __init__(self, list_directory) -> None:
         self._list_directory = list_directory
-        self.last_tests: Optional[str] = None  # "passed" | "failed" | None
+        self.last_tests: Optional[str] = None  # Live RunnerStatus value; None before any test attempt.
         self.last_tests_output = ""
         self.claim_unverified = False
         self.claim_unverified_error = ""
         self.edited_since_tests = False
-        self.ran_code_success = False
-        self.edited_since_code = False
+        self.last_code_status = RunnerStatus.UNKNOWN
+        self.code_calls = 0
+        self.all_code_completed = True
         self.edited_paths: set[str] = set()
         self.post_edit_read_paths: set[str] = set()
         self.read_paths: set[str] = set()
@@ -635,21 +652,16 @@ class LoopGuard:
     # -- after every tool call -------------------------------------------------
     def after_tool(self, name: str, args: Dict, result: str) -> str:
         text = str(result)
-        if name == "run_tests" and not text.startswith("ERROR:"):
-            self.last_tests = "passed" if "Pytest Results: PASSED" in text else "failed"
+        if name == "run_tests":
+            self.last_tests = runner_status(result, "run_tests").value
             self.last_tests_output = text
             self.edited_since_tests = False
-        elif name == "run_tests":
-            if "not approved" in text or "declined" in text or "pytest is not installed" in text:
-                self.last_tests, self.last_tests_output = "unavailable", text  # could not run: not a test failure
-            else:
-                self.last_tests, self.last_tests_output = "failed", text
-        elif name == "run_code" and not text.startswith("ERROR:"):
-            self.ran_code_success = True
-            self.edited_since_code = False
+        elif name == "run_code":
+            self.last_code_status = runner_status(result, "run_code")
+            self.code_calls += 1
+            self.all_code_completed &= self.last_code_status is RunnerStatus.COMPLETED
         elif name in ("patch_file", "write_file", "edit_function", "add_function") and not text.startswith(("ERROR:", "No changes:")):
             self.edited_since_tests = True
-            self.edited_since_code = True
             raw_path = str(args.get("path", "")).strip()
             if raw_path:
                 norm_p = os.path.normcase(os.path.normpath(raw_path))
@@ -690,7 +702,18 @@ class LoopGuard:
         """Return (verdict, text). verdict: 'ok' | 'retry' (text is the nudge to send) ."""
         self.claim_unverified = False
         self.claim_unverified_error = ""
-        claims_tests = claims_tests_pass(text)
+        clauses = list(_test_claim_clauses(text))
+        test_clauses = [clause for clause in clauses if _TEST_CLAIM.search(clause)]
+        claims_tests = bool(test_clauses)
+        unsupported_scope = any(_INLINE_TEST_SCOPE.search(clause) for clause in test_clauses)
+        snippet_unverified = False
+        for clause in clauses:
+            for match in _SNIPPET_SUCCESS_CLAIM.finditer(clause):
+                plural = (match.group("subject").lower().endswith("s")
+                          or (match.group("quantifier") or "").lower() in ("all", "both"))
+                if (not self.code_calls or self.last_code_status is not RunnerStatus.COMPLETED
+                        or (plural and not self.all_code_completed)):
+                    snippet_unverified = True
         claims_file = claims_file_verification(text)
 
         if claims_tests and self.last_tests == "failed":
@@ -704,16 +727,22 @@ class LoopGuard:
                     "Fix the code with patch_file or write_file, run run_tests again, and only report success if it says PASSED. "
                     "Last result:\n" + self.last_tests_output[-800:]
                 )
-            return "ok", text + "\n\nCorrection: run_tests last reported FAILED. The tests do not pass.\n" + self.last_tests_output[-600:]
+            return "ok", text + "\n\nCorrection: run_tests last reported FAILED; no fresh passing run_tests result was recorded.\n" + self.last_tests_output[-600:]
 
         extra = ""
         test_unverified = False
         if claims_tests:
-            if self.last_tests == "passed" and not self.edited_since_tests:
+            if unsupported_scope:
+                test_unverified = True
+                self.claim_unverified = True
+                extra += (
+                    "\n\nNote: the inline/assertion claim is unverified. Detached code completion "
+                    "does not prove assertions were reached, and run_tests does not establish "
+                    "a detached snippet's result or fix correctness."
+                )
+            elif self.last_tests == "passed" and not self.edited_since_tests:
                 pass
-            elif self.ran_code_success and not self.edited_since_code:
-                pass
-            elif (self.last_tests == "passed" and self.edited_since_tests) or (self.ran_code_success and self.edited_since_code):
+            elif self.last_tests == "passed" and self.edited_since_tests:
                 test_unverified = True
                 self.claim_unverified = True
                 extra += "\n\nNote: files changed after the last test run, so rerun tests to confirm."
@@ -721,10 +750,18 @@ class LoopGuard:
                 test_unverified = True
                 self.claim_unverified = True
                 extra += (
-                    "\n\nNote: the tests were not run, so the claim that they pass or confirm the fix is unverified."
-                    if self.last_tests is None else
-                    "\n\nNote: the tests could not be run (permission not given), so the claim that they pass is unverified."
+                    "\n\nNote: no fresh source-verified passing run_tests result backs this test "
+                    "claim, so it is unverified. Detached code completion is not project-test "
+                    "or reached-assertion proof."
                 )
+        if snippet_unverified:
+            test_unverified = True
+            self.claim_unverified = True
+            extra += (
+                "\n\nNote: the snippet-completion claim is unverified by the private runner record. "
+                "A completed invocation is not inferred from output text; a latest result "
+                "does not establish that all earlier snippets completed."
+            )
 
         file_unverified = False
         if claims_file:
@@ -741,7 +778,7 @@ class LoopGuard:
         if test_unverified and file_unverified:
             self.claim_unverified_error = "The model made unverified test and verification claims without backing tool evidence."
         elif test_unverified:
-            self.claim_unverified_error = "The model claimed the fix was tested, but no passing test run backs that up."
+            self.claim_unverified_error = "The model made a test/assertion or snippet-completion claim without matching fresh source evidence."
         elif file_unverified:
             self.claim_unverified_error = "The model claimed the changes were verified, but the modified file was not inspected after being edited."
         if self.git_outputs and not self._mentions_git_facts(text):

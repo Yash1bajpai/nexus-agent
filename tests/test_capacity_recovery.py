@@ -10,7 +10,7 @@ from nexus_agent_ai.agent import context, core, tools
 from nexus_agent_ai.agent.core import Agent
 from nexus_agent_ai.agent.memory import ConversationMemory, is_genuine_user_message
 from nexus_agent_ai.agent.persistence import SQLiteMemory
-from nexus_agent_ai.agent.refusals import RefusalClass, execution_result, refusal
+from nexus_agent_ai.agent.refusals import RefusalClass, RunnerStatus, execution_result, refusal, runner_result
 from nexus_agent_ai.cli import app as cli
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, Tool, ToolCall
 from nexus_agent_ai.providers.messages import assistant_message
@@ -254,7 +254,8 @@ def test_rejected_optional_nudge_keeps_originals_and_closes_without_extra_reques
 
     def execute(name, args, **kwargs):
         dispatched.append((name, copy.deepcopy(args)))
-        return execution_result(result_text, executed=kind == "test_honesty", outcome="Fixture observation recorded.")
+        result = execution_result(result_text, executed=kind == "test_honesty", outcome="Fixture observation recorded.")
+        return runner_result(result, tool="run_tests", status=RunnerStatus.FAILED) if kind == "test_honesty" else result
 
     monkeypatch.setattr(core, "execute_tool", execute)
     offered = [tools.WRITE_FILE_TOOL] if kind == "edit" else [probe() if kind == "tool_error" else tools.RUN_TESTS_TOOL]
@@ -417,12 +418,19 @@ def test_normal_edit_nudge_still_allows_actual_write(tmp_path):
 
 
 def test_normal_test_honesty_nudge_still_runs_passing_followup(monkeypatch):
-    results = iter(["Pytest Results: FAILED\nassert 1 == 2", "Pytest Results: PASSED"])
+    results = iter([
+        ("Pytest Results: FAILED\nassert 1 == 2", RunnerStatus.FAILED),
+        ("Pytest Results: PASSED", RunnerStatus.PASSED),
+    ])
     dispatched = []
 
     def execute(name, args, **kwargs):
         dispatched.append(name)
-        return execution_result(next(results), executed=True, outcome="Fixture test process completed.")
+        text, status = next(results)
+        return runner_result(
+            execution_result(text, executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=status,
+        )
 
     monkeypatch.setattr(core, "execute_tool", execute)
     provider = Scripted([
