@@ -374,6 +374,171 @@ def test_assess_compact_recall_honest_unknown():
     assert res_honest["reply"]["status"] == assess.PASS
 
 
+def test_assess_task_brief_original_failure_task_fail():
+    """Verify original actual failure ('I'll read the file...') with no tool call yields task FAIL."""
+    assistant_ans = "I'll read the file to get a summary."
+    delta_msgs = [
+        {"role": "user", "content": "Read brief.txt and summarize it in four short bullet points."},
+        {"role": "assistant", "content": assistant_ans},
+    ]
+    res = assess.assess_task_brief(assistant_ans, delta_msgs)
+    assert res["name"] == "compact-turn-02-brief"
+    assert res["task"]["status"] == assess.FAIL
+    assert res["task"]["status"] != assess.PASS
+    assert res["reply"]["status"] == assess.REVIEW
+    evidence = res["task"]["evidence"][0]
+    assert evidence["read_bound"] is False
+    assert evidence["four_substantive_items"] is False
+    assert evidence["assistant_answer"] == assistant_ans
+    assert evidence["read_evidence"] == []
+
+
+def test_assess_task_brief_four_bullets_without_read_task_fail():
+    """Verify four substantive bullet points without bound successful read_file brief.txt yields task FAIL."""
+    bullets = (
+        "- Infrastructure migration completed across all primary clusters.\n"
+        "- Database latency decreased by 18% with connection pooling.\n"
+        "- Soak test detected three edge cases in background sync worker.\n"
+        "- Anomalies mitigated by adjusting timeout thresholds and pool limits."
+    )
+    res = assess.assess_task_brief(bullets, [])
+    assert res["name"] == "compact-turn-02-brief"
+    assert res["task"]["status"] == assess.FAIL
+    assert res["task"]["status"] != assess.PASS
+    assert res["reply"]["status"] == assess.REVIEW
+    evidence = res["task"]["evidence"][0]
+    assert evidence["read_bound"] is False
+    assert evidence["four_substantive_items"] is True
+    assert len(evidence["bullet_items"]) == 4
+
+
+@pytest.mark.parametrize("executed,refusal,status", [
+    (True, None, assess.REVIEW),
+    (False, None, assess.FAIL),
+    (True, "capacity", assess.FAIL),
+])
+def test_assess_task_brief_read_and_substantive_four_items_review_not_pass(executed, refusal, status):
+    """Verify successful bound read_file brief.txt and four substantive items yields REVIEW, never PASS."""
+    brief_content = (
+        "Harbor Desk Deployment Summary - Release Cycle 2026-Q1\n"
+        "The infrastructure migration to containerized worker nodes has completed across all four primary clusters.\n"
+        "Database latency decreased by 18% following the implementation of connection pooling and read-replica routing.\n"
+        "During the staging soak test, three edge cases were detected in the background sync worker:\n"
+        "1. Token expiration during long-running batch jobs resulted in transient HTTP 401 retries.\n"
+        "2. File descriptors exceeded the soft limit under concurrent payload downloads exceeding 50 MB.\n"
+        "3. Cache invalidation events occasionally lagged behind replica write confirmations by 150 milliseconds.\n"
+        "All three anomalies were mitigated by adjusting timeout thresholds and pool limits.\n"
+    )
+    tool_msgs = [
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_brief_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": "brief.txt"})},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_brief_1", "name": "read_file", "content": brief_content,
+         "metadata": {"executed": executed, "refusal_class": refusal}},
+    ]
+    bullets = (
+        "Here is the deployment brief summary in four bullet points:\n"
+        "1. Infrastructure migration to containerized worker nodes has completed across four primary clusters.\n"
+        "2. Database latency dropped 18% following implementation of connection pooling and read-replica routing.\n"
+        "3. Three edge cases detected in background sync worker during staging soak test.\n"
+        "4. All anomalies mitigated by adjusting timeout thresholds and connection pool limits."
+    )
+    res = assess.assess_task_brief(bullets, tool_msgs)
+    assert res["name"] == "compact-turn-02-brief"
+    assert res["task"]["status"] == status
+    assert res["task"]["status"] != assess.PASS
+    assert res["reply"]["status"] == assess.REVIEW
+    assert res["reply"]["status"] != assess.PASS
+    evidence = res["task"]["evidence"][0]
+    assert evidence["read_bound"] is (status == assess.REVIEW)
+    assert evidence["four_substantive_items"] is True
+    assert len(evidence["bullet_items"]) == 4
+    assert evidence["read_evidence"] == [brief_content]
+    assert evidence["assistant_answer"] == bullets
+
+
+
+
+def test_assess_task_brief_placeholders_and_echoes_fail():
+    """Verify empty bullets, placeholder bullets, prompt echoes, and non-4 item counts fail closed even with read_file."""
+    brief_content = "Some brief content"
+    tool_msgs = [
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": "brief.txt"})},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": brief_content,
+         "metadata": {"executed": True}},
+    ]
+    # Placeholders like Point 1, Point 2... (only 1 alphabetic word per item)
+    placeholders = "- Point 1\n- Point 2\n- Point 3\n- Point 4"
+    res_ph = assess.assess_task_brief(placeholders, tool_msgs)
+    assert res_ph["task"]["status"] == assess.FAIL
+    assert res_ph["task"]["evidence"][0]["four_substantive_items"] is False
+
+    # Prompt echo
+    echo = "1. Read brief.txt\n2. and summarize it\n3. in four\n4. short bullet points"
+    res_echo = assess.assess_task_brief(echo, tool_msgs)
+    assert res_echo["task"]["status"] == assess.FAIL
+    assert res_echo["task"]["evidence"][0]["four_substantive_items"] is False
+
+    # Empty bullets
+    empty = "- \n- \n- \n- "
+    res_empty = assess.assess_task_brief(empty, tool_msgs)
+    assert res_empty["task"]["status"] == assess.FAIL
+    assert res_empty["task"]["evidence"][0]["four_substantive_items"] is False
+
+    # Exactly four required: 5 items (even if substantive) must fail
+    five_items = (
+        "- Infrastructure migration completed across primary clusters.\n"
+        "- Database latency decreased by 18 percent.\n"
+        "- Soak test detected three background sync edge cases.\n"
+        "- Timeout thresholds and pool limits adjusted.\n"
+        "- Extra fifth item summary note."
+    )
+    res_five = assess.assess_task_brief(five_items, tool_msgs)
+    assert res_five["task"]["status"] == assess.FAIL
+    assert res_five["task"]["evidence"][0]["four_substantive_items"] is False
+    four_with_empty_fifth = five_items.rsplit("\n", 1)[0] + "\n- "
+    assert assess.assess_task_brief(four_with_empty_fifth, tool_msgs)["task"]["status"] == assess.FAIL
+
+
+def test_summarize_axes_failed_or_review_brief_blocks_automated_core_pass():
+    """Verify failed or review brief row blocks automated core pass even when all other required rows pass."""
+    rows = [{"name": name, "task": {"status": assess.PASS}, "reply": {"status": assess.PASS}} for name in assess.REQUIRED_TASKS]
+    cleanup_axis = {"status": assess.PASS}
+    tty_axis = {"status": assess.PASS}
+
+    # Case 1: compact-turn-02-brief failed -> task axis FAIL, automated core pass False, qualified False
+    for r in rows:
+        if r["name"] == "compact-turn-02-brief":
+            r["task"]["status"] = assess.FAIL
+            r["reply"]["status"] = assess.REVIEW
+    res_fail = assess.summarize_axes(rows, cleanup_axis, tty_axis, True, True, False)
+    assert res_fail["axes"]["task"] == assess.FAIL
+    assert res_fail["automated_core_pass"] is False
+    assert res_fail["qualified"] is False
+
+    # Case 2: compact-turn-02-brief in REVIEW -> task axis REVIEW, automated core pass False, independent review required
+    for r in rows:
+        if r["name"] == "compact-turn-02-brief":
+            r["task"]["status"] = assess.REVIEW
+            r["reply"]["status"] = assess.REVIEW
+    res_review = assess.summarize_axes(rows, cleanup_axis, tty_axis, True, True, False)
+    assert res_review["axes"]["task"] == assess.REVIEW
+    assert res_review["automated_core_pass"] is False
+    assert res_review["independent_review_required"] is True
+    assert res_review["qualified"] is False
+
 def test_cleanup_injection_via_sys_modules(tmp_path, monkeypatch):
     """Verify cleanup_root respects exact create_time and unconfirmed on missing psutil."""
     out = tmp_path / "output"

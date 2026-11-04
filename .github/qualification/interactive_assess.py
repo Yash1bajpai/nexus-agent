@@ -176,6 +176,66 @@ def assess_task_web_search(answer, tool_messages):
     return row
 
 
+CANONICAL_BRIEF_PROMPT = "Read brief.txt and summarize it in four short bullet points."
+_BULLET_ITEM_RE = re.compile(r"^\s*(?:[-*•+]|\d+[.)])\s+(.*)$")
+
+
+def _norm_tokens(text):
+    return " ".join(re.findall(r"[a-zA-Z0-9]+", (text or "").lower()))
+
+
+def extract_bullet_items(text):
+    if not text:
+        return []
+    items = []
+    current = []
+    for line in text.splitlines():
+        if not line.strip():
+            if current:
+                items.append(" ".join(current).strip())
+                current = []
+            continue
+        m = _BULLET_ITEM_RE.match(line)
+        if m:
+            if current:
+                items.append(" ".join(current).strip())
+            current = [m.group(1).strip()]
+        elif current:
+            current.append(line.strip())
+    if current:
+        items.append(" ".join(current).strip())
+    return items
+
+
+def assess_task_brief(answer, tool_messages):
+    messages = [_plain(message) for message in tool_messages]
+    read_results = tool_evidence(messages, "read_file", "brief.txt")
+    executed = [message for message in messages if message.get("role") != "tool"
+                or (message.get("metadata", {}).get("executed") is True
+                    and not message.get("metadata", {}).get("refusal_class"))]
+    successful = _successful(tool_evidence(executed, "read_file", "brief.txt"))
+    read_ok = bool(successful)
+
+    items = extract_bullet_items(answer or "")
+    exact_four = len(items) == 4
+    nontrivial = all(len(re.findall(r"[a-zA-Z]+", it)) >= 2 for it in items)
+    not_prompt_echo = _norm_tokens(" ".join(items)) != _norm_tokens(CANONICAL_BRIEF_PROMPT)
+
+    items_ok = exact_four and nontrivial and not_prompt_echo
+    valid = read_ok and items_ok
+
+    evidence_record = {
+        "read_evidence": read_results,
+        "assistant_answer": answer or "",
+        "bullet_items": items,
+        "read_bound": read_ok,
+        "four_substantive_items": items_ok,
+    }
+
+    status = REVIEW if valid else FAIL
+    return _row("compact-turn-02-brief", status, evidence_record, REVIEW)
+
+
 def assess_compact_recall(answer, expected_codename="Amber-Kite-731"):
     text = (answer or "").lower()
     if expected_codename.lower() in text:
@@ -200,7 +260,7 @@ def assess_cleanup(owned_metadata, killed_pids, remaining_llama, confirmed, erro
     return _axis(PASS if valid else INCOMPLETE, {"owned": len(owned_metadata), "remaining_llama": remaining_llama, "errors": errors})
 
 
-REQUIRED_TASKS = ("row-01-readme", "row-02-greeting", "row-03-calculator-review", "row-04-slash-review", "row-05-calculator-fix", "row-06-web-search", "compact-context-before", "compact-row-06-slash-compact", "compact-context-after", "compact-row-08-recall")
+REQUIRED_TASKS = ("row-01-readme", "row-02-greeting", "row-03-calculator-review", "row-04-slash-review", "row-05-calculator-fix", "row-06-web-search", "compact-turn-02-brief", "compact-context-before", "compact-row-06-slash-compact", "compact-context-after", "compact-row-08-recall")
 
 
 def summarize_axes(rows, cleanup_axis, tty_axis, model_initial_ok, model_final_ok, budget_expired):

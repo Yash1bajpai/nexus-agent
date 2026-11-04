@@ -669,6 +669,8 @@ def _execute_protocol_session(protocol: List[Dict[str, Any]], session_id: str, p
             row_res = assess.assess_task_calculator_fix(beh_ok, add_ok, before_files.get("calculator.py", ""), after_files.get("calculator.py", ""), delta_msgs)
         elif name == "row-06-web-search":
             row_res = assess.assess_task_web_search(assistant_ans, delta_msgs)
+        elif name == "compact-turn-02-brief":
+            row_res = assess.assess_task_brief(assistant_ans, delta_msgs)
         elif name == "compact-context-before":
             context_metrics_before = assess.parse_context_output(raw_chunk)
             row_res = assess.assess_context_command(context_metrics_before, "before")
