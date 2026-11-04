@@ -258,19 +258,26 @@ def function_request_prose(request: str) -> str:
 
 _PYTHON_NAME = r"[A-Za-z_][A-Za-z_0-9]*"
 _FUNCTION_ACTION = re.compile(
-    r"(?:^|[,;.!]\s*|\b(?:then|and)\s+)(?:please\s+)?(?:"
+    r"(?:^\s*|[,;.!]\s*|\b(?:then|and)\s+)(?:please\s+)?"
+    r"(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?(?:"
     r"rename\s+(?:the\s+)?(?:" + _PYTHON_NAME + r"\s+function|function\s+" + _PYTHON_NAME
     + r")\s+to\s+(?P<rename>" + _PYTHON_NAME + r")\b|"
     r"(?:add|create|define)\s+(?:(?:a|the)\s+)?(?:"
-    r"(?P<add>" + _PYTHON_NAME + r")\s*\([^()\n]*\)\s+function\b|"
+    r"(?P<add>" + _PYTHON_NAME + r")\s*\([^()\n]*\)(?:\s+function\b|"
+    r"(?=\s*(?:[,;.!?]|\b(?:to|in|that|which|and|then|with)\b|$)))|"
+    r"(?P<named>" + _PYTHON_NAME + r")\s+function\b|"
     r"function\s+(?P<define>" + _PYTHON_NAME + r")\b"
-    r"(?=\s*(?:\(|[,;.!?]|\b(?:that|which|and|then|with)\b|$))))",
+    r"(?=\s*(?:\(|[,;.!?]|\b(?:to|in|that|which|and|then|with)\b|$))))",
     re.IGNORECASE,
 )
+_FUNCTION_NOUN_FILLERS = frozenset({
+    "a", "an", "the", "function", "to", "in", "for", "with", "and", "or",
+    "that", "which", "please", "named", "called", "new",
+})
 
 
 def requested_function_names(prose: str) -> List[str]:
-    """Recognize explicit imperative rename/add/create/define forms, not semantics."""
+    """Recognize bounded direct rename/add/create/define requests, not semantics."""
     intent = re.sub(r"^\s*(?:in|for)\s+[^,;\n]+,\s*", "", prose, flags=re.IGNORECASE)
     if re.match(
         r"^\s*(?:please\s+)?(?:how\b|what\b|why\b|when\b|where\b|explain\b|describe\b|"
@@ -280,7 +287,14 @@ def requested_function_names(prose: str) -> List[str]:
         return []
     names = []
     for match in _FUNCTION_ACTION.finditer(prose):
-        name = match.group("rename") or match.group("add") or match.group("define")
+        name = (
+            match.group("rename") or match.group("add")
+            or match.group("named") or match.group("define")
+        )
+        # Articles/linking words are not missing names. Parentheses and rename
+        # targets make identifiers explicit; keep their existing name semantics.
+        if not (match.group("rename") or match.group("add")) and name.casefold() in _FUNCTION_NOUN_FILLERS:
+            continue
         if name.isidentifier() and not keyword.iskeyword(name) and name not in names:
             names.append(name)
     return names
