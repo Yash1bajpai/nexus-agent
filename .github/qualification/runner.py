@@ -309,6 +309,7 @@ def native_gate(args):
     staged = stage_tests(args.source_root, root / "reviewed-tests", contract(args.source_root))
     write_json(root / "output/native-spec.json", {"provenance": provenance, "staged": staged})
     environment = child_environment(root / "state/test-home", root / "state/test-tmp")
+    environment["NEXUS_Q1_OUTPUT_DIR"] = str(root / "output")
     owner = owned_module(args.source_root)
     command = [sys.executable, "-I", "-X", "utf8", str(Path(args.source_root) / ".github/qualification/runner.py"),
                "_pytest", "--root", str(root), "--wheel", str(args.wheel),
@@ -316,6 +317,9 @@ def native_gate(args):
     with owner.ProcessDomain(root / "output/native-process", deadline=deadline_from_file(args.deadline_file)) as domain:
         result = domain.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment)
         write_json(root / "output/native-lifecycle.json", domain.records)
+        # Collect any test-generated diagnostic artifacts into dedicated output before failure upload
+        for p in (root / "state").rglob("*diagnostic*.json"):
+            shutil.copy2(p, root / "output" / p.name)
     results_path = root / "output/native-results.json"
     require(results_path.is_file(), "Native test outcomes unavailable; no model fetch")
     results = json.loads(results_path.read_text())

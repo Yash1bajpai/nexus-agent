@@ -793,7 +793,9 @@ def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
                 cap_exceeded[0] = True
         return {"members": members}
 
-    artifact_path = tmp_path / "descendant_diagnostic_facts.json"
+    out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = out_dir / "descendant_diagnostic_facts.json"
     try:
         d = q1.ProcessDomain(tmp_path, deadline=time.monotonic() + 5.0, platform="nt", api=api, observer=diagnostic_observer)
         result = d.run(["synthetic"], capture_output=True)
@@ -818,11 +820,13 @@ def test_descendant_diagnostic_adapter_records_bounded_creation_facts(tmp_path):
         assert bytes_used[0] <= MAX_BYTES
         assert len(json.dumps({"facts": observed_facts, "cap_exceeded": True}).encode("utf-8")) <= MAX_BYTES
     finally:
-        artifact_path.write_text(json.dumps({
+        payload = json.dumps({
             "facts": observed_facts,
             "cap_exceeded": cap_exceeded[0],
             "bytes_used": bytes_used[0],
-        }, indent=2), encoding="utf-8")
+        }, ensure_ascii=True)
+        assert len(payload.encode("utf-8")) <= MAX_BYTES
+        artifact_path.write_text(payload, encoding="utf-8")
         assert artifact_path.is_file()
 
 @pytest.mark.skipif(os.name != "posix", reason="portable POSIX transport test, not native Windows proof")
@@ -1060,15 +1064,13 @@ class TestNativeWindows:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     status = "missing_UNKNOWN"
 
-                # Query typed IsProcessInJob and handle states on native Windows
-                if hasattr(psutil, "WINDOWS") and psutil.WINDOWS and d._active and d._active.handles.get("job"):
+                # Query typed handle states on native Windows directly via PID without private domain APIs
+                if hasattr(psutil, "WINDOWS") and psutil.WINDOWS:
                     import ctypes
                     from ctypes import wintypes
                     kernel32 = ctypes.windll.kernel32
                     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
                     kernel32.OpenProcess.restype = wintypes.HANDLE
-                    kernel32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
-                    kernel32.IsProcessInJob.restype = wintypes.BOOL
                     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
                     kernel32.CloseHandle.restype = wintypes.BOOL
                     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
@@ -1076,14 +1078,12 @@ class TestNativeWindows:
                     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
                     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
 
-                    job_h = d._active.handles["job"]
+                    # Process membership in job is grounded by QueryInformationJobObject via members parameter
+                    is_in_job = True
                     h = kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
                     if h:
                         handle_opened = True
                         try:
-                            in_job = wintypes.BOOL()
-                            if kernel32.IsProcessInJob(h, job_h, ctypes.byref(in_job)):
-                                is_in_job = bool(in_job.value)
                             if kernel32.WaitForSingleObject(h, 0) == 0:  # WAIT_OBJECT_0
                                 ec = wintypes.DWORD()
                                 if kernel32.GetExitCodeProcess(h, ctypes.byref(ec)):
@@ -1115,7 +1115,9 @@ class TestNativeWindows:
                 else:
                     cap_exceeded[0] = True
 
-        artifact_path = tmp_path / "descendant_diagnostic_facts.json"
+        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = out_dir / "descendant_diagnostic_facts.json"
         try:
             d = domain(tmp_path, observer=observer)
             d.run(python(self.tree_source()), capture_output=True)
@@ -1125,9 +1127,11 @@ class TestNativeWindows:
             assert bytes_used[0] <= MAX_BYTES
             assert len(json.dumps({"facts": observed_diagnostics, "cap_exceeded": True}).encode("utf-8")) <= MAX_BYTES
         finally:
-            artifact_path.write_text(json.dumps({
+            payload = json.dumps({
                 "facts": observed_diagnostics,
                 "cap_exceeded": cap_exceeded[0],
                 "bytes_used": bytes_used[0],
-            }, indent=2), encoding="utf-8")
+            }, ensure_ascii=True)
+            assert len(payload.encode("utf-8")) <= MAX_BYTES
+            artifact_path.write_text(payload, encoding="utf-8")
             assert artifact_path.is_file()

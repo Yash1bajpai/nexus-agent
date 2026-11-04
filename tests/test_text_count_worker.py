@@ -1077,6 +1077,11 @@ def test_count_identity_diagnostics_installed_worker_passive_wrapper(tmp_path, m
         assert recorder.events[1]["identity_match"] is True
     finally:
         os.close(fd)
+        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
+        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
 
     assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
 
@@ -1104,10 +1109,75 @@ def test_count_identity_diagnostics_installed_worker_mismatch_refusal(tmp_path, 
         return res
 
     monkeypatch.setattr(worker, "_reliable_identity", mismatched_reliable)
-    with pytest.raises(worker._PathRefusal) as caught:
-        worker._open_validated("sample.txt")
-    assert caught.value.reason == "changed"
-    assert recorder.first_mismatch is not None
-    assert recorder.first_mismatch["phase"] == "open.initial_vs_fstat"
-    assert "st_mtime_ns" in recorder.first_mismatch["differing_fields"]
+    try:
+        with pytest.raises(worker._PathRefusal) as caught:
+            worker._open_validated("sample.txt")
+        assert caught.value.reason == "changed"
+        assert recorder.first_mismatch is not None
+        assert recorder.first_mismatch["phase"] == "open.initial_vs_fstat"
+        assert "st_mtime_ns" in recorder.first_mismatch["differing_fields"]
+    finally:
+        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
+        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
+    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+
+
+def test_count_identity_diagnostics_check_identity_path_mismatch_refusal(tmp_path, monkeypatch):
+    """DiagnosticWorkerWrapper captures path mismatch in check_identity without extra stat calls."""
+    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
+    recorder = CountIdentityRecorder(tmp_path)
+    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
+    wrapper.install(worker)
+
+    target = tmp_path / "sample.txt"
+    target.write_text("hello world\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    fd, target_path, before = worker._open_validated("sample.txt")
+    try:
+        monkeypatch.setattr(worker, "_opened_path", lambda f: tmp_path / "other.txt")
+        with pytest.raises(worker._PathRefusal) as caught:
+            worker._check_identity(fd, "sample.txt", target_path, before)
+        assert caught.value.reason == "changed"
+        assert recorder.first_mismatch is not None
+        assert recorder.first_mismatch["phase"] == "check_identity.refusal"
+    finally:
+        os.close(fd)
+        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
+        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
+    assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+
+
+def test_count_identity_diagnostics_check_identity_stat_mismatch_refusal(tmp_path, monkeypatch):
+    """DiagnosticWorkerWrapper captures stat mismatch in check_identity recheck without extra stat calls."""
+    from tests._count_identity_diagnostics import CountIdentityRecorder, DiagnosticWorkerWrapper
+    recorder = CountIdentityRecorder(tmp_path)
+    wrapper = DiagnosticWorkerWrapper(recorder, monkeypatch)
+    wrapper.install(worker)
+
+    target = tmp_path / "sample.txt"
+    target.write_text("hello world\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    fd, target_path, before = worker._open_validated("sample.txt")
+    try:
+        different_before = (before[0], before[1], before[2], before[3], before[4] + 1234, before[5])
+        with pytest.raises(worker._PathRefusal) as caught:
+            worker._check_identity(fd, "sample.txt", target_path, different_before)
+        assert caught.value.reason == "changed"
+        assert recorder.first_mismatch is not None
+        assert recorder.first_mismatch["phase"] == "check_identity.refusal"
+    finally:
+        os.close(fd)
+        out_dir = Path(os.environ.get("NEXUS_Q1_OUTPUT_DIR", str(tmp_path)))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(recorder.to_dict(), ensure_ascii=True)
+        assert len(payload.encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
+        (out_dir / "count_identity_facts.json").write_text(payload, encoding="utf-8")
     assert len(json.dumps(recorder.to_dict(), ensure_ascii=True).encode("utf-8")) <= CountIdentityRecorder.MAX_BYTES
