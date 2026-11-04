@@ -24,6 +24,8 @@ def candidate(tmp_path, monkeypatch):
     gate = gate_module()
     repo = LocalRepository(tmp_path / "repository")
     repo.write("src/preserved.py", "frozen production\n")
+    for name in gate.ALLOWED_PATHS:
+        repo.write(name, "historical reviewed B bytes\n")
     parent_tree = repo.stage_tree()
     parent = repo.commit_tree(parent_tree)
     repo.head(parent)

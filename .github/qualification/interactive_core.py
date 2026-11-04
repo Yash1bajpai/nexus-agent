@@ -194,40 +194,89 @@ def check_evidence_cap(output_dir: Path, cap: int = EVIDENCE_CAP, reserve: int =
     return total
 
 
+def record_observation_error(root: Path | str, error_msg: str) -> None:
+    """Record observation error into persistent evidence."""
+    try:
+        output_dir = Path(root) / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        err_file = output_dir / "observation_errors.json"
+        errs = []
+        if err_file.exists():
+            try:
+                loaded = json.loads(err_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    errs = loaded
+                elif loaded:
+                    errs = [str(loaded)]
+            except Exception:
+                errs = []
+        errs.append(str(error_msg))
+        err_file.write_text(json.dumps(errs, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"Observation error (evidence write failed: {type(exc).__name__}): {error_msg}", file=sys.stderr)
+
+
 def record_owned_process(root: Path, pid: int) -> None:
     """Record owned process metadata for cleanup."""
+    if pid <= 0:
+        err = f"Invalid PID {pid} to record as owned process"
+        record_observation_error(root, err)
+        raise ValueError(err)
+
     output_dir = Path(root) / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     owned_file = output_dir / "owned_processes.json"
     owned = []
     if owned_file.exists():
         try:
-            owned = json.loads(owned_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    create_time = 0.0
-    exe, cmdline = "", []
+            loaded = json.loads(owned_file.read_text(encoding="utf-8"))
+            if not isinstance(loaded, list):
+                raise ValueError("owned metadata must be a list")
+            owned = loaded
+        except Exception as exc:
+            err = f"owned metadata unreadable: {exc}"
+            record_observation_error(root, err)
+            raise RuntimeError(err)
+
+
     try:
         import psutil
         proc = psutil.Process(pid)
         create_time = proc.create_time()
+        if create_time <= 0:
+            err = f"Process {pid} returned non-positive create_time: {create_time}"
+            record_observation_error(root, err)
+            raise RuntimeError(err)
         exe, cmdline = proc.exe(), proc.cmdline()
-    except Exception:
-        pass
-    if create_time > 0 and not any(e.get("pid") == pid for e in owned):
-        owned.append({"pid": pid, "create_time": create_time, "exe": exe, "cmdline": cmdline})
+    except Exception as exc:
+        record_observation_error(root, f"psutil inspection failed for PID {pid}: {exc}")
+        raise
+    if any(e.get("pid") == pid and e.get("create_time") == create_time for e in owned):
+        return
+
+    owned.append({"pid": pid, "create_time": create_time, "exe": exe, "cmdline": cmdline})
+    try:
         owned_file.write_text(json.dumps(owned, indent=2), encoding="utf-8")
+    except Exception as exc:
+        record_observation_error(root, f"Failed to write owned_processes.json: {exc}")
+        raise
 
 
 def scan_and_record_descendants(root: Path, parent_pid: int) -> None:
     """Scan and record child processes of parent PID."""
+    if parent_pid <= 0:
+        err = f"Invalid parent PID {parent_pid} for descendant scan"
+        record_observation_error(root, err)
+        raise ValueError(err)
     try:
         import psutil
-        for child in psutil.Process(parent_pid).children(recursive=True):
-            record_owned_process(root, child.pid)
-    except Exception:
-        pass
-
+        proc = psutil.Process(parent_pid)
+        children = proc.children(recursive=True)
+    except Exception as exc:
+        record_observation_error(root, f"psutil scan children failed for PID {parent_pid}: {exc}")
+        raise
+    for child in children:
+        record_owned_process(root, child.pid)
 
 def fetch_sqlite_messages(db_path: Path, session_id: str) -> List[Dict[str, Any]]:
     """Query synthetic session messages from history.db in read-only mode, extracting tool bindings."""
@@ -351,8 +400,12 @@ class PtySession:
         self.error_flag: Optional[str] = None
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
-        if self.pid > 0:
+        try:
             record_owned_process(self.root, self.pid)
+        except Exception as exc:
+            self.error_flag = f"root_ownership_failed: {exc}"
+            record_observation_error(self.root, self.error_flag)
+            self.close()
 
     def _reader_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -380,6 +433,17 @@ class PtySession:
                 self.error_flag = f"read_error: {type(e).__name__}"
                 break
 
+    def _scan_descendants(self) -> bool:
+        if self.error_flag:
+            return False
+        if self.pid > 0:
+            try:
+                scan_and_record_descendants(self.root, self.pid)
+            except Exception as exc:
+                self.error_flag = f"descendant_observation_error: {exc}"
+                return False
+        return True
+
     def wait_for_ready_prompt(self, timeout: float, deadline: float, prompt_pattern: str = r"^>>\s*You:?\s*$") -> Tuple[str, bool]:
         start = time.monotonic()
         buf = ""
@@ -395,17 +459,17 @@ class PtySession:
                 self.all_output += chunk
                 lines = [l.strip() for l in assess.strip_ansi(buf).splitlines() if l.strip()]
                 if lines and re.match(prompt_pattern, lines[-1]):
-                    if self.pid > 0:
-                        scan_and_record_descendants(self.root, self.pid)
+                    if not self._scan_descendants():
+                        return buf, False
                     return buf, True
             except queue.Empty:
-                if self.pid > 0:
-                    scan_and_record_descendants(self.root, self.pid)
+                if not self._scan_descendants():
+                    return buf, False
                 continue
         lines = [l.strip() for l in assess.strip_ansi(buf).splitlines() if l.strip()]
         found = bool(lines and re.match(prompt_pattern, lines[-1])) and not bool(self.error_flag)
-        if self.pid > 0:
-            scan_and_record_descendants(self.root, self.pid)
+        if not self._scan_descendants():
+            return buf, False
         return buf, found
 
     def wait_for_exit(self, timeout: float = PROCESS_EXIT_TIMEOUT, deadline: Optional[float] = None) -> Tuple[str, bool]:
@@ -427,6 +491,8 @@ class PtySession:
         return buf, not alive and not self.error_flag
 
     def send_input(self, text: str) -> None:
+        if self.error_flag:
+            raise RuntimeError(f"Cannot send input after session failure: {self.error_flag}")
         self.pty.write(text)
 
     def close(self) -> None:
@@ -443,12 +509,34 @@ def cleanup_root(root: Path | str) -> Dict[str, Any]:
     root = Path(root).resolve()
     output_dir = root / "output"
     owned_file = output_dir / "owned_processes.json"
+    obs_errors_file = output_dir / "observation_errors.json"
     killed, errors, remaining, remaining_llama = [], [], [], []
-    try:
-        owned = json.loads(owned_file.read_text()) if owned_file.exists() else []
-    except (OSError, ValueError):
+
+    if obs_errors_file.exists():
+        try:
+            loaded_errs = json.loads(obs_errors_file.read_text(encoding="utf-8"))
+            if isinstance(loaded_errs, list):
+                errors.extend(str(e) for e in loaded_errs)
+            elif loaded_errs:
+                errors.append(str(loaded_errs))
+        except (OSError, ValueError) as exc:
+            errors.append(f"observation errors unreadable: {type(exc).__name__}")
+
+    if not owned_file.exists():
         owned = []
-        errors.append("owned metadata unreadable")
+        errors.append("missing owned metadata")
+    else:
+        try:
+            owned = json.loads(owned_file.read_text(encoding="utf-8"))
+            if (not isinstance(owned, list) or not owned or
+                    any(not isinstance(e, dict) or not isinstance(e.get("pid"), int)
+                        or e["pid"] <= 0 or not isinstance(e.get("create_time"), (int, float))
+                        or not e["create_time"] > 0 for e in owned)):
+                owned = []
+                errors.append("missing owned metadata")
+        except (OSError, ValueError):
+            owned = []
+            errors.append("owned metadata unreadable")
     try:
         import psutil
     except ImportError:
@@ -498,7 +586,7 @@ def cleanup_root(root: Path | str) -> Dict[str, Any]:
                     remaining_llama.append(process.pid)
         except Exception as exc:
             errors.append("owned process final check: " + type(exc).__name__)
-    result = {"confirmed": not errors and not remaining and not remaining_llama,
+    result = {"confirmed": bool(owned) and not errors and not remaining and not remaining_llama,
               "owned_count": len(owned), "killed_pids": killed, "remaining_owned": remaining,
               "remaining_llama_servers": remaining_llama, "errors": errors}
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -517,7 +605,7 @@ def _execute_protocol_session(protocol: List[Dict[str, Any]], session_id: str, p
 
     for idx, step in enumerate(protocol):
         name, kind, prompt, timeout = step["name"], step["kind"], step["prompt"], step["timeout"]
-        if session_stopped or time.monotonic() >= deadline:
+        if session_stopped or pty.error_flag or time.monotonic() >= deadline:
             target_rows[idx] = {"name": name, "task": {"status": assess.NOT_RUN, "evidence": ["Session stopped or deadline exhausted"]}}
             continue
 

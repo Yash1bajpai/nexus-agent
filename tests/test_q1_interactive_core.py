@@ -34,10 +34,20 @@ assess = _load_module("interactive_assess_under_test", ".github/qualification/in
 core = _load_module("interactive_core_under_test", ".github/qualification/interactive_core.py")
 
 
+def mock_successful_ownership(monkeypatch, root: Path, pid: int = 4242) -> None:
+    """Record fake facts and mock process recording without launching real processes."""
+    out = root / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    facts = [{"pid": pid, "create_time": 1000.0, "exe": "mock.exe", "cmdline": ["mock"]}]
+    (out / "owned_processes.json").write_text(json.dumps(facts), encoding="utf-8")
+    monkeypatch.setattr(core, "record_owned_process", lambda r, p: None)
+    monkeypatch.setattr(core, "scan_and_record_descendants", lambda r, p: None)
+
+
 class FakePtyProcess:
     """Mock PtyProcess for testing waiter logic, echo rejection, and timeouts."""
 
-    def __init__(self, chunks, pid=0):
+    def __init__(self, chunks, pid=4242):
         self.chunks = list(chunks)
         self.pid = pid
         self._alive = True
@@ -76,8 +86,9 @@ def test_parse_tty_probe():
     assert assess.parse_tty_probe(bad)["observed"] is False
 
 
-def test_ready_prompt_detection_vs_echo(tmp_path):
+def test_ready_prompt_detection_vs_echo(tmp_path, monkeypatch):
     """Verify PtySession.wait_for_ready_prompt rejects echoed input and detects clean ready prompt."""
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
     fake = FakePtyProcess([
         ">> You: Read readme.txt\r\n",  # Echo of input
         "Processing...\r\n",
@@ -92,8 +103,9 @@ def test_ready_prompt_detection_vs_echo(tmp_path):
         session.close()
 
 
-def test_wait_for_ready_prompt_timeout(tmp_path):
+def test_wait_for_ready_prompt_timeout(tmp_path, monkeypatch):
     """Verify PtySession.wait_for_ready_prompt returns False when ready prompt is not emitted."""
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
     fake = FakePtyProcess(["Still working...\r\n"])
     session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
     try:
@@ -336,7 +348,8 @@ def test_assess_task_web_search_evidence_matching_and_outage():
     ]
     ans_grounded = f"The latest release is b4100 at {url}"
     res_ok = assess.assess_task_web_search(ans_grounded, tool_msgs)
-    assert res_ok["task"]["status"] == assess.PASS
+    assert res_ok["task"]["status"] == assess.REVIEW
+    assert res_ok["reply"]["status"] == assess.REVIEW
     assert res_ok["network"]["status"] == assess.PASS
 
     # Outage with error context and honest report
@@ -353,8 +366,8 @@ def test_assess_task_web_search_evidence_matching_and_outage():
 
 def test_assess_compact_recall_honest_unknown():
     res_ok = assess.assess_compact_recall("The codename is Amber-Kite-731.", "Amber-Kite-731")
-    assert res_ok["task"]["status"] == assess.PASS
-    assert res_ok["reply"]["status"] == assess.PASS
+    assert res_ok["task"]["status"] == assess.REVIEW
+    assert res_ok["reply"]["status"] == assess.REVIEW
 
     res_honest = assess.assess_compact_recall("I do not recall what codename was mentioned.", "Amber-Kite-731")
     assert res_honest["task"]["status"] == assess.FAIL
@@ -373,8 +386,9 @@ def test_cleanup_injection_via_sys_modules(tmp_path, monkeypatch):
     assert res["confirmed"] is False
 
 
-def test_protocol_timeout_and_remaining_not_run(tmp_path):
+def test_protocol_timeout_and_remaining_not_run(tmp_path, monkeypatch):
     """Verify _execute_protocol_session marks timed out step INCOMPLETE and remaining NOT_RUN."""
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
     fake_pty = FakePtyProcess([])  # Empty chunks => will time out
     session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake_pty)
     try:
@@ -416,7 +430,8 @@ def test_check_evidence_cap(tmp_path):
         core.check_evidence_cap(out, cap=1500, reserve=1000)
 
 
-def test_reader_cap_is_incomplete_not_silent_success(tmp_path):
+def test_reader_cap_is_incomplete_not_silent_success(tmp_path, monkeypatch):
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
     fake = FakePtyProcess(["extra\n", ">> You: "])
     tracker = [core.EVIDENCE_CAP - core.MANIFEST_RESERVE]
     session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake, byte_tracker=tracker)
@@ -439,3 +454,109 @@ def test_unrun_and_environment_blocked_are_not_product_failure():
     result = assess.summarize_axes(rows, {"status": assess.PASS}, {"status": assess.PASS}, True, True, False)
     assert result["axes"]["task"] == assess.ENVIRONMENT_BLOCKED
     assert result["qualified"] is False
+
+
+def test_regression_ownership_fail_closed_on_unrecorded_root_and_observation_failure(tmp_path, monkeypatch):
+    """Verify unrecorded root PID fails closed, halts ready prompt, and rejects send_input."""
+    fake = FakePtyProcess([">> You: "], pid=0)
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
+    try:
+        assert session.error_flag is not None
+        assert "root_ownership_failed" in session.error_flag
+        buf, ready = session.wait_for_ready_prompt(timeout=0.1, deadline=time.monotonic() + 0.1)
+        assert ready is False
+        with pytest.raises(RuntimeError, match="Cannot send input"):
+            session.send_input("test\n")
+    finally:
+        session.close()
+
+    cleanup_res = core.cleanup_root(tmp_path)
+    assert cleanup_res["confirmed"] is False
+    assert any("root_ownership_failed" in err for err in cleanup_res["errors"])
+    axis = assess.assess_cleanup([], cleanup_res["killed_pids"], cleanup_res["remaining_llama_servers"],
+                                 cleanup_res["confirmed"], cleanup_res["errors"])
+    assert axis["status"] == assess.INCOMPLETE
+
+
+def test_regression_descendant_observation_failure_halts_session(tmp_path, monkeypatch):
+    """Verify descendant observation scanning failure propagates error_flag, stops waiter, and rejects input."""
+    mock_successful_ownership(monkeypatch, tmp_path, pid=4242)
+    fake = FakePtyProcess([">> You: "], pid=4242)
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
+    try:
+        def _failing_scan(root, pid):
+            core.record_observation_error(root, "descendant scan failed")
+            raise RuntimeError("descendant scan failed")
+
+        monkeypatch.setattr(core, "scan_and_record_descendants", _failing_scan)
+        buf, ready = session.wait_for_ready_prompt(timeout=0.2, deadline=time.monotonic() + 0.2)
+        assert ready is False
+        assert "descendant_observation_error" in (session.error_flag or "")
+        with pytest.raises(RuntimeError, match="Cannot send input"):
+            session.send_input("test\n")
+    finally:
+        session.close()
+
+    cleanup_res = core.cleanup_root(tmp_path)
+    assert cleanup_res["confirmed"] is False
+    assert any("descendant" in err for err in cleanup_res["errors"])
+
+
+def test_regression_missing_owned_metadata_not_confirmed(tmp_path):
+    """Verify missing owned_processes.json fails closed and never confirms empty success."""
+    res = core.cleanup_root(tmp_path)
+    assert res["confirmed"] is False
+    assert "missing owned metadata" in res["errors"]
+    axis = assess.assess_cleanup([], res["killed_pids"], res["remaining_llama_servers"], res["confirmed"], res["errors"])
+    assert axis["status"] == assess.INCOMPLETE
+
+
+def test_regression_search_mismatched_tag_url_cannot_pass():
+    """Verify search does not PASS from independent tag/url intersections; requires REVIEW."""
+    evidence = (
+        "Release b1234 notes: see https://github.com/ggerganov/llama.cpp/releases/tag/b1234\n"
+        "Previous release was b9999 at https://github.com/ggerganov/llama.cpp/releases/tag/b9999"
+    )
+    tool_msgs = [
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "search_web", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "search_web", "content": evidence},
+    ]
+    ans_mismatched = "The latest release is b1234 at https://github.com/ggerganov/llama.cpp/releases/tag/b9999"
+    res = assess.assess_task_web_search(ans_mismatched, tool_msgs)
+    assert res["task"]["status"] != assess.PASS
+    assert res["task"]["status"] == assess.REVIEW
+    assert res["reply"]["status"] == assess.REVIEW
+
+
+def test_regression_uncertain_seed_mention_cannot_pass():
+    """Verify assistant mentioning seed with uncertainty does not PASS; requires REVIEW."""
+    ans_uncertain = "I cannot remember whether it was Amber-Kite-731 or something else."
+    res = assess.assess_compact_recall(ans_uncertain, "Amber-Kite-731")
+    assert res["task"]["status"] != assess.PASS
+    assert res["task"]["status"] == assess.REVIEW
+    assert res["reply"]["status"] == assess.REVIEW
+
+
+@pytest.mark.parametrize("observation", ["inspection_failure", "zero_create_time"])
+def test_regression_positive_root_without_observed_identity_cannot_feed(tmp_path, monkeypatch, observation):
+    from types import SimpleNamespace
+
+    def create_time():
+        if observation == "inspection_failure":
+            raise OSError("root inspection failed")
+        return 0.0
+
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(
+        Process=lambda pid: SimpleNamespace(create_time=create_time)))
+    fake = FakePtyProcess([">> You: "], pid=4242)
+    monkeypatch.setattr(fake, "write", lambda text: pytest.fail("Prompt fed without root identity"))
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
+    try:
+        assert "root_ownership_failed" in session.error_flag
+        with pytest.raises(RuntimeError, match="Cannot send input"):
+            session.send_input("must not run\r")
+        assert not (tmp_path / "output/owned_processes.json").exists()
+        errors = json.loads((tmp_path / "output/observation_errors.json").read_text())
+        assert any("root_ownership_failed" in message for message in errors)
+    finally:
+        session.close()

@@ -150,15 +150,28 @@ def assess_task_web_search(answer, tool_messages):
     evidence = "\n".join(successful)
     evidence_urls = {m.rstrip(".,;").lower() for m in _RELEASE_URL.findall(evidence)}
     evidence_tags = {m.lower() for m in _TAG.findall(evidence)}
-    grounded = bool(answer_urls & evidence_urls) and bool(answer_tags & evidence_tags)
-    if grounded:
-        row = _row("row-06-web-search", PASS, "Official release URL and tag match bound successful search result", PASS)
-    elif outage:
+
+    evidence_record = {
+        "search_evidence": successful,
+        "outages": errors,
+        "assistant_answer": text,
+        "answer_urls": sorted(answer_urls),
+        "answer_tags": sorted(answer_tags),
+        "evidence_urls": sorted(evidence_urls),
+        "evidence_tags": sorted(evidence_tags),
+    }
+
+    if outage:
         claimed_release = bool(answer_urls and answer_tags)
         honest = bool(re.search(r"cannot|can't|unable|unavailable|failed|could not|error", text, re.I)) and not claimed_release
-        row = _row("row-06-web-search", ENVIRONMENT_BLOCKED if not claimed_release else FAIL, "Observed search outage", PASS if honest else REVIEW if not claimed_release else FAIL)
+        row = _row("row-06-web-search", ENVIRONMENT_BLOCKED if not claimed_release else FAIL, evidence_record, PASS if honest else REVIEW if not claimed_release else FAIL)
+    elif not successful:
+        row = _row("row-06-web-search", FAIL, evidence_record, REVIEW)
     else:
-        row = _row("row-06-web-search", FAIL if not successful else REVIEW, "Search result/assistant URL and tag not established")
+        # Semantic checks all REVIEW for independent reading (preferred minimal option).
+        # No PASS from independent tag/url intersections.
+        row = _row("row-06-web-search", REVIEW, evidence_record, REVIEW)
+
     row["network"] = _axis(ENVIRONMENT_BLOCKED if outage and not successful else PASS if successful else REVIEW, "Only observed tool results establish network state")
     return row
 
@@ -166,10 +179,10 @@ def assess_task_web_search(answer, tool_messages):
 def assess_compact_recall(answer, expected_codename="Amber-Kite-731"):
     text = (answer or "").lower()
     if expected_codename.lower() in text:
-        return _row("compact-row-08-recall", PASS, "Earlier seed recalled in assistant answer", PASS)
+        # Seed substring presence requires independent reading; uncertainty cannot PASS.
+        return _row("compact-row-08-recall", REVIEW, "Earlier seed mentioned in assistant answer; requires independent reading", REVIEW)
     honest = bool(re.search(r"don't (?:know|recall)|do not (?:know|recall)|cannot remember|can't remember|not remember|unknown|forgot", text))
     return _row("compact-row-08-recall", FAIL, "Earlier seed not recalled", PASS if honest else REVIEW)
-
 
 def assess_compact_slash(compact_parsed, session_messages, seed_prefix="[Earlier conversation compacted"):
     notes = [m.get("content", "") for m in session_messages if m.get("role") == "user" and seed_prefix.lower() in str(m.get("content", "")).lower()]
@@ -183,7 +196,8 @@ def assess_context_command(metrics, step_label):
 
 
 def assess_cleanup(owned_metadata, killed_pids, remaining_llama, confirmed, errors):
-    return _axis(PASS if confirmed and not remaining_llama and not errors else INCOMPLETE, {"owned": len(owned_metadata), "remaining_llama": remaining_llama, "errors": errors})
+    valid = bool(confirmed and owned_metadata and not remaining_llama and not errors)
+    return _axis(PASS if valid else INCOMPLETE, {"owned": len(owned_metadata), "remaining_llama": remaining_llama, "errors": errors})
 
 
 REQUIRED_TASKS = ("row-01-readme", "row-02-greeting", "row-03-calculator-review", "row-04-slash-review", "row-05-calculator-fix", "row-06-web-search", "compact-context-before", "compact-row-06-slash-compact", "compact-context-after", "compact-row-08-recall")

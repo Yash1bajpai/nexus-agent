@@ -14,8 +14,8 @@ from pathlib import Path, PurePosixPath
 import re
 import sys
 
-PARENT = "ceee768ec7580489c35949498491e7b1cbbd5fa4"
-PARENT_TREE = "3491413724c1f23e59c30168a088816692370194"
+PARENT = "92312e6a862e1493ec24702d56f57c8c505d6691"
+PARENT_TREE = "ac6a6c43d795c5ef8d17b94ed8ff3a0a290a2ad0"
 REVIEWED_REF = "refs/heads/qualification/q1-windows-interactive-ceee-20261104-2040-6c83e21f"
 A_COMMIT = "d8a7e95ed8141f25326092930a2ba2736023546a"
 A_TREE = "beca126eb8c1507d0311515ad658f12dc9ec276f"
@@ -26,16 +26,15 @@ OLD_GATE_SHA256 = "d166b42450ef01ec9dd408b30ca691ec003ef2d4c349c5a7b8d8cbf6ef175
 OLD_COLLECTOR_SHA256 = "be04a2405f6fbb43880a69352166f3c0313486e0f1b34eae86988067b310df14"
 ALLOWED_PATHS = frozenset({
     GATE_PATH, ".github/qualification/interactive_core.py",
-    ".github/qualification/interactive_assess.py", ".github/workflows/q1-windows-interactive.yml",
+    ".github/qualification/interactive_assess.py",
     "tests/test_q1_interactive_core.py", "tests/test_q1_interactive_route.py",
 })
 # Final payload pins; this verifier's SHA256 is bound out of band.
 PAYLOAD_SHA256 = {
-    ".github/qualification/interactive_core.py": "1b19adbeca48d03baf728f19e35c908f20aa9b28632182ca614bf2f2966f6490",
-    ".github/qualification/interactive_assess.py": "2efabff03bae221567f72e35c495d779bca5ad8eb6178cdca115763ac2dae285",
-    ".github/workflows/q1-windows-interactive.yml": "43056edb3beac4eb4c463e47632f1f10b3b182e6ce4d437725e6dcbe86b3a9d1",
-    "tests/test_q1_interactive_core.py": "97b63032652bc7c1aad98a68a47079f08a5ce523ac629ca0ffe7121875c8f578",
-    "tests/test_q1_interactive_route.py": "181990fbdc25931c3c037d2497debee79eb66a48767b16292797bc3748be856c",
+    ".github/qualification/interactive_core.py": "864f918b3c28d66ff38d118dd3f4a0e49d8bf78e76376f1527c309a7fa1c6c80",
+    ".github/qualification/interactive_assess.py": "8fd2cc08d6273cfd52bc5efaef8c2be628042959b7d83cabb0f1442982c14d3b",
+    "tests/test_q1_interactive_core.py": "29392f813338c50aa1039065645669c375c1a6fe4b93964430bae462627e779f",
+    "tests/test_q1_interactive_route.py": "bb1e028fe10ad7a357297b0140983afe42b2606d538c434d57e9afe6130acad8",
 }
 
 
@@ -67,10 +66,11 @@ def verify_tree(repo, tree):
             require(b is not None and b[:2] == ("040000", "tree") and
                     (a is None or a[:2] == ("040000", "tree")), "Non-directory ancestor")
             continue
-        require(name in ALLOWED_PATHS and a is None and b is not None and
-                b[:2] == ("100644", "blob"), "Only exact additive B files allowed: " + name)
+        require(name in ALLOWED_PATHS and a is not None and a[:2] == ("100644", "blob")
+                and b is not None and b[:2] == ("100644", "blob"),
+                "Only exact reviewed B revision files allowed: " + name)
         changed.add(name)
-    require(changed == ALLOWED_PATHS, "Exact six-file additive delta required")
+    require(changed == ALLOWED_PATHS, "Exact five-file reviewed revision required")
     require(set(PAYLOAD_SHA256) == ALLOWED_PATHS - {GATE_PATH}, "Complete payload pins required")
     for name, expected in PAYLOAD_SHA256.items():
         require(re.fullmatch(r"[0-9a-f]{64}", expected) is not None, "Invalid payload pin")
