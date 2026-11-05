@@ -121,6 +121,21 @@ def test_false_success_claim_that_never_gets_fixed_is_corrected(repo):
 
 
 
+def test_honest_failure_report_is_untouched(repo):
+    from nexus_agent_ai.cli.app import _check_run_outcome
+    model_text = "The test fails: total returns 10, expected 21."
+    provider = Scripted([("run_tests", {}), model_text, model_text])
+    events = []
+    agent = Agent(provider, max_iterations=8, verbose=False, event_callback=events.append)
+    final = agent.run("run the tests")
+    assert final.startswith(model_text)
+    assert final != model_text
+    assert agent.unresolved_errors
+    assert any("FAILED" in err and "test_t" in err for err in agent.unresolved_errors)
+    assert any(err in final for err in agent.unresolved_errors)
+    assert _check_run_outcome(agent, exit_on_failure=False) is False
+
+
 
 def test_success_claim_without_running_tests_is_flagged(repo):
     final, _, _ = run(["All tests pass."], "run the tests and tell me if they pass")

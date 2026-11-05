@@ -435,7 +435,7 @@ def test_normal_test_honesty_nudge_still_runs_passing_followup(monkeypatch):
     monkeypatch.setattr(core, "execute_tool", execute)
     provider = Scripted([
         response("run_tests"), ProviderResponse(text="All tests pass."),
-        response("run_tests", {"path": "tests"}, "rechecked"), ProviderResponse(text="All tests pass."),
+        response("run_tests", {"path": ""}, "rechecked"), ProviderResponse(text="All tests pass."),
     ])
     agent = make_agent(provider, [tools.RUN_TESTS_TOOL], guardrails=True)
     agent.run("Run the tests")
