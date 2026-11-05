@@ -376,3 +376,253 @@ def test_run_code_guard_tool_result_preserves_typed_receipt():
     assert execution_metadata(shortened)["executed"] is True
     assert execution_metadata(shortened)["outcome"] == "Code FAILED (exit code 1)."
     assert runner_status(str(shortened), "run_code") is S.UNKNOWN
+
+
+@pytest.mark.parametrize("initial_args,followup_args", [
+    ({"path": "."}, {"path": "./"}),
+    ({"path": "./"}, {"path": "."}),
+    ({"path": "."}, {"path": "__CWD__"}),
+    ({"path": "__CWD__"}, {"path": "."}),
+    ({}, {"path": ""}),
+    ({"path": ""}, {}),
+    ({}, {"path": "   "}),
+])
+def test_run_tests_scope_normalization_clears_proven_target_aliases(initial_args, followup_args, monkeypatch):
+    from pathlib import Path
+    from nexus_agent_ai.agent import core
+    if initial_args.get("path") == "__CWD__":
+        initial_args = {"path": str(Path.cwd().resolve())}
+    if followup_args.get("path") == "__CWD__":
+        followup_args = {"path": str(Path.cwd().resolve())}
+    results = iter([
+        runner_result(
+            execution_result("Pytest Results: FAILED\nassert 1 == 2", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=S.FAILED,
+        ),
+        runner_result(
+            execution_result("Pytest Results: PASSED", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=S.PASSED,
+        ),
+    ])
+    monkeypatch.setattr(core, "execute_tool", lambda name, args, **kwargs: next(results))
+    steps = [
+        ProviderResponse(tool_calls=[ToolCall("c1", "run_tests", initial_args)]),
+        ProviderResponse(tool_calls=[ToolCall("c2", "run_tests", followup_args)]),
+        ProviderResponse(text="All tests pass."),
+    ]
+    provider = ScriptedProvider(steps)
+    agent = Agent(provider, tools=[T.RUN_TESTS_TOOL], verbose=False)
+    agent.run("Run the tests")
+    assert agent.unresolved_errors == []
+    assert _check_run_outcome(agent, exit_on_failure=False) is True
+
+
+@pytest.mark.parametrize("initial_path,followup_path", [
+    ("test_sample.py::test_one", "./test_sample.py::test_one"),
+    ("./test_sample.py::test_one", "test_sample.py::test_one"),
+])
+def test_run_tests_scope_normalization_clears_proven_file_selector_aliases(tmp_path, initial_path, followup_path, monkeypatch):
+    from nexus_agent_ai.agent import core
+    (tmp_path / "test_sample.py").write_text("def test_one(): pass\n")
+    results = iter([
+        runner_result(
+            execution_result("Pytest Results: FAILED\nassert 1 == 2", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=S.FAILED,
+        ),
+        runner_result(
+            execution_result("Pytest Results: PASSED", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=S.PASSED,
+        ),
+    ])
+    monkeypatch.setattr(core, "execute_tool", lambda name, args, **kwargs: next(results))
+    steps = [
+        ProviderResponse(tool_calls=[ToolCall("c1", "run_tests", {"path": initial_path})]),
+        ProviderResponse(tool_calls=[ToolCall("c2", "run_tests", {"path": followup_path})]),
+        ProviderResponse(text="All tests pass."),
+    ]
+    provider = ScriptedProvider(steps)
+    agent = Agent(provider, tools=[T.RUN_TESTS_TOOL], verbose=False)
+    agent.run("Run the tests")
+    assert agent.unresolved_errors == []
+    assert _check_run_outcome(agent, exit_on_failure=False) is True
+
+
+@pytest.mark.parametrize("initial_args,followup_args", [
+    ({}, {"path": "."}),
+    ({"path": "."}, {}),
+    ({}, {"path": "./"}),
+    ({}, {"path": "tests"}),
+    ({"path": "tests"}, {}),
+    ({"path": "test_sample.py::test_one"}, {"path": "test_sample.py::test_two"}),
+    ({}, {"args": "-k filter"}),
+    ({"args": "-k filter"}, {}),
+    ({"path": 123}, {"path": "123"}),
+    ({"path": "../outside"}, {"path": "."}),
+])
+def test_run_tests_scope_normalization_preserves_unrelated_target_and_selection_failures(initial_args, followup_args, monkeypatch):
+    from nexus_agent_ai.agent import core
+    results = iter([
+        runner_result(
+            execution_result("Pytest Results: FAILED\nassert 1 == 2", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=S.FAILED,
+        ),
+        runner_result(
+            execution_result("Pytest Results: PASSED", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=S.PASSED,
+        ),
+    ])
+    monkeypatch.setattr(core, "execute_tool", lambda name, args, **kwargs: next(results))
+    steps = [
+        ProviderResponse(tool_calls=[ToolCall("c1", "run_tests", initial_args)]),
+        ProviderResponse(tool_calls=[ToolCall("c2", "run_tests", followup_args)]),
+        ProviderResponse(text="All tests pass."),
+    ]
+    provider = ScriptedProvider(steps)
+    agent = Agent(provider, tools=[T.RUN_TESTS_TOOL], verbose=False)
+    agent.run("Run the tests")
+    assert len(agent.unresolved_errors) == 1
+    assert "FAILED" in agent.unresolved_errors[0]
+    assert _check_run_outcome(agent, exit_on_failure=False) is False
+
+
+def test_configured_testpaths_default_discovery_vs_cwd_regression(tmp_path, approved_project, monkeypatch):
+    """Configured testpaths default discovery and explicit cwd are distinct scopes."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\ntestpaths = tests\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    (tests_dir / "test_inside.py").write_text("def test_inside(): pass\n", encoding="utf-8")
+    (tmp_path / "test_outside.py").write_text("def test_outside(): assert False\n", encoding="utf-8")
+
+    steps = [
+        ProviderResponse(tool_calls=[ToolCall("c1", "run_tests", {"path": "."})]),
+        ProviderResponse(tool_calls=[ToolCall("c2", "run_tests", {})]),
+        ProviderResponse(text="All tests pass."),
+    ]
+    provider = ScriptedProvider(steps)
+    dispatched = []
+    real_execute = T.RUN_TESTS_TOOL.execute
+
+    def capturing_execute(**kwargs):
+        res = real_execute(**kwargs)
+        dispatched.append(res)
+        return res
+
+    monkeypatch.setattr(T.RUN_TESTS_TOOL, "execute", capturing_execute)
+    agent = Agent(provider, tools=[T.RUN_TESTS_TOOL], verbose=False)
+    agent.run("Run the tests")
+
+    assert len(dispatched) == 2
+    assert runner_status(dispatched[0], "run_tests") is S.FAILED
+    assert runner_status(dispatched[1], "run_tests") is S.PASSED
+    assert len(agent.unresolved_errors) == 1
+    assert "test_outside.py" in agent.unresolved_errors[0]
+    assert _check_run_outcome(agent, exit_on_failure=False) is False
+
+def test_run_tests_scope_key_grounding():
+    import json
+    from nexus_agent_ai.agent.core import _run_tests_scope_key, _DEFAULT_DISCOVERY
+
+    assert _run_tests_scope_key({}) == ("run_tests", _DEFAULT_DISCOVERY, "", "")
+    assert _run_tests_scope_key({"path": ""}) == ("run_tests", _DEFAULT_DISCOVERY, "", "")
+    assert _run_tests_scope_key({"path": "   "}) == ("run_tests", _DEFAULT_DISCOVERY, "", "")
+
+    cwd_key = _run_tests_scope_key({"path": "."})
+    assert cwd_key == _run_tests_scope_key({"path": "./"})
+    assert cwd_key[1] != _DEFAULT_DISCOVERY
+
+    int_key = _run_tests_scope_key({"path": 123})
+    str_key = _run_tests_scope_key({"path": "123"})
+    assert int_key != str_key
+    assert int_key[1][0] == "OPAQUE_INVALID"
+    assert int_key[1][1] == "int"
+
+    list_args_key = _run_tests_scope_key({"args": ["-v"]})
+    assert list_args_key[3][0] == "OPAQUE_INVALID"
+    assert list_args_key[3][1] == "list"
+    assert json.loads(list_args_key[3][2]) == ["-v"]
+    assert isinstance(hash(list_args_key), int)
+
+    refused_key = _run_tests_scope_key({"path": "../outside"})
+    assert refused_key[1][0] == "OPAQUE_INVALID"
+    assert isinstance(hash(refused_key), int)
+
+
+@pytest.mark.parametrize("path_val", [[], {}, [1], None, False, 0])
+@pytest.mark.parametrize("args_val", [[], {}, {"x": 1}, None, False, 0])
+def test_run_tests_scope_key_hashability_and_malformed_separation(path_val, args_val):
+    from nexus_agent_ai.agent.core import _run_tests_scope_key
+    key = _run_tests_scope_key({"path": path_val, "args": args_val})
+    assert isinstance(hash(key), int)
+    assert key[1][0] == "OPAQUE_INVALID"
+    assert key[1][1] == type(path_val).__name__
+    assert key[3][0] == "OPAQUE_INVALID"
+    assert key[3][1] == type(args_val).__name__
+
+
+def test_run_tests_scope_key_deterministic_dict_order():
+    from nexus_agent_ai.agent.core import _run_tests_scope_key
+    key1 = _run_tests_scope_key({"args": {"b": 2, "a": 1}})
+    key2 = _run_tests_scope_key({"args": {"a": 1, "b": 2}})
+    assert key1 == key2
+    assert hash(key1) == hash(key2)
+
+@pytest.mark.parametrize("malformed_args", [
+    {"path": []},
+    {"path": {}},
+    {"path": [1]},
+    {"args": []},
+    {"args": {}},
+    {"args": {"x": 1}},
+    {"path": [1], "args": {"x": 1}},
+])
+def test_agent_malformed_run_tests_call_does_not_raise_type_error_and_preserves_valid_failure(malformed_args, monkeypatch):
+    from nexus_agent_ai.agent import core
+    valid_failure = runner_result(
+        execution_result("Pytest Results: FAILED\nassert 1 == 2", executed=True, outcome="Fixture test process completed."),
+        tool="run_tests", status=S.FAILED,
+    )
+    malformed_result = runner_result(
+        execution_result("Pytest Results: FAILED\nmalformed arguments", executed=False, outcome="Execution failed."),
+        tool="run_tests", status=S.NOT_EXECUTED,
+    )
+    results = iter([valid_failure, malformed_result])
+    monkeypatch.setattr(core, "execute_tool", lambda name, args, **kwargs: next(results))
+
+    steps = [
+        ProviderResponse(tool_calls=[ToolCall("c1", "run_tests", {})]),
+        ProviderResponse(tool_calls=[ToolCall("c2", "run_tests", malformed_args)]),
+        ProviderResponse(text="All tests pass."),
+    ]
+    provider = ScriptedProvider(steps)
+    agent = Agent(provider, tools=[T.RUN_TESTS_TOOL], verbose=False)
+    agent.run("Run the tests")
+
+    assert len(agent.unresolved_errors) == 2
+    assert any("assert 1 == 2" in err for err in agent.unresolved_errors)
+    assert _check_run_outcome(agent, exit_on_failure=False) is False
+
+@pytest.mark.parametrize("status", [S.FAILED, S.UNKNOWN, S.TIMED_OUT])
+def test_run_tests_scope_normalization_conservative_for_non_passed(status, monkeypatch):
+    from nexus_agent_ai.agent import core
+    results = iter([
+        runner_result(
+            execution_result("Pytest Results: FAILED\nassert 1 == 2", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=S.FAILED,
+        ),
+        runner_result(
+            execution_result("Pytest Results: non-passed", executed=True, outcome="Fixture test process completed."),
+            tool="run_tests", status=status,
+        ),
+    ])
+    monkeypatch.setattr(core, "execute_tool", lambda name, args, **kwargs: next(results))
+    steps = [
+        ProviderResponse(tool_calls=[ToolCall("c1", "run_tests", {})]),
+        ProviderResponse(tool_calls=[ToolCall("c2", "run_tests", {"path": ""})]),
+        ProviderResponse(text="All tests pass."),
+        ProviderResponse(text="The test outcome remains unresolved."),
+    ]
+    provider = ScriptedProvider(steps)
+    agent = Agent(provider, tools=[T.RUN_TESTS_TOOL], verbose=False)
+    agent.run("Run the tests")
+    assert len(agent.unresolved_errors) == 1
+    assert _check_run_outcome(agent, exit_on_failure=False) is False
