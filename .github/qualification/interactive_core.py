@@ -4,7 +4,7 @@ Drives installed nexus_agent_ai repl through real pseudo-console (pywinpty ConPT
 Executes two fixed sessions: 'tasks' and 'compact'.
 Verifies A native gate, installed provenance, TTY/Backspace probes, attributed SQLite
 canonical history, context token math, calculator fix behavior, and process cleanup.
-Bounded evidence output under EVIDENCE_CAP (64MB).
+Bounded evidence output under EVIDENCE_CAP (48MB).
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ except (ImportError, ValueError):
 RUNNER_SHA256 = "6bf1c0f1eff306eec2b73f6b77a9661e4b077d9846f200e0f692472491db97db"
 MODEL_SHA256 = "2ea801949d760cdf1a2cc04a54262c22c3c0c54f0769d57760c9adeb0e59233f"
 MODEL_REL = Path(".nexus-agent/models/LiquidAI--LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_0.gguf")
-EVIDENCE_CAP = 64 * 1024 * 1024
+EVIDENCE_CAP = 48 * 1024 * 1024
 MANIFEST_RESERVE = 1024 * 1024
 _CAP_LOCK = threading.Lock()
 STARTUP_TIMEOUT = 900.0   # 15 minutes for startup (covers model download if needed)
@@ -700,11 +700,118 @@ def _execute_protocol_session(protocol: List[Dict[str, Any]], session_id: str, p
 
         if is_tasks and not first_real_checked and on_after_first_real_task:
             first_real_checked = True
-            if not on_after_first_real_task():
-                session_stopped = True
+            try:
+                if not on_after_first_real_task():
+                    session_stopped = True
+            except Exception:
+                pass
 
     return not session_stopped
 
+
+def capture_backend_identity(root: Path, output_dir: Path, deadline: float, source_root: Path) -> Dict[str, Any]:
+    """Capture bounded runtime backend executable, PID, create_time, hash and version.
+
+    This records facts of the actual running server executable while it is alive,
+    distinct from any warmup or model invocation.
+    """
+    meta_file = output_dir / "owned_processes.json"
+    backend_meta = {
+        "complete": False,
+        "server_found": False,
+        "pid": None,
+        "create_time": None,
+        "exe": None,
+        "argv": None,
+        "exe_sha256": None,
+        "version_output": None,
+        "version_returncode": None,
+        "error": None,
+        "observation_errors": [],
+    }
+    try:
+        if not meta_file.exists():
+            backend_meta["error"] = "owned_processes.json missing"
+            return backend_meta
+        try:
+            owned = json.loads(meta_file.read_text(encoding="utf-8"))
+            if not isinstance(owned, list):
+                backend_meta["error"] = "owned_processes.json is not a list"
+                return backend_meta
+        except Exception as exc:
+            backend_meta["error"] = f"Failed to read owned_processes: {exc}"
+            return backend_meta
+
+        import psutil
+
+        server_entry = None
+        for entry in owned:
+            exe = entry.get("exe") or ""
+            pid = entry.get("pid")
+            if exe.lower().endswith(("llama-server.exe", "llama-server")) and pid:
+                try:
+                    proc = psutil.Process(pid)
+                    if proc.is_running() and proc.create_time() == entry.get("create_time"):
+                        server_entry = entry
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+                    backend_meta["observation_errors"].append({"pid": pid, "type": type(exc).__name__})
+                    continue
+                except Exception as exc:
+                    backend_meta["observation_errors"].append({"pid": pid, "type": type(exc).__name__})
+                    continue
+
+        if not server_entry:
+            backend_meta["error"] = "No active running llama-server process observed"
+            return backend_meta
+
+        pid = server_entry.get("pid")
+        exe_path = server_entry.get("exe")
+        backend_meta.update({
+            "server_found": True,
+            "pid": pid,
+            "create_time": server_entry.get("create_time"),
+            "exe": exe_path,
+            "argv": server_entry.get("cmdline"),
+        })
+
+        if not exe_path or not Path(exe_path).is_file():
+            backend_meta["error"] = f"Server executable missing at {exe_path}"
+            return backend_meta
+
+        try:
+            backend_meta["exe_sha256"] = digest(Path(exe_path))
+        except Exception as exc:
+            backend_meta["error"] = f"Failed to digest exe: {exc}"
+            return backend_meta
+
+        remaining_sec = deadline - time.monotonic()
+        if remaining_sec <= 0.0:
+            backend_meta["error"] = "Work deadline expired before backend version query"
+            return backend_meta
+
+        v_timeout = min(10.0, remaining_sec)
+        try:
+            runner_path = Path(source_root) / ".github/qualification/runner.py"
+            runner_mod = load_module(runner_path, "q1_runner_for_proc")
+            owner = runner_mod.owned_module(source_root)
+            domain_dir = root / "version-process"
+            domain_dir.mkdir(parents=True, exist_ok=True)
+            with owner.ProcessDomain(domain_dir, deadline=deadline) as domain:
+                v_res = domain.run([exe_path, "--version"], capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=v_timeout)
+                raw_out = (v_res.stdout or v_res.stderr or "").strip()[:4096]
+                backend_meta["version_output"] = raw_out
+                backend_meta["version_returncode"] = v_res.returncode
+                if v_res.returncode == 0:
+                    backend_meta["complete"] = True
+                else:
+                    backend_meta["error"] = f"Version query returned nonzero code {v_res.returncode}"
+        except Exception as exc:
+            backend_meta["error"] = f"Version query failed: {type(exc).__name__}: {str(exc)[:256]}"
+    except Exception as exc:
+        backend_meta["error"] = f"Capture exception: {type(exc).__name__}: {str(exc)[:256]}"
+    return backend_meta
 
 def run_driver(args: argparse.Namespace) -> int:
     """Execute the full interactive qualification protocol."""
@@ -712,6 +819,11 @@ def run_driver(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     wheel = Path(args.wheel).resolve(strict=True)
     commit = args.commit
+    tree = getattr(args, "tree", None)
+    if not commit or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit) or commit == "0" * 40:
+        raise RuntimeError("Mandatory external approved commit seal is missing, unresolved, or zero; execution rejected")
+    if not tree or not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40}", tree) or tree == "0" * 40:
+        raise RuntimeError("Mandatory external approved tree seal is missing, unresolved, or zero; execution rejected")
     deadline_file = Path(args.deadline_file).resolve(strict=True)
     native_evidence_path = Path(args.native_evidence).resolve(strict=True)
 
@@ -725,13 +837,19 @@ def run_driver(args: argparse.Namespace) -> int:
         raise RuntimeError("Windows platform required for interactive ConPTY qualification")
 
     verifier = load_module(source_root / ".github/qualification/verify_windows_interactive.py", "verify_windows_interactive")
-    native_gate = verifier.check_native_evidence(native_evidence_path)
+    native_gate = verifier.check_native_evidence(native_evidence_path, commit=commit, tree=tree, wheel=wheel)
 
     runner_mod = load_module(runner_path, "q1_runner")
     installed_provenance = runner_mod.verify_installed(wheel, source_root, commit)
+    if installed_provenance.get("commit") != commit:
+        raise RuntimeError("Installed runtime commit differs from approved commit seal")
+    if installed_provenance.get("tree") != tree:
+        raise RuntimeError("Installed runtime tree differs from approved tree seal")
 
     if installed_provenance["package_py"] != native_gate["provenance"]["package_py"]:
         raise RuntimeError("Installed runtime package bytes differ from A native gate package_py")
+    if installed_provenance["wheel_sha256"] != native_gate.get("wheel_sha256"):
+        raise RuntimeError("Installed wheel SHA256 differs from native gate wheel_sha256")
 
     deadline = deadline_from_file(deadline_file)
     workspace, home, temporary = root / "workspace", root / "home", root / "tmp"
@@ -761,12 +879,29 @@ def run_driver(args: argparse.Namespace) -> int:
     tty_probe_tasks, tty_probe_compact = {"observed": False}, {"observed": False}
     cleanup_facts = {}
     byte_tracker = [0]
+    backend_identity = {"complete": False, "server_found": False, "attempts": [], "errors": []}
 
     def verify_initial_model() -> bool:
         nonlocal model_verified_initial
         m = home / MODEL_REL
         model_verified_initial = m.is_file() and digest(m) == MODEL_SHA256
         return model_verified_initial
+
+    def on_after_first_real_task_hook() -> bool:
+        ok = verify_initial_model()
+        if not ok:
+            return False
+        if not backend_identity.get("complete", False):
+            try:
+                attempt = capture_backend_identity(root, output_dir, deadline, source_root)
+            except Exception as exc:
+                attempt = {"complete": False, "server_found": False, "error": f"Capture exception: {type(exc).__name__}: {str(exc)[:256]}", "observation_errors": []}
+            backend_identity["attempts"].append(attempt)
+            if attempt.get("complete", False):
+                backend_identity.update(attempt)
+            else:
+                backend_identity["errors"].append(attempt.get("error", "Unknown error"))
+        return True
 
     try:
         # Session 1: tasks
@@ -783,7 +918,7 @@ def run_driver(args: argparse.Namespace) -> int:
                 s1_completed = _execute_protocol_session(
                     PROTOCOL_TASKS, s1_id, pty1, workspace, home, history_db,
                     deadline=deadline, is_tasks=True, output_dir=output_dir, target_rows=tasks_rows,
-                    byte_tracker=byte_tracker, on_after_first_real_task=verify_initial_model
+                    byte_tracker=byte_tracker, on_after_first_real_task=on_after_first_real_task_hook
                 )
             else:
                 tasks_rows[0] = {"name": PROTOCOL_TASKS[0]["name"], "task": {"status": assess.INCOMPLETE, "evidence": ["Startup timeout"]}}
@@ -809,6 +944,16 @@ def run_driver(args: argparse.Namespace) -> int:
                         deadline=deadline, is_tasks=False, output_dir=output_dir, target_rows=compact_rows,
                         byte_tracker=byte_tracker
                     )
+                    if not backend_identity.get("complete", False):
+                        try:
+                            attempt = capture_backend_identity(root, output_dir, deadline, source_root)
+                        except Exception as exc:
+                            attempt = {"complete": False, "server_found": False, "error": f"Capture exception: {type(exc).__name__}: {str(exc)[:256]}", "observation_errors": []}
+                        backend_identity["attempts"].append(attempt)
+                        if attempt.get("complete", False):
+                            backend_identity["post_exit_capture"] = attempt
+                        else:
+                            backend_identity["errors"].append(attempt.get("error", "Unknown error"))
                 else:
                     compact_rows[0] = {"name": PROTOCOL_COMPACT[0]["name"], "task": {"status": assess.INCOMPLETE, "evidence": ["Startup timeout"]}}
             finally:
@@ -821,7 +966,10 @@ def run_driver(args: argparse.Namespace) -> int:
         model_verified_final = m_fin.is_file() and digest(m_fin) == MODEL_SHA256
 
     finally:
-        cleanup_facts = cleanup_root(root)
+        try:
+            (output_dir / "backend_identity.json").write_text(json.dumps(backend_identity, indent=2), encoding="utf-8")
+        finally:
+            cleanup_facts = cleanup_root(root)
 
         owned_meta = json.loads((output_dir / "owned_processes.json").read_text(encoding="utf-8")) if (output_dir / "owned_processes.json").exists() else []
         cleanup_axis = assess.assess_cleanup(owned_meta, cleanup_facts.get("killed_pids", []),
@@ -834,7 +982,7 @@ def run_driver(args: argparse.Namespace) -> int:
         all_rows = tasks_rows + compact_rows
         summary = assess.summarize_axes(all_rows, cleanup_axis, tty_axis, model_verified_initial, model_verified_final, budget_expired)
 
-        complete = summary.get("automated_core_pass", False)
+        complete = bool(summary.get("automated_core_pass", False) and backend_identity.get("complete", False))
 
         results = {
             "commit": commit, "wheel": wheel.name, "native_evidence_verified": True,
@@ -844,6 +992,7 @@ def run_driver(args: argparse.Namespace) -> int:
                 "untraced_native": native_gate.get("untraced_native"),
             },
             "installed_provenance": installed_provenance,
+            "backend_identity": backend_identity,
             "model_sha256": MODEL_SHA256,
             "model_sha256_observations": {
                 "initial_verified": model_verified_initial,
@@ -878,6 +1027,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--commit", required=True)
     run_parser.add_argument("--deadline-file", required=True)
     run_parser.add_argument("--native-evidence", required=True)
+    run_parser.add_argument("--tree", required=True)
 
     cleanup_parser = sub.add_parser("cleanup", help="Clean up owned processes for root")
     cleanup_parser.add_argument("--root", required=True)
