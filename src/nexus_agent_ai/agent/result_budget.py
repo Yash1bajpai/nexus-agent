@@ -61,23 +61,51 @@ def guard_tool_result(name, result, *, memory, fits):
     if callable(retain):
         discard_reason = "artifact receipt cannot fit the context budget; output discarded"
         identity = hashlib.sha256((name + "\0" + content).encode("utf-8")).hexdigest()
-        retained = replacement(
-            f"{status}\n~{omitted} tokens omitted from context; retained as artifact {identity}."
-        )
-        if fits(retained):
-            plan = {"artifact_id": identity, "tool_name": name,
-                    "byte_len": len(content.encode("utf-8")), "content": content}
-            try:
-                admitted = retain(plan) is True
-                diagnostics.receipt_retention("success" if admitted else "full")
-                discard_reason = "artifact store full; output discarded"
-            except Exception:
-                admitted = False
-                diagnostics.receipt_retention("error")
-                discard_reason = "artifact retention failed; output discarded"
-            if admitted:
-                return retained
-
+        if name == "search_web":
+            lines = content.splitlines(keepends=True)
+            max_k = min(len(lines), 8)
+            for k in range(max_k, 0, -1):
+                prefix = "".join(lines[:k])
+                if not (0 < len(prefix) <= 2048 and prefix != content):
+                    continue
+                suffix = content[len(prefix):]
+                omitted_suffix = estimate_tokens(suffix)
+                cand_text = (
+                    f"{status}\n{prefix}\n\n"
+                    f"~{omitted_suffix} tokens omitted from context; retained as artifact {identity}."
+                )
+                cand = replacement(cand_text)
+                if fits(cand):
+                    plan = {"artifact_id": identity, "tool_name": name,
+                            "byte_len": len(content.encode("utf-8")), "content": content}
+                    try:
+                        admitted = retain(plan) is True
+                        diagnostics.receipt_retention("success" if admitted else "full")
+                        discard_reason = "artifact store full; output discarded"
+                    except Exception:
+                        admitted = False
+                        diagnostics.receipt_retention("error")
+                        discard_reason = "artifact retention failed; output discarded"
+                    if admitted:
+                        return cand
+                    break
+        if discard_reason == "artifact receipt cannot fit the context budget; output discarded":
+            retained = replacement(
+                f"{status}\n~{omitted} tokens omitted from context; retained as artifact {identity}."
+            )
+            if fits(retained):
+                plan = {"artifact_id": identity, "tool_name": name,
+                        "byte_len": len(content.encode("utf-8")), "content": content}
+                try:
+                    admitted = retain(plan) is True
+                    diagnostics.receipt_retention("success" if admitted else "full")
+                    discard_reason = "artifact store full; output discarded"
+                except Exception:
+                    admitted = False
+                    diagnostics.receipt_retention("error")
+                    discard_reason = "artifact retention failed; output discarded"
+                if admitted:
+                    return retained
     for note in (
         f"{status}\n~{omitted} tokens omitted from context; {discard_reason}.",
         f"{status}\nOutput discarded.",

@@ -7,7 +7,7 @@ from nexus_agent_ai.agent import context, core, tools
 from nexus_agent_ai.agent.core import Agent
 from nexus_agent_ai.agent.memory import ConversationMemory
 from nexus_agent_ai.agent.persistence import SQLiteMemory
-from nexus_agent_ai.agent.refusals import RefusalClass, refusal
+from nexus_agent_ai.agent.refusals import RefusalClass, RunnerStatus, execution_result, refusal, runner_result
 from nexus_agent_ai.providers.base import BaseProvider, ProviderResponse, ToolCall
 
 
@@ -162,7 +162,12 @@ def test_gate_restores_at_next_user_turn(tmp_path, monkeypatch):
     (tmp_path / "f.py").write_text("x = 1\n")
     tools.execute_read_file("f.py")
     calls = []
-    monkeypatch.setattr(tools.RUN_CODE_TOOL, "execute", lambda **kwargs: calls.append(kwargs) or "STDOUT:\n42")
+    completed_receipt = runner_result(
+        execution_result("STDOUT:\n42", executed=True, outcome="Code completed (exit code 0)."),
+        tool="run_code",
+        status=RunnerStatus.COMPLETED,
+    )
+    monkeypatch.setattr(tools.RUN_CODE_TOOL, "execute", lambda **kwargs: calls.append(kwargs) or completed_receipt)
     provider = Transcript([patch(), "No changes were made.", ("run_code", {"code": "print(42)"}), "42"])
     agent = Agent(provider, verbose=False)
     agent.run("Fix f.py")

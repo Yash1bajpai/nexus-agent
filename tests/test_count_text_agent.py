@@ -705,9 +705,9 @@ def test_capacity_count_is_nonzero_in_actual_cli_without_optional_retry(tmp_path
 
 @pytest.mark.parametrize("stage", ["worker", "result_admission"])
 def test_unhandled_count_failure_preserves_unknown_or_returned_facts_and_pending_closure(tmp_path, monkeypatch, stage):
-    # Still >2,000 serialized result chars, but leaves the protected arguments
-    # representable at 4K so this reaches the injected nonbudget failure.
-    literal = '"' * 896
+    # 800 UTF-8 bytes (<= 1024 limit) produces >2,000 ASCII serialized result chars (2,732)
+    # while provider UTF-8 args fit within 4K budget to reach the injected nonbudget failure.
+    literal = "é" * 400
     (tmp_path / "physical.txt").write_bytes(literal.encode() + b"\n")
     call = count_call(literal=literal)
     later = ToolCall("later", "list_directory", {"path": "."})
@@ -717,15 +717,18 @@ def test_unhandled_count_failure_preserves_unknown_or_returned_facts_and_pending
     ])
     failure = RuntimeError("synthetic nonbudget inspection failure")
     observed = observe_count(monkeypatch)
+    injected_calls = []
     if stage == "worker":
         def fail_worker(*args, **kwargs):
+            injected_calls.append("worker")
             raise failure
         monkeypatch.setattr(tools, "inspect_text", fail_worker)
     else:
         real_plan = agent._plan_fit
         def fail_after_result(messages, *args, **kwargs):
-            if any(m.get("tool_call_id") == call.id and m.get("content", "").startswith("{")
+            if observed and any(m.get("tool_call_id") == call.id and m.get("content", "").startswith("{")
                    for m in messages):
+                injected_calls.append("result_admission")
                 raise failure
             return real_plan(messages, *args, **kwargs)
         monkeypatch.setattr(agent, "_plan_fit", fail_after_result)
@@ -734,6 +737,7 @@ def test_unhandled_count_failure_preserves_unknown_or_returned_facts_and_pending
     with pytest.raises(RuntimeError) as raised:
         agent.run("Count the specified literal in physical.txt; physical facts only.")
     assert raised.value is failure
+    assert injected_calls == [stage]
     assert len(provider.seen) == 1
     canonical = agent.memory.get()
     assert next(m for m in canonical if m.get("tool_calls"))["content"] == original

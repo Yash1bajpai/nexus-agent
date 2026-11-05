@@ -165,7 +165,8 @@ def test_iteration_limit_stores_terminal_outcome(tmp_path, monkeypatch):
     final = agent.run("diagnose this", require_edit=True)
     assert final.startswith("Stopped: maximum tool iterations")
     assert agent.edit_not_applied
-    assert agent.unresolved_errors
+    assert agent.unresolved_errors == ["Maximum tool iterations reached before task completed."]
+    assert final.count("Stopped: maximum tool iterations reached before the task completed.") == 1
     assert memory.get()[-1] == {"role": "assistant", "content": final}
 
 
@@ -354,3 +355,27 @@ def test_repeated_truncation_does_not_retry_forever():
     assert agent.response_incomplete
     assert "reached its output limit" in final
     assert len(provider.seen) == 2  # one boost retry, then honest incomplete
+
+
+def test_automatic_stop_signal_resets_after_successful_next_run(monkeypatch):
+    monkeypatch.setattr(core, "execute_tool", lambda *args, **kwargs: "observed")
+    provider = Scripted(["hello"])
+    agent = Agent(provider, tools=[tool("read_file")], max_iterations=3, verbose=False)
+    agent.automatic_stop_reason = "previous_stop"
+    agent.run("hello")
+    assert agent.automatic_stop_reason is None
+    from nexus_agent_ai.cli import app as cli
+    assert cli._check_run_outcome(agent) is True
+
+
+@pytest.mark.parametrize("exit_on_failure", [True, False])
+def test_cli_automatic_stop_is_failure_without_fake_tool_error(exit_on_failure):
+    from types import SimpleNamespace
+    from nexus_agent_ai.cli import app as cli
+    agent = SimpleNamespace(automatic_stop_reason="automatic_recovery_budget", unresolved_errors=[])
+    if exit_on_failure:
+        with pytest.raises(cli.typer.Exit) as stopped:
+            cli._check_run_outcome(agent)
+        assert stopped.value.exit_code == 1
+    else:
+        assert cli._check_run_outcome(agent, exit_on_failure=False) is False

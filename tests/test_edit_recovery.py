@@ -92,6 +92,10 @@ def test_second_refusal_stops_without_a_second_append(tmp_path):
     results = [message for message in agent.memory.get() if message["role"] == "tool"]
     assert [message["tool_call_id"] for message in results] == ["failed", "second"]
     assert all("BEGIN HARNESS EDIT RECOVERY" not in message["content"] for message in results)
+    assert result.count("Stopped: bounded edit recovery ended.") == 1
+    assert all("Stopped: bounded edit recovery ended." not in error for error in agent.unresolved_errors)
+    assert len(agent.unresolved_errors) == 1
+    assert agent.unresolved_errors[0].startswith("ERROR:")
 
 
 def test_no_corrected_edit_preserves_reply_and_stops(tmp_path):
@@ -392,6 +396,16 @@ def test_stopped_false_claim_history_retrieval_includes_executor_correction(tmp_
         "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
     }
     assert any(event["type"] == "response" and event["content"] == final for event in events)
+    # Preserve original model prose under the existing annotation policy, but
+    # never copy that prose back after the executor's truthful failure note.
+    assert final.count(raw) == 1
+    assert final.count("Stopped: bounded edit recovery ended.") == 1
+    assert raw not in "\n".join(agent.unresolved_errors)
+    assert "No corrected edit was attempted" not in "\n".join(agent.unresolved_errors)
+    assert any("ERROR:" in error for error in agent.unresolved_errors)
+    assert raw not in final.split("Unresolved tool errors:", 1)[1]
+    assert canonical[-1]["content"].count(raw) == 1
+    assert records[0]["text"].count(raw) == 1
 
 
 def test_credential_shaped_stopped_text_has_hash_only_audit_and_corrected_history(tmp_path):

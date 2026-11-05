@@ -276,7 +276,8 @@ def test_rejected_optional_nudge_keeps_originals_and_closes_without_extra_reques
         assert tool_result["content"].startswith(result_text)
         assert tool_result["metadata"]["executed"] is (kind == "test_honesty")
     assert not any(m.get("metadata", {}).get("internal") for m in messages)
-    assert agent.unresolved_errors
+    assert agent.automatic_stop_reason == "automatic_recovery_budget"
+    assert bool(agent.unresolved_errors) is (kind != "edit")
     assert not agent.response_incomplete
     assert_closed(agent)
     assert "output limit" not in final.lower()
@@ -435,7 +436,7 @@ def test_normal_test_honesty_nudge_still_runs_passing_followup(monkeypatch):
     monkeypatch.setattr(core, "execute_tool", execute)
     provider = Scripted([
         response("run_tests"), ProviderResponse(text="All tests pass."),
-        response("run_tests", {"path": "tests"}, "rechecked"), ProviderResponse(text="All tests pass."),
+        response("run_tests", {"path": ""}, "rechecked"), ProviderResponse(text="All tests pass."),
     ])
     agent = make_agent(provider, [tools.RUN_TESTS_TOOL], guardrails=True)
     agent.run("Run the tests")
@@ -718,9 +719,16 @@ def test_duplicate_forced_final_no_tools_overflow_preserves_canonical_and_stops(
     assert [message["tool_call_id"] for message in results] == ["0", "1", "2"]
     assert [message["metadata"]["executed"] for message in results] == [True, False, False]
     assert not any(message.get("metadata", {}).get("internal") for message in messages)
-    assert agent.unresolved_errors
+    assert agent.automatic_stop_reason == "automatic_recovery_budget"
+    assert agent.unresolved_errors == []
     assert_closed(agent)
     assert final == messages[-1]["content"]
     with pytest.raises(cli.typer.Exit) as stopped:
         cli._check_run_outcome(agent)
     assert stopped.value.exit_code == 1
+    provider.steps = [ProviderResponse(text="hello")]
+    provider.context_size = 32768
+    assert agent.run("hello") == "hello"
+    assert agent.automatic_stop_reason is None
+    assert agent.unresolved_errors == []
+    assert cli._check_run_outcome(agent) is True

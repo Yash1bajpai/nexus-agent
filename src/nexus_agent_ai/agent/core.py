@@ -180,6 +180,53 @@ def _edit_path(args) -> Optional[Path]:
     except (OSError, ValueError):
         return None
 
+_DEFAULT_DISCOVERY = "__PYTEST_DEFAULT_DISCOVERY__"
+
+
+def _opaque_invalid_value(value: Any) -> tuple:
+    """Represent malformed values immutably and deterministically without valid aliasing."""
+    return ("OPAQUE_INVALID", type(value).__name__, json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
+
+
+def _run_tests_scope_key(args: Optional[dict]) -> tuple:
+    """Normalize run_tests scope to proven-equivalent filesystem target and args.
+
+    Omitted/blank path represents pytest default discovery honoring configured
+    testpaths, whereas explicit '.' targets cwd and can override discovery.
+    They are kept strictly distinct. Only explicit valid filesystem targets
+    normalize aliases among themselves. Opaque '::node' selectors and exact
+    whitespace-trimmed args strings are preserved. Refused or non-string
+    arguments are kept opaque and invalid without aliasing valid scopes.
+    """
+    if not isinstance(args, dict):
+        return ("run_tests", _opaque_invalid_value(args), "", "")
+
+    raw_path = args.get("path", "")
+    if isinstance(raw_path, str):
+        clean_path = raw_path.strip()
+        if not clean_path:
+            target_str = _DEFAULT_DISCOVERY
+            selector = ""
+        else:
+            filesystem_path, separator, node_id = clean_path.partition("::")
+            selector = separator + node_id if separator else ""
+            try:
+                from ._workspace_paths import _validate_workspace_path
+                validated = _validate_workspace_path(filesystem_path)
+                target_str = str(validated) if isinstance(validated, Path) else ("OPAQUE_INVALID", "refused", filesystem_path)
+            except (TypeError, ValueError, OSError):
+                target_str = ("OPAQUE_INVALID", "refused", filesystem_path)
+    else:
+        target_str = _opaque_invalid_value(raw_path)
+        selector = ""
+
+    raw_args = args.get("args", "")
+    if isinstance(raw_args, str):
+        norm_args = raw_args.strip()
+    else:
+        norm_args = _opaque_invalid_value(raw_args)
+
+    return ("run_tests", target_str, selector, norm_args)
 
 def _target_snapshot(name, args):
     """Hash only permitted file targets; unknown/denied states are never evidence."""
@@ -360,6 +407,7 @@ class Agent:
         self._sync_context_window()
         self.last_trim = {"dropped_messages": 0, "truncated_messages": 0, "tokens": 0}
         self.unresolved_errors: List[str] = []  # tool errors not fixed by the end of the last run
+        self.automatic_stop_reason: Optional[str] = None
         self.claimed_unapplied_edit = False  # model said it changed code but no write succeeded
         self.edit_not_applied = False  # an edit was requested, nothing was written, and the model did not say nothing needs changing
         self.claim_unverified = False  # model said tests pass but they were not run / last run failed
@@ -969,6 +1017,7 @@ class Agent:
         offered_tools = list(use_tools)  # use_tools is emptied by the anti-loop stop; keep what was offered
         guard = LoopGuard(execute_list_directory) if self.guardrails else None
         self.unresolved_errors = []
+        self.automatic_stop_reason = None
         self.claimed_unapplied_edit = False
         self.edit_not_applied = False
         self.claim_unverified = False
@@ -1251,7 +1300,7 @@ class Agent:
 
                         pending["state"] = "returned"
                         pending["result"] = result
-                        if tool_call.name in ("read_file", "count_file_text", "run_tests", "git_diff", "run_code"):
+                        if tool_call.name in ("read_file", "count_file_text", "run_tests", "git_diff", "run_code", "search_web"):
                             result = guard_tool_result(
                                 tool_call.name, result, memory=self.memory,
                                 fits=lambda content: self._tool_result_fits(
@@ -1259,11 +1308,14 @@ class Agent:
                                 ),
                             )
                             pending["result"] = result
-                        error_key = str(tool_call.args.get("path") or tool_call.name)
-                        if tool_call.name == "count_file_text":
+                        if tool_call.name == "run_tests":
+                            error_key = _run_tests_scope_key(tool_call.args)
+                        elif tool_call.name == "count_file_text":
                             # Inspection facts cannot overwrite/resolve an unrelated
                             # read/edit/test failure just because the path is the same.
-                            error_key = (tool_call.name, error_key)
+                            error_key = (tool_call.name, str(tool_call.args.get("path") or tool_call.name))
+                        else:
+                            error_key = str(tool_call.args.get("path") or tool_call.name)
                         r_status = runner_status(result, tool_call.name) if tool_call.name in ("run_code", "run_tests") else None
                         runner_failed = (
                             r_status is not None
@@ -1286,7 +1338,13 @@ class Agent:
                             # An unrelated success (including write_file at the same path) must not clear a runner failure.
                             failed_tool = unresolved_tool.get(error_key)
                             if failed_tool in ("run_code", "run_tests"):
-                                cleared = tool_call.name == failed_tool
+                                cleared = (
+                                    tool_call.name == failed_tool
+                                    and (
+                                        (tool_call.name == "run_code" and r_status is RunnerStatus.COMPLETED)
+                                        or (tool_call.name == "run_tests" and r_status is RunnerStatus.PASSED)
+                                    )
+                                )
                             else:
                                 cleared = failed_tool is None or tool_call.name == failed_tool or tool_call.name in _WRITE_TOOLS
                             if cleared:
@@ -1558,10 +1616,13 @@ class Agent:
                 self.provider.before_request = previous_before_request
             self.unresolved_errors = list(unresolved.values())
 
+        self.automatic_stop_reason = automatic_stop_reason
         final_text = repeated_failure_stop or "Stopped: maximum tool iterations reached before the task completed."
-        self.unresolved_errors.append(
-            repeated_failure_stop or "Maximum tool iterations reached before task completed."
-        )
+        # A stop explanation is already the final reply, not a tool error.
+        # Keep genuine unresolved tool results without replaying model prose
+        # or the executor's outcome note under the tool-error heading.
+        if not repeated_failure_stop:
+            self.unresolved_errors.append("Maximum tool iterations reached before task completed.")
         if automatic_stop_reason:
             execution = (
                 "Tool execution occurred; its recorded outcomes are preserved."

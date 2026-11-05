@@ -54,6 +54,9 @@ nexus-agent --help
 
 If the model says "the tests pass" without a current passing run, one-shot commands exit with code 1, including verification-only questions. Streaming output displays the correction; the REPL reports the failure and remains open.
 
+**Test runner scope and failure resolution:**
+`run_tests` failures remain unresolved until a subsequent execution of the same runner succeeds with typed `PASSED` authority. Omitted or blank test targets represent pytest default discovery honoring configured `testpaths`; explicit directory targets (such as `.` or `./`) explicitly append the path and can override discovery, so default discovery and explicit `.` remain distinct scopes. Scope normalization resolves only proven true filesystem aliases among explicit paths targeting the same directory (`.` and `./` and absolute cwd), and between exact relative and absolute file paths (`./test_mod.py::test_one` and `test_mod.py::test_one`). Pytest node selectors (`path::test_node`) and selection arguments (`args`) are strictly preserved; passing runs targeting a different file, node selector, or filter scope never clear unrelated test failures.
+
 ### Model downloads
 
 Local models come from Hugging Face. Downloads resume from `.part` files after interruption, and every completion path, including HTTP 416, checks available size and SHA-256 metadata. Without a digest, checks are best-effort: HTTP framing can detect truncation but not same-size corruption. Cache destinations reject traversal and escaping symlinks while allowing nested repository filenames. For private or gated models, set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`, or use the Hugging Face CLI token file). Downloads and speed probes send the token only to the configured Hugging Face host and strip it on cross-host redirects. Private-repo access is covered by local server fixtures, not a real private-repository run.

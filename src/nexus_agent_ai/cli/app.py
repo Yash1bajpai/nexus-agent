@@ -78,7 +78,7 @@ def _check_run_outcome(agent: Agent, *, exit_on_failure: bool = True) -> bool:
         error = "The model announced an action, but no tool was executed."
     elif getattr(agent, "response_incomplete", False):
         error = "The model reached its output limit; the response is incomplete."
-    elif getattr(agent, "unresolved_errors", None):
+    elif getattr(agent, "unresolved_errors", None) or getattr(agent, "automatic_stop_reason", None):
         error = "Did not finish cleanly (unresolved tool errors or iteration limit)."
     if error is None:
         return True
