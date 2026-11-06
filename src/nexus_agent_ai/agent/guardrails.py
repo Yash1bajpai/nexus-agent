@@ -14,6 +14,7 @@ import keyword
 import difflib
 import math
 import os
+import posixpath
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -248,6 +249,275 @@ _ACTION_PROMISE = re.compile(
     r"(?:initiated|started|running)\b",
     re.IGNORECASE,
 )
+
+
+_FILE_NAME_RE = re.compile(
+    r"[\w./\\-]+\.(?:py|js|ts|java|c|cpp|h|go|rs|rb|html|css|json|ya?ml|toml|md|txt|csv|xml|sql|sh)",
+    re.IGNORECASE,
+)
+# Honest admission that no read happened; such answers are not claims.
+_READ_ADMISSION = re.compile(
+    r"\b(?:could\s+not|couldn't|cannot|can't|did\s+not|didn't|unable\s+to|failed\s+to|"
+    r"haven't|have\s+not|not\s+able\s+to)\s+(?:read|open|access|review|inspect|examine)\b",
+    re.IGNORECASE,
+)
+# Weak content signals: require a fenced block nearby to count as a contents claim.
+_CONTENT_CLAIM = re.compile(
+    r"\bi(?:'ll|\s+will|\s+have|'ve)?\s*(?:now\s+|first\s+|just\s+)*"
+    r"(?:read|reviewed|checked|inspected|examined|looked\s+(?:at|through|over))\b|"
+    r"\bthe\s+(?:file|code|contents?)\s+(?:contains?|shows?|is|are|has|have|looks?)\b|"
+    r"\bno\s+(?:obvious\s+)?bugs?\b|\bbugs?\s+(?:found|identified)\b|"
+    r"\bcurrent\s+(?:contents?|structure|implementation|version)\b|"
+    r"\bincorrect\s+behavior\b|\bnothing\s+wrong\b",
+    re.IGNORECASE,
+)
+# Strong claim: a first-person statement that the read/review was PERFORMED.
+# Unambiguous enough to flag without a fenced block.
+_PERFORMED_CLAIM = re.compile(
+    r"\bi\s+(?:read|reviewed|checked|inspected|examined|looked\s+(?:at|through|over))\b|"
+    r"\bi(?:'ve|\s+have)\s+(?:now\s+|just\s+|already\s+)*"
+    r"(?:read|reviewed|checked|inspected|examined|looked\s+(?:at|through|over))\b",
+    re.IGNORECASE,
+)
+# Proposed-new-file / advice phrasing: the file is being drafted, not reviewed.
+_PROPOSAL_SIGNAL = re.compile(
+    r"\b(?:create|creates|creating|write|writing|save|generates?|generating|new\s+file|"
+    r"you\s+(?:can|could|should|might))\b|"
+    r"\bhere(?:'s|\s+is)\s+(?:a|an)\s+(?:example|template|sample|draft)\b",
+    re.IGNORECASE,
+)
+def tool_result_succeeded(result):
+    """True when a tool result is an actual success, by status metadata first.
+
+    A successful read of a file whose bytes begin with "ERROR" must count as a
+    read; only a bare string without status metadata falls back to the prefix.
+    """
+    if getattr(result, "refusal_class", None) is not None:
+        return False
+    executed = getattr(result, "executed", None)
+    if executed is not None:
+        return bool(executed)
+    return not str(result).lstrip().startswith("ERROR")
+
+
+def _norm_path(value):
+    # Platform-appropriate identity: os.path.normcase lowercases only where the
+    # filesystem itself is case-insensitive, so case-distinct names never merge
+    # on case-sensitive platforms. normcase also converts "/" to "\\" on Windows,
+    # so separators are normalized AGAIN after it: one representation everywhere.
+    normed = posixpath.normpath(str(value).replace("\\", "/").strip())
+    return os.path.normcase(normed).replace("\\", "/").rstrip("/")
+
+
+def _basename(path):
+    return path.rsplit("/", 1)[-1]
+
+
+def _file_identity(path):
+    """Content fingerprint in the executor's own _file_state representation.
+
+    Equal bytes hash equal on every supported Python, so an identity captured
+    by the tool loop (hashlib.file_digest) matches one recomputed here.
+    """
+    try:
+        return ("file", hashlib.sha256(Path(path).read_bytes()).digest())
+    except FileNotFoundError:
+        return ("missing", None)
+    except OSError:
+        return None
+
+
+def known_file_entry(path, *, base_dir=None, bound_state=None):
+    """Provenance record for one successfully read/written file.
+
+    ref: normalized path as recorded (for claim matching). abs: the resolved
+    on-disk target; relative paths resolve against base_dir, which the
+    registration site anchors to the same root the tools resolve against
+    (_validate_workspace_path: the process cwd at execution time), and resolve()
+    mirrors the tool layer. bound_state: the executor's own content identity
+    ("file", sha256 digest) captured inside its before/after observation window
+    - for a read, the identities must be equal across the read, otherwise the
+    observation is unbound (None); for a write, the post-write identity.
+    bound_state=None means historical trusted provenance with NO freshness
+    claim: such records can never suppress a current-disk warning.
+    """
+    ref = _norm_path(path)
+    raw = str(path)
+    target = Path(raw)
+    if not target.is_absolute():
+        target = (Path(base_dir) if base_dir else Path.cwd()) / raw
+    target = target.resolve()  # mirror the tool layer's _validate_workspace_path
+    return {"ref": ref, "abs": str(target), "state": bound_state}
+
+
+def _entry_fresh(entry):
+    """True: the live file's content identity equals the bound observation.
+    False: changed, missing, or unreadable. None: no bound observation on
+    record, so freshness is unverifiable - this NEVER suppresses a warning."""
+    state = entry.get("state")
+    if not (isinstance(state, tuple) and len(state) == 2 and state[0] == "file"):
+        return None
+    current = _file_identity(entry["abs"])
+    return current == state
+
+
+def _provenance_entry(ref_raw, entries, workspace_root=None):
+    """The entry identifying the same file as ref_raw, else None.
+
+    Identity is exact normalized equality, or canonical equality with the
+    workspace-resolved target (so a qualified relative reference matches an
+    absolute executor record of the same file). Reading calculator.py says
+    nothing about app/calculator.py. A bare name matches a known file's
+    basename only when exactly one known file has it.
+    """
+    ref = _norm_path(ref_raw)
+    candidates = {ref}
+    if workspace_root and "/" in ref and not posixpath.isabs(ref) and ":" not in ref.split("/", 1)[0]:
+        try:
+            candidates.add(_norm_path(str((Path(workspace_root) / str(ref_raw)).resolve())))
+        except (OSError, ValueError):
+            pass
+    for entry in entries:
+        if entry["ref"] in candidates:
+            return entry
+        abs_norm = _norm_path(entry["abs"]) if entry.get("abs") else None
+        if abs_norm and abs_norm in candidates:
+            return entry
+    if "/" in ref:
+        return None
+    basename_candidates = [e for e in entries if _basename(e["ref"]) == ref]
+    return basename_candidates[0] if len(basename_candidates) == 1 else None
+
+
+_FENCE_SPAN_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_SPAN_RE = re.compile(r"`[^`\n]*`")
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _segment_spans(text, fence_spans):
+    """Sentence-like segments of the non-fence text, original offsets kept.
+
+    Fenced source blocks are hard boundaries: quoted or source data never
+    exempts a claim and never counts as one. Inline-code spans are masked from
+    signal matching but keep their enclosing sentence, so an inline-formatted
+    filename (``I'll create `config.py` for you:``) still gets its exemptions.
+    """
+    segments = []
+    pos = 0
+    for cs, ce in sorted(fence_spans) + [(len(text), len(text))]:
+        base = pos
+        for m in _SENTENCE_SPLIT.finditer(text[pos:cs]):
+            if base < pos + m.start():
+                segments.append((base, pos + m.start()))
+            base = pos + m.end()
+        if base < cs:
+            segments.append((base, cs))
+        pos = ce
+    return segments
+
+
+class FileClaimReport(tuple):
+    """(unverified, stale, unverifiable): files with unsupported claims.
+
+    unverified: no successful disk read/write of the file is on record in the
+    current context. stale: a bound read/write is on record but the file on
+    disk has changed or become unavailable since. unverifiable: a historical
+    trusted record exists but carries no bound observation (or its source left
+    the context), so freshness could not be verified - it is NOT a claim that
+    the file changed.
+    """
+    __slots__ = ()
+
+    def __new__(cls, unverified, stale, unverifiable):
+        return tuple.__new__(cls, (list(unverified), list(stale), list(unverifiable)))
+
+    @property
+    def unverified(self):
+        return self[0]
+
+    @property
+    def stale(self):
+        return self[1]
+
+    @property
+    def unverifiable(self):
+        return self[2]
+
+
+def unverified_file_content_claims(reply, *, user_input="", known_files=(), workspace_root=None):
+    """Heuristic (not general protection): files a reply presents contents or a
+    performed review for without a verified disk source.
+
+    Provenance is per-file and comes ONLY from trusted records: successful
+    read/write tool calls and real @file attachments, as known_file_entry
+    records. Request text grants nothing: a pasted fence, the words "content
+    of", or user-typed attachment markers are not disk reads. Only positively
+    established freshness (a bound observation whose target still matches the
+    disk) suppresses a current-disk warning; historical records without a bound
+    observation are classified separately as unverifiable.
+
+    A claim needs a performed-review or contents signal in the +-300-char
+    window with code spans masked out. Exemptions (honest no-read admissions,
+    proposed-new-file/advice phrasing) apply only within the claim's own
+    sentence segment and never override a performed-review claim in that same
+    segment, so advice cannot cancel an independent fabricated review.
+    user_input is accepted for call-site compatibility and grants no provenance.
+    """
+    if not reply:
+        return FileClaimReport([], [], [])
+    fence_spans = [(m.start(), m.end()) for m in _FENCE_SPAN_RE.finditer(reply)]
+    mask_spans = fence_spans + [(m.start(), m.end()) for m in _INLINE_SPAN_RE.finditer(reply)]
+    masked = list(reply)
+    for cs, ce in mask_spans:
+        for i in range(cs, ce):
+            masked[i] = " "
+    masked = "".join(masked)
+    segments = _segment_spans(reply, fence_spans)
+    has_fence = bool(fence_spans)
+
+    entries = []
+    for item in known_files or ():
+        if isinstance(item, dict):
+            entry = dict(item)
+            entry["ref"] = _norm_path(entry.get("ref") or entry.get("abs") or "")
+            entries.append(entry)
+        else:
+            entries.append({"ref": _norm_path(item), "abs": None, "mtime_ns": None, "size": None})
+
+    def _segment_text(pos):
+        for cs, ce in fence_spans:
+            if cs <= pos < ce:
+                return ""
+        for ss, se in segments:
+            if ss <= pos < se:
+                return masked[ss:se]
+        return ""
+
+    unverified, stale, unverifiable, seen = [], [], [], set()
+    for match in _FILE_NAME_RE.finditer(reply):
+        ref = _norm_path(match.group(0))
+        if not ref or ref in seen:
+            continue
+        window = masked[max(0, match.start() - 300):match.end() + 300]
+        if not (_PERFORMED_CLAIM.search(window) or (has_fence and _CONTENT_CLAIM.search(window))):
+            continue
+        segment = _segment_text(match.start())
+        if (not _PERFORMED_CLAIM.search(segment)
+                and (_READ_ADMISSION.search(segment) or _PROPOSAL_SIGNAL.search(segment))):
+            continue
+        seen.add(ref)
+        entry = _provenance_entry(match.group(0), entries, workspace_root=workspace_root)
+        fresh = _entry_fresh(entry) if entry is not None else None
+        if entry is None:
+            unverified.append(ref)
+        elif fresh is False:
+            stale.append(ref)
+        elif fresh is None:
+            unverifiable.append(ref)
+        # Only positively established freshness (fresh is True) stays silent.
+        if len(unverified) + len(stale) + len(unverifiable) >= 3:
+            break
+    return FileClaimReport(unverified, stale, unverifiable)
 
 
 def promises_tool_use(text: str) -> bool:

@@ -48,7 +48,7 @@ def candidate(tmp_path, monkeypatch):
     parent = repo.commit_tree(parent_tree, message="synthetic declared parent")
     repo.head(parent)
 
-    # Candidate files: exact 21 paths (5 added, 16 modified)
+    # Candidate files: exactly the declared candidate paths
     payload = {}
     for name in gate.ALLOWED_PATHS:
         blob = get_payload_blob(ROOT, name)
@@ -104,7 +104,7 @@ def test_candidate_rejects_any_unsealed_delta(candidate, change):
     elif change == "extra":
         c.repo.write("unreviewed_extra.py", "unreviewed extra file\n")
     elif change == "missing":
-        (c.repo.path / "tests/test_q1_interactive_route.py").unlink()
+        (c.repo.path / "src/nexus_agent_ai/agent/guardrails.py").unlink()
     elif change == "payload":
         c.repo.write(".github/qualification/interactive_core.py", "unreviewed\n")
     tree = c.repo.stage_tree()
