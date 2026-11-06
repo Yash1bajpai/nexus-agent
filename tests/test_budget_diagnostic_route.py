@@ -1,5 +1,8 @@
 """Synthetic local Git objects only: no remote, workflow, model, or provider runs."""
 from __future__ import annotations
+import os as _route_os
+_route_os.environ.setdefault("NEXUS_NATIVE_BRANCH", "qualification/q1-windows-native-v12-20261105-2335-8af3d120")
+_route_os.environ.setdefault("NEXUS_REALMODEL_BRANCH", "qualification/q1-windows-realmodel-v12-20261105-2335-8af3d120")
 
 import hashlib
 import importlib.util

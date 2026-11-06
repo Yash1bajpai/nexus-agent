@@ -68,6 +68,22 @@ def test_run_code_success():
     assert "42" in res
 
 
+def test_run_code_probe_disable_refuses_before_any_spawn(monkeypatch):
+    """Probe-only kill switch: flag set -> refusal, no subprocess; unset -> unchanged."""
+    import nexus_agent_ai.agent.tools as tools_mod
+    monkeypatch.setenv("NEXUS_AGENT_DISABLE_RUN_CODE", "1")
+    spawned = []
+    monkeypatch.setattr(tools_mod.subprocess, "run", lambda *a, **kw: spawned.append((a, kw)))
+    res = execute_tool("run_code", {"code": "print(2 * 21)"})
+    assert spawned == [], "flag must be checked before any spawn"
+    assert "disabled in this environment" in res
+
+    monkeypatch.delenv("NEXUS_AGENT_DISABLE_RUN_CODE")
+    monkeypatch.undo()
+    res2 = execute_tool("run_code", {"code": "print(2 * 21)"})
+    assert "STDOUT:" in res2 and "42" in res2
+
+
 def test_run_code_fstring_allowed_and_escapes_blocked():
     res = execute_tool("run_code", {"code": 'print(f"{2+2}")'})
     assert "STDOUT:" in res

@@ -15,10 +15,11 @@ from pathlib import Path, PurePosixPath
 import re
 import sys
 
-PARENT = "ae1c0c2e9fddf9e9078a6d87e8c1b2202930ce0b"
-PARENT_TREE = "95efded383cf137850d7f3144f0063455bead5e0"
-REVIEWED_REF = "refs/heads/qualification/q1-windows-realmodel-v12-20261105-2335-8af3d120"
-NATIVE_BRANCH = "qualification/q1-windows-native-v12-20261105-2335-8af3d120"
+PARENT = "fe62609fe956baaead419c47dab7441e31d84f88"
+PARENT_TREE = "293aa18714241a05871c8e91931bbee05fb43323"
+REALMODEL_BRANCH = os.environ.get("NEXUS_REALMODEL_BRANCH", "")
+NATIVE_BRANCH = os.environ.get("NEXUS_NATIVE_BRANCH", "")
+REVIEWED_REF = f"refs/heads/{REALMODEL_BRANCH}" if REALMODEL_BRANCH else ""
 NATIVE_WORKFLOW = ".github/workflows/q1-windows-native.yml"
 
 GATE_PATH = ".github/qualification/verify_windows_interactive.py"
@@ -35,55 +36,49 @@ VERIFIER_PATHS = frozenset({
 })
 
 ADDED_PATHS = frozenset({
-    ".github/qualification/native_functional.py",
-    ".github/qualification/verify_windows_native.py",
-    ".github/workflows/q1-windows-native.yml",
-    "tests/fixtures/q1_search_recorded_1712.json",
-    "tests/test_q1_native_route.py",
+    ".github/workflows/q1-windows-conpty.yml",
 })
 
 MODIFIED_PATHS = frozenset({
+    ".github/qualification/interactive_assess.py",
     ".github/qualification/interactive_core.py",
+    ".github/qualification/native_functional.py",
     ".github/qualification/verify_windows_interactive.py",
+    ".github/qualification/verify_windows_native.py",
     ".github/workflows/q1-windows-interactive.yml",
-    "README.md",
-    "src/nexus_agent_ai/agent/core.py",
-    'src/nexus_agent_ai/cli/app.py',
-    'tests/test_agent_outcomes.py',
-    'tests/test_edit_recovery.py',
-    "src/nexus_agent_ai/agent/result_budget.py",
-    "tests/test_approved_integration.py",
-    "tests/test_capacity_recovery.py",
-    "tests/test_count_text_agent.py",
-    "tests/test_guardrails.py",
+    ".github/workflows/q1-windows-native.yml",
+    "src/nexus_agent_ai/agent/tools.py",
+    "src/nexus_agent_ai/providers/local_provider.py",
+    "tests/test_budget_diagnostic_route.py",
+    "tests/test_local_provider.py",
+    "tests/test_q1_diagnostics_route.py",
+    "tests/test_q1_interactive_core.py",
     "tests/test_q1_interactive_route.py",
-    "tests/test_runner_evidence_d1.py",
-    "tests/test_tool_result_guard.py",
+    "tests/test_q1_native_route.py",
+    "tests/test_q1_route.py",
+    "tests/test_tools.py",
 })
 
 ALLOWED_PATHS = ADDED_PATHS | MODIFIED_PATHS
 
-# Exactly 19 non-verifier candidate files pinned; both verifiers bound out of band.
+# Non-verifier candidate files pinned exactly; both verifiers bound out of band.
 PAYLOAD_SHA256 = {
-    ".github/qualification/interactive_core.py": "40aa087dcb64baf2ae6e19307bb13cc61d5f120ee5593303257c96f9d55ba214",
-    ".github/qualification/native_functional.py": "2896285b7ee42b0d335dc0cd88c01a13ff554a1db299b7d09bc850a9fbe12efc",
-    ".github/workflows/q1-windows-interactive.yml": "63d39a80daeb025dd43b15cb415c60be3d926d462e173bb5b437bad9b027d1aa",
-    ".github/workflows/q1-windows-native.yml": "e76e6386d0c05788bc054ab51b0607ce237145392999602056f5d5baba72a5d9",
-    "README.md": "d9842d16b578ac25a9ca4f25d0373eac393b96bbeb13de199979c38bba460199",
-    "src/nexus_agent_ai/agent/core.py": "f5c38cd67b0ce9f4bd73cc38a4b9e4d972f3d578453bd3b6767c71e42cfa01e3",
-    "src/nexus_agent_ai/agent/result_budget.py": "bd6be4637dc005b219812144e1eaf920a1f26a3bb0a0de24d69ba86f0e9e6f41",
-    "src/nexus_agent_ai/cli/app.py": "520a892950533778311a42c3ae08fac334bfbcf86a6ce256b500a198cff3eb39",
-    "tests/fixtures/q1_search_recorded_1712.json": "06388e71c69d267a95584ea57d930d51412c78ad917a455d0734dd2ed1b39949",
-    "tests/test_agent_outcomes.py": "b682fc1d15fd060d0a7ed4dfa37c1678e2395692c1c769952af6e284a0ca21c3",
-    "tests/test_approved_integration.py": "8613c000b51fdc25f26963b311d2661e9a7a927fa7ff463b6aa928b40f549d6d",
-    "tests/test_capacity_recovery.py": "ba4040d172c9dc6af2adaa5ad4f57f232a3f9f7337b3995e79e8724e925d4903",
-    "tests/test_count_text_agent.py": "93990093340806bbb47f231048f84d675ea1b42ca302bddbd3a68d7a0a3b02f8",
-    "tests/test_edit_recovery.py": "5a2c8fd752dfb75f625b4fa038c292fde55c46c30e68005d53cc1e5fa9f3b1fc",
-    "tests/test_guardrails.py": "b0988e904d1a224b7f1e0ae736a4e9b63261df0b34afcc64f2f9a97eba6f680e",
-    "tests/test_q1_interactive_route.py": "c47f84f8da19b12e67fccdfdcb8ffad57fc16dbb094cb15094067570dff594b7",
-    "tests/test_q1_native_route.py": "a16cef43452568179e3769b0baeccf2586eace237d1415cfb528efff0cea0f84",
-    "tests/test_runner_evidence_d1.py": "71bec0225112391c9ca6abe582183f1bfffe6adf480def2f7fd3c3fd6e1a6adf",
-    "tests/test_tool_result_guard.py": "196bc98c8a55fc7e383dd4302e72ef0003664972c694477f8a0777fa66570739"
+    ".github/qualification/interactive_assess.py": "8b18e9ea00b62c4d3181927456f28a73bc531c424df40b75dd542ca9c24088b5",
+    ".github/qualification/interactive_core.py": "94ee7262a8d5f5193b6448950abf4791e79f2870903d7d3f68c36b243a058e40",
+    ".github/qualification/native_functional.py": "583f414e6ec84e47b7f94c4baf4e4f6ce9e549a957249cdcde7e3dc420a93af0",
+    ".github/workflows/q1-windows-interactive.yml": "129d52c0409864fa983566d239607df6e8d2a2490168a2fbd3efa0ea31017c8f",
+    ".github/workflows/q1-windows-native.yml": "481cdb7d7c1c6fbbf7a696ffd92bf1923ac41d66657be617308743ddf9910fdf",
+    "src/nexus_agent_ai/agent/tools.py": "ef23ef0f39b6577f45de395ad9f1f10b5889c84b2f770b9a410f05ce7dad9c3e",
+    "src/nexus_agent_ai/providers/local_provider.py": "11661be1d23f4ed53f4f97895c9b5472e9d9bd713d128ccd7c00d21ea6c0e48e",
+    "tests/test_budget_diagnostic_route.py": "0b3fee9741081fc1dc09ddda974550a2afca454317138373df16ae04ae2b7370",
+    "tests/test_local_provider.py": "8ec48936fe664ef0d991a24e8ba9e0de229f4984b8b7ecd3745c0d4cb5fcd416",
+    "tests/test_q1_diagnostics_route.py": "4e203fb4f37dd202cfbfef9844a635e499852ee6f7141b167e5aebff212f050d",
+    "tests/test_q1_interactive_core.py": "e0cd20b2420c333c896f9df2b99ffd4b2add8d673c9ed33d7a84a2212d7f953a",
+    "tests/test_q1_interactive_route.py": "49132c2ccb7a54228cce6f4f2b8c61f3910c5fd1e18175ef21e31ef8fc09d5f9",
+    "tests/test_q1_native_route.py": "8247b31ce598818a00afb5e1d1123ca81e3a92044910f14b78b6b3ccc339e074",
+    "tests/test_q1_route.py": "132a7366eb17ee1e461f76b8ae7219f502b95f915a8e09dd4a0badbeba9ce2cf",
+    "tests/test_tools.py": "a396628e84a05266bd97e74628e7605f3955e1aa38d02d9500bfabaf1e0c9e98",
+    ".github/workflows/q1-windows-conpty.yml": "475e17484a90efa8f564020823d6d770cea63418eb0467352472ba00278cc0fe"
 }
 
 
@@ -145,7 +140,7 @@ def verify_tree(repo, tree, approved_tree=None):
             require(a is not None and a[:2] == ("100644", "blob"), "Modified path missing from baseline: " + name)
             require(b is not None and b[:2] == ("100644", "blob"), "Nonregular modified file: " + name)
         changed.add(name)
-    require(changed == ALLOWED_PATHS, "Exact twenty-one candidate paths required")
+    require(changed == ALLOWED_PATHS, "Delta must equal exactly the declared candidate paths")
     require(set(PAYLOAD_SHA256) == ALLOWED_PATHS - VERIFIER_PATHS, "Complete payload pins required for all 19 candidate files")
     for name, expected in PAYLOAD_SHA256.items():
         require(re.fullmatch(r"[0-9a-f]{64}", expected) is not None, "Invalid payload pin: " + name)
@@ -173,6 +168,7 @@ def verify_commit(repo, sha, approved_commit=None, approved_tree=None):
 def verify_event(event, *, event_name, ref, sha, run_attempt):
     old._object_id(sha)
     require(event_name == "push", "Only push is permitted")
+    require(REVIEWED_REF, "NEXUS_REALMODEL_BRANCH not configured; refusing to bind a branch")
     require(ref == REVIEWED_REF, "Branch ref mismatch")
     require(str(run_attempt) == "1", "Only first attempt is permitted")
     require(isinstance(event, dict), "Invalid push event")
@@ -216,7 +212,7 @@ def select_native_run(metadata, repository, approved_commit=None, approved_tree=
     runs = metadata.get("workflow_runs", []) if isinstance(metadata, dict) else []
     matches = [r for r in runs if isinstance(r, dict) and
                r.get("head_sha") == commit and
-               r.get("head_branch") == NATIVE_BRANCH and
+               r.get("head_branch") == NATIVE_BRANCH and NATIVE_BRANCH != "" and
                r.get("path") == NATIVE_WORKFLOW and
                r.get("event") == "push" and r.get("run_attempt") == 1 and
                r.get("status") == "completed" and r.get("conclusion") == "success" and
