@@ -29,6 +29,20 @@ _LLAMA_SERVER_SHA256 = {
     "llama-b7075-bin-ubuntu-x64.zip": "eda853db069c545218eefb24afa126b557a5545ce19631e2f2a42ee7bce407d6",
 }
 
+
+def agent_thinking_kwargs() -> Dict[str, bool]:
+    """Chat-template kwargs for agent turns on the llama-server path.
+
+    Agent turns must spend the bounded output budget on tool calls and answers,
+    not hidden chain-of-thought. Templates that branch on enable_thinking (e.g.
+    SmolLM3) default it to true, which delays tool calls and can consume the
+    whole output reserve before any tool call is emitted; templates that do not
+    reference the variable ignore the kwarg. Opt back into thinking with
+    NEXUS_AGENT_ENABLE_THINKING=1.
+    """
+    enabled = os.environ.get("NEXUS_AGENT_ENABLE_THINKING", "").strip().lower() in ("1", "true", "yes", "on")
+    return {"enable_thinking": enabled}
+
 def _get_llama_server_info() -> tuple:
     """Return (download_url, exe_name) for the current platform."""
     system = platform.system().lower()
@@ -549,6 +563,9 @@ class LocalProvider(BaseProvider):
             "stream": True,
             # Ask the server to include real token counts in the final chunk
             "stream_options": {"include_usage": True},
+            # Keep hidden thinking out of the bounded output budget on templates
+            # that support it; ignored by templates that do not.
+            "chat_template_kwargs": agent_thinking_kwargs(),
         }
         if tools:
             payload["tools"] = self._convert_tools(tools)

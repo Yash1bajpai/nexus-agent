@@ -1,5 +1,8 @@
 """Local Git/event/artifact boundary tests for untraced Windows native functional route."""
 from __future__ import annotations
+import os as _route_os
+_route_os.environ.setdefault("NEXUS_NATIVE_BRANCH", "qualification/q1-windows-native-v12-20261105-2335-8af3d120")
+_route_os.environ.setdefault("NEXUS_REALMODEL_BRANCH", "qualification/q1-windows-realmodel-v12-20261105-2335-8af3d120")
 
 import hashlib
 import importlib.util
@@ -84,7 +87,7 @@ def test_exact_native_candidate_is_not_execution_or_qualification_approval(candi
     c = candidate
     result = c.gate.verify_commit(c.repo.path, c.sha, approved_commit=c.sha, approved_tree=c.tree)
     assert set(result["exact_delta_paths"]) == c.gate.ALLOWED_PATHS
-    assert len(result["exact_delta_paths"]) == 21
+    assert len(result["exact_delta_paths"]) == len(c.gate.ALLOWED_PATHS)
     assert result["parent"] == c.parent and result["base"] == c.base
     assert result["native_functional_only"] is True
     assert result["untraced_native"] is True
@@ -142,12 +145,12 @@ def test_candidate_refuses_scope_content_or_mode_change(candidate, change):
         c.gate.verify_tree(c.repo.path, tree)
 
 
-def test_payload_table_must_pin_exact_nineteen_files(candidate, monkeypatch):
+def test_payload_table_must_pin_exact_non_verifier_files(candidate, monkeypatch):
     c = candidate
     pins = dict(c.gate.PAYLOAD_SHA256)
     pins.pop("tests/test_q1_native_route.py")
     monkeypatch.setattr(c.gate, "PAYLOAD_SHA256", pins)
-    with pytest.raises(c.gate.ReviewError, match="nineteen"):
+    with pytest.raises(c.gate.ReviewError, match="non-verifier candidate files"):
         c.gate.verify_tree(c.repo.path, c.tree)
 
 

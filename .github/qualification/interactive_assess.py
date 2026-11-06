@@ -129,10 +129,19 @@ def assess_task_calculator_review(answer, before_src, after_src, tool_messages, 
     return _row(name, PASS if valid else REVIEW, "Multiply addition bug explicitly identified" if valid else "Ambiguous bug explanation; inspect assistant text", PASS if valid else REVIEW)
 
 
-def assess_task_calculator_fix(behavior_verified, add_preserved, before_src, after_src, tool_messages):
+def assess_task_calculator_fix(static_facts, before_src, after_src, tool_messages):
     mutation = any(_successful(tool_evidence(tool_messages, name, "calculator.py")) for name in ("write_file", "patch_file"))
-    valid = mutation and before_src != after_src and behavior_verified and add_preserved
-    return _row("row-05-calculator-fix", PASS if valid else FAIL, {"mutation_bound": mutation, "behavior_verified": behavior_verified, "add_preserved": add_preserved})
+    syntax_ok = bool(static_facts.get("syntax_ok"))
+    add_preserved = bool(static_facts.get("add_preserved"))
+    multiply_changed = bool(static_facts.get("multiply_changed"))
+    static_ok = mutation and before_src != after_src and syntax_ok and add_preserved and multiply_changed
+    evidence = {"mutation_bound": mutation, "static_only": True,
+                "static_syntax_ok": syntax_ok, "static_add_preserved": add_preserved,
+                "static_multiply_changed": multiply_changed,
+                "behavior": "NOT_TESTED: harness execution/import of model-written files was removed; "
+                            "static syntax/content checks only, never behavior PASS"}
+    # Best possible row outcome is REVIEW: behavioral coverage is NOT_TESTED by design.
+    return _row("row-05-calculator-fix", REVIEW if static_ok else FAIL, evidence)
 
 
 _RELEASE_URL = re.compile(r"https?://github\.com/(?:ggerganov|ggml-org)/llama\.cpp/releases(?:/tag/[^\s\]\)<>\"']+)?", re.I)

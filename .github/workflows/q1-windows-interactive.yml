@@ -6,7 +6,7 @@ name: Q1 Windows normal interactive core coverage
 on:
   push:
     branches:
-      - qualification/q1-windows-realmodel-v12-20261105-2335-8af3d120
+      - 'qualification/q1-windows-realmodel-*'  # exact one-shot ref enforced in the job gate via NEXUS_REALMODEL_BRANCH
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
   interactive:
     if: >-
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/qualification/q1-windows-realmodel-v12-20261105-2335-8af3d120' &&
+      github.ref == format('refs/heads/{0}', vars.NEXUS_REALMODEL_BRANCH) &&
       github.event.created == true && github.event.before == '0000000000000000000000000000000000000000' &&
       github.event.deleted == false && github.event.forced == false &&
       github.event.after == github.sha && github.run_attempt == 1
@@ -25,6 +25,8 @@ jobs:
     env:
       NEXUS_APPROVED_COMMIT: ${{ vars.NEXUS_APPROVED_COMMIT }}
       NEXUS_APPROVED_TREE: ${{ vars.NEXUS_APPROVED_TREE }}
+      NEXUS_REALMODEL_BRANCH: ${{ vars.NEXUS_REALMODEL_BRANCH }}
+      NEXUS_NATIVE_BRANCH: ${{ vars.NEXUS_NATIVE_BRANCH }}
     defaults:
       run:
         shell: pwsh
@@ -60,7 +62,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP 'q1-interactive'
-          gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/q1-windows-native.yml/runs?branch=qualification%2Fq1-windows-native-v12-20261105-2335-8af3d120&event=push&status=success&per_page=100" | Set-Content -Encoding utf8 "$root/a-runs.json"
+          gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/q1-windows-native.yml/runs?branch=$([uri]::EscapeDataString($env:NEXUS_NATIVE_BRANCH))&event=push&status=success&per_page=100" | Set-Content -Encoding utf8 "$root/a-runs.json"
           if ($LASTEXITCODE -ne 0) { throw 'A run lookup failed; no model execution' }
           $selected = python -I -B .github/qualification/verify_windows_interactive.py select-native-run --metadata "$root/a-runs.json" --repository "$env:GITHUB_REPOSITORY" --approved-commit "$env:NEXUS_APPROVED_COMMIT" --approved-tree "$env:NEXUS_APPROVED_TREE"
           if ($LASTEXITCODE -ne 0) { throw 'No exact successful A run; no model execution' }
