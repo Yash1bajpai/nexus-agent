@@ -1,0 +1,93 @@
+name: Q1 Windows ConPTY compatibility (non-model, not qualification)
+
+# LOCAL PREPARATION ONLY. Before a separately approved push, the executor must
+# validate the exact sealed candidate and a LIVE unused literal ref/run.
+# Never reuse consumed refs or rerun attempts.
+on:
+  push:
+    branches:
+      - 'qualification/q1-windows-conpty-*'  # exact one-shot ref enforced in the job gate via NEXUS_CONPTY_BRANCH
+
+permissions:
+  contents: read
+
+jobs:
+  conpty:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == format('refs/heads/{0}', vars.NEXUS_CONPTY_BRANCH) &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.deleted == false && github.event.forced == false &&
+      github.event.after == github.sha && github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      NEXUS_APPROVED_COMMIT: ${{ vars.NEXUS_APPROVED_COMMIT }}
+      NEXUS_APPROVED_TREE: ${{ vars.NEXUS_APPROVED_TREE }}
+      NEXUS_CONPTY_BRANCH: ${{ vars.NEXUS_CONPTY_BRANCH }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Establish fresh ConPTY root and absolute work deadline
+        timeout-minutes: 1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-conpty'
+          if (Test-Path $root) { throw 'ConPTY root is not fresh' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 110 * 60
+          @{ work_deadline_utc = $deadline; job_limit_minutes = 120; reserve_minutes = 10 } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $root 'deadline.json')
+      - name: Checkout exact event SHA and grounded ancestry
+        timeout-minutes: 3
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 6
+          persist-credentials: false
+      - name: Select Python 3.12
+        timeout-minutes: 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify exact sealed candidate and creation event
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -I -B .github/qualification/verify_windows_native.py verify --source-root "$env:GITHUB_WORKSPACE" --approved-commit "$env:NEXUS_APPROVED_COMMIT" --approved-tree "$env:NEXUS_APPROVED_TREE"
+          if ($LASTEXITCODE -ne 0) { throw 'ConPTY candidate verification failed' }
+      - name: Isolated declared pywinpty environment
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-conpty'
+          python -I -m venv "$root/venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Venv creation failed' }
+          & "$root/venv/Scripts/python.exe" -I -m pip install 'pywinpty==2.0.15' 'psutil>=5.9.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Declared dependency install failed' }
+      - name: Non-model ConPTY compatibility proof (never model execution)
+        timeout-minutes: 100
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-conpty'
+          & "$root/venv/Scripts/python.exe" -I -B "$env:GITHUB_WORKSPACE/.github/qualification/interactive_core.py" conpty-check --root "$root" --deadline-file "$root/deadline.json"
+          if ($LASTEXITCODE -ne 0) { throw 'ConPTY compatibility proof failed or incomplete; retain failure artifacts' }
+      - name: Bound dedicated output for publication even on failure
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'q1-windows-conpty'
+          python -I -B "$env:GITHUB_WORKSPACE/.github/qualification/verify_windows_native.py" collect --output-root "$root/output" --upload-root "$root/conpty-upload"
+          if ($LASTEXITCODE -ne 0) { throw 'ConPTY output is incomplete; bounded manifest retained' }
+      - name: Upload bounded ConPTY compatibility evidence (never qualification)
+        if: always()
+        timeout-minutes: 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: q1-windows-conpty-compat
+          path: ${{ runner.temp }}/q1-windows-conpty/conpty-upload
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7

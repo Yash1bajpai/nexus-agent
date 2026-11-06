@@ -95,7 +95,7 @@ def stage_tests(source_root, destination, frozen):
         target.write_bytes(blob)
         staged[name] = hashlib.sha256(blob).hexdigest()
 
-    # Stage the 18 candidate payloads as read-only neutral data for route tests
+    # Stage the candidate payloads as read-only neutral data for route tests
     # Never placed in importable src/
     candidate_gate = load_module(source_root / ".github/qualification/verify_windows_native.py", "native_gate_for_staging")
     candidate_payloads = {}
@@ -129,14 +129,28 @@ def pytest_phase(args):
     plugin = GatePlugin(provenance["package_root"])
     stage = Path(spec["staged"]["root"])
     old_cwd = os.getcwd()
+    os.environ["NEXUS_Q1_NATIVE_RECEIPT_DIR"] = str(root / "output")
     try:
         os.chdir(stage)
         exit_code = pytest.main(["-c", spec["staged"]["config"], "--rootdir", str(stage),
                                  "-o", "pythonpath=", "-o", "addopts=", "tests", "-q"], plugins=[plugin])
     finally:
         os.chdir(old_cwd)
+        os.environ.pop("NEXUS_Q1_NATIVE_RECEIPT_DIR", None)
     require(sys.gettrace() is None, "Trace function leaked into harness after tests")
     final = critical_outcomes(plugin.outcomes, spec["staged"]["critical_native"], sys.platform)
+    termination_nodeid = ("tests/test_q1_interactive_core.py::"
+                          "test_terminate_verified_real_os_handle_identity")
+    termination_outcome = plugin.outcomes.get(termination_nodeid)
+    termination_receipt = root / "output" / "termination_native_test.json"
+    if sys.platform == "win32":
+        require(termination_outcome != "passed" or termination_receipt.is_file(),
+                "Passed native termination test without a retained receipt")
+        require(termination_outcome == "passed" or not termination_receipt.is_file(),
+                "Retained native termination receipt without a passing outcome")
+    else:
+        require(not termination_receipt.is_file(),
+                "Native termination receipt retained off Windows")
     final.update(
         exit_code=int(exit_code),
         collected=len(plugin.collected),
@@ -150,6 +164,8 @@ def pytest_phase(args):
         model_execution_permitted=False,
         untraced_native=True,
         trace_function_active=False,
+        termination_receipt_sha256=(digest(termination_receipt)
+                                    if termination_receipt.is_file() else None),
     )
     # Detect installed-file mutation too; generated RECORD/bytecode are not compared.
     verify_installed(args.wheel, args.source_root, args.commit)

@@ -6,7 +6,7 @@ name: Q1 Windows UNTRACED native functional (not qualification)
 on:
   push:
     branches:
-      - qualification/q1-windows-native-v12-20261105-2335-8af3d120
+      - 'qualification/q1-windows-native-*'  # exact one-shot ref enforced in the job gate via NEXUS_NATIVE_BRANCH
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ jobs:
   native:
     if: >-
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/qualification/q1-windows-native-v12-20261105-2335-8af3d120' &&
+      github.ref == format('refs/heads/{0}', vars.NEXUS_NATIVE_BRANCH) &&
       github.event.created == true &&
       github.event.before == '0000000000000000000000000000000000000000' &&
       github.event.deleted == false && github.event.forced == false &&
@@ -25,6 +25,7 @@ jobs:
     env:
       NEXUS_APPROVED_COMMIT: ${{ vars.NEXUS_APPROVED_COMMIT }}
       NEXUS_APPROVED_TREE: ${{ vars.NEXUS_APPROVED_TREE }}
+      NEXUS_NATIVE_BRANCH: ${{ vars.NEXUS_NATIVE_BRANCH }}
     defaults:
       run:
         shell: pwsh

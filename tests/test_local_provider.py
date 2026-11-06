@@ -198,3 +198,46 @@ def test_terminate_proc_force_kills_on_timeout():
     assert mock_proc.terminate.called
     assert mock_proc.kill.called
 
+
+def test_agent_thinking_kwargs_default_off(monkeypatch):
+    from nexus_agent_ai.providers.local_provider import agent_thinking_kwargs
+    monkeypatch.delenv("NEXUS_AGENT_ENABLE_THINKING", raising=False)
+    assert agent_thinking_kwargs() == {"enable_thinking": False}
+
+
+def test_agent_thinking_kwargs_env_override(monkeypatch):
+    from nexus_agent_ai.providers.local_provider import agent_thinking_kwargs
+    monkeypatch.setenv("NEXUS_AGENT_ENABLE_THINKING", "1")
+    assert agent_thinking_kwargs() == {"enable_thinking": True}
+    monkeypatch.setenv("NEXUS_AGENT_ENABLE_THINKING", "false")
+    assert agent_thinking_kwargs() == {"enable_thinking": False}
+
+
+def test_stream_payload_includes_thinking_kwargs(monkeypatch):
+    """The llama-server request must carry chat_template_kwargs so thinking-capable
+    templates stay within the bounded output budget for tool calls."""
+    import json as _json
+    from nexus_agent_ai.providers import local_provider as lp
+    monkeypatch.delenv("NEXUS_AGENT_ENABLE_THINKING", raising=False)
+    captured = {}
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def __iter__(self):
+            return iter([b'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}\n',
+                         b'data: [DONE]\n'])
+
+    def fake_urlopen(req, timeout=None):
+        captured["payload"] = _json.loads(req.data.decode("utf-8"))
+        return FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    prov = LocalProvider()
+    prov._server_alias = "m"
+    prov._server_port = 1
+    chunks = list(prov._stream_via_server([{"role": "user", "content": "hi"}], [], "sys"))
+    assert chunks[-1].text == "ok"
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
