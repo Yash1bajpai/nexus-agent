@@ -1,0 +1,97 @@
+name: Isolated SmolLM3 thinking-OFF Windows model experiment (repeat on v16-r8v5 qualification wheel)
+on:
+  push:
+    branches: [experiment/smollm3-thinkingoff-v16r8v5-20261106-2256-f803d5d1]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  model-probe:
+    if: >-
+      github.event.created == true && github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.deleted == false && github.event.forced == false && github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: experiment
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: f803d5d16add2edb0963b181ee530e75cbcf91d8
+          path: baseline
+          fetch-depth: 6
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fresh isolated root and work deadline
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          if (Test-Path $root) { throw 'Experiment root already exists' }
+          New-Item -ItemType Directory $root | Out-Null
+          @{work_deadline_utc=([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()+110*60);job_limit_minutes=120;reserve_minutes=10} | ConvertTo-Json | Set-Content -Encoding utf8 "$root/deadline.json"
+      - name: Verify unchanged actual attempt-one native baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/42260284787" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $metadata.head_sha -ne 'f803d5d16add2edb0963b181ee530e75cbcf91d8' -or $metadata.run_attempt -ne 1 -or $metadata.status -ne 'completed' -or $metadata.conclusion -ne 'success') { throw 'Baseline native run changed or unavailable' }
+      - uses: actions/download-artifact@v4
+        with:
+          name: q1-windows-untraced-native
+          path: ${{ runner.temp }}/smollm3-experiment/native-evidence
+          repository: ${{ github.repository }}
+          run-id: 42260284787
+          github-token: ${{ github.token }}
+      - name: Verify and install unchanged native-qualified wheel
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          $wheels = @(Get-ChildItem "$root/native-evidence" -Filter 'nexus_agent_ai-*.whl' -Recurse -File)
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one native-qualified wheel' }
+          python -I -B baseline/.github/qualification/verify_windows_interactive.py check-native --native-evidence "$root/native-evidence/native-gate.json" --wheel $wheels[0].FullName --commit f803d5d16add2edb0963b181ee530e75cbcf91d8 --tree 7f371e3d8acf46c6091527cad19b02faed68ef0a
+          if ($LASTEXITCODE -ne 0) { throw 'Native baseline verification failed' }
+          python -I -m venv "$root/venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh venv failed' }
+          & "$root/venv/Scripts/python.exe" -I -m pip install "$($wheels[0].FullName)[dev,cloud]" 'pywinpty==2.0.15'
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated dependencies failed' }
+      - name: One pinned model experiment, no warmup or retry
+        timeout-minutes: 110
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          $wheels = @(Get-ChildItem "$root/native-evidence" -Filter 'nexus_agent_ai-*.whl' -Recurse -File)
+          if ($wheels.Count -ne 1) { throw 'Wheel missing' }
+          & "$root/venv/Scripts/python.exe" -I -B experiment/.github/experiments/smollm3_probe.py --source-root "$env:GITHUB_WORKSPACE/baseline" --root $root --wheel $wheels[0].FullName --native-evidence "$root/native-evidence/native-gate.json" --deadline-file "$root/deadline.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Model experiment failed or incomplete, no rerun' }
+      - name: Always clean owned process trees
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          if (Test-Path "$root/venv/Scripts/python.exe") {
+            & "$root/venv/Scripts/python.exe" -I -B baseline/.github/qualification/interactive_core.py cleanup --root $root
+            if ($LASTEXITCODE -ne 0) { throw 'Owned process cleanup incomplete' }
+          }
+      - name: Always collect bounded synthetic evidence
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          python -I -B baseline/.github/qualification/verify_windows_interactive.py collect --output-root "$root/output" --upload-root "$root/upload"
+          if ($LASTEXITCODE -ne 0) { throw 'Evidence incomplete' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smollm3-windows-model-experiment
+          path: ${{ runner.temp }}/smollm3-experiment/upload
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 7
