@@ -153,14 +153,30 @@ def test_agent_trims_request_but_keeps_stored_history(tmp_path):
     assert len(mem.get()) == 12 * 2 + 2
 
 
-def test_agent_retries_once_after_overflow():
+def test_agent_retries_once_after_overflow(tmp_path):
+    from nexus_agent_ai.agent.persistence import SQLiteMemory
+    prov = RecordingProvider(fail_first=True)
+    mem = SQLiteMemory(tmp_path / "private" / "history.db", session_id="overflow-retry")
+    mem.replace(history(20, size=1000))
+    agent = Agent(provider=prov, memory=mem, verbose=False, tools=[])
+    assert agent.run("again") == "ok"
+    assert len(prov.calls) == 2
+    # The retry must be strictly smaller than the rejected request; an
+    # unchanged resend is never attempted.
+    assert ctx.history_tokens(prov.calls[1]) < ctx.history_tokens(prov.calls[0])
+
+
+def test_agent_overflow_without_reducible_history_fails_accurately():
+    # When nothing can be reduced below the rejected payload, the accurate
+    # capacity failure stands instead of an unchanged resend.
     prov = RecordingProvider(fail_first=True)
     mem = ConversationMemory(max_messages=500)
     mem.replace(history(4, size=100))
     agent = Agent(provider=prov, memory=mem, verbose=False, tools=[])
-    assert agent.run("again") == "ok"
-    assert len(prov.calls) == 2
-    assert ctx.history_tokens(prov.calls[1]) <= ctx.history_tokens(prov.calls[0])
+    import pytest as _pytest
+    with _pytest.raises(ctx.ContextBudgetError):
+        agent.run("again")
+    assert len(prov.calls) == 1
 
 
 def test_agent_does_not_retry_unrelated_errors():

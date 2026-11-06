@@ -17,8 +17,8 @@ import shutil
 import subprocess
 import sys
 BASE_COMMIT = "ae1c0c2e9fddf9e9078a6d87e8c1b2202930ce0b"
-REVIEWED_PARENT = "fe62609fe956baaead419c47dab7441e31d84f88"
-PARENT_TREE = "293aa18714241a05871c8e91931bbee05fb43323"
+REVIEWED_PARENT = "86180b5bf00817168e48f84dc401065e6d338114"
+PARENT_TREE = "aa87b217cde959326ec88beb904c1115c5510f3c"
 NATIVE_BRANCH = os.environ.get("NEXUS_NATIVE_BRANCH", "")
 REVIEWED_REF = f"refs/heads/{NATIVE_BRANCH}" if NATIVE_BRANCH else ""
 INVARIANT = "Q1_WINDOWS_NATIVE_V2"
@@ -33,49 +33,31 @@ VERIFIER_PATHS = frozenset({
 })
 
 ADDED_PATHS = frozenset({
-    ".github/workflows/q1-windows-conpty.yml",
+    "tests/test_unverified_content_claims.py",
+    "tests/test_overflow_retry.py",
 })
 
 MODIFIED_PATHS = frozenset({
-    ".github/qualification/interactive_assess.py",
-    ".github/qualification/interactive_core.py",
-    ".github/qualification/native_functional.py",
+    "tests/test_context_management.py",
     ".github/qualification/verify_windows_interactive.py",
     ".github/qualification/verify_windows_native.py",
-    ".github/workflows/q1-windows-interactive.yml",
-    ".github/workflows/q1-windows-native.yml",
-    "src/nexus_agent_ai/agent/tools.py",
-    "src/nexus_agent_ai/providers/local_provider.py",
-    "tests/test_budget_diagnostic_route.py",
-    "tests/test_local_provider.py",
-    "tests/test_q1_diagnostics_route.py",
-    "tests/test_q1_interactive_core.py",
+    "src/nexus_agent_ai/agent/core.py",
+    "src/nexus_agent_ai/agent/guardrails.py",
     "tests/test_q1_interactive_route.py",
     "tests/test_q1_native_route.py",
-    "tests/test_q1_route.py",
-    "tests/test_tools.py",
 })
 
 ALLOWED_PATHS = ADDED_PATHS | MODIFIED_PATHS
 
 # Non-verifier candidate files pinned exactly; both verifiers bound out of band.
 PAYLOAD_SHA256 = {
-    ".github/qualification/interactive_assess.py": "8b18e9ea00b62c4d3181927456f28a73bc531c424df40b75dd542ca9c24088b5",
-    ".github/qualification/interactive_core.py": "a96392bef56afc1ff8faf1fbc89648364c5e2fc2d7f12ba657d5d4ca0ba53da0",
-    ".github/qualification/native_functional.py": "583f414e6ec84e47b7f94c4baf4e4f6ce9e549a957249cdcde7e3dc420a93af0",
-    ".github/workflows/q1-windows-interactive.yml": "129d52c0409864fa983566d239607df6e8d2a2490168a2fbd3efa0ea31017c8f",
-    ".github/workflows/q1-windows-native.yml": "481cdb7d7c1c6fbbf7a696ffd92bf1923ac41d66657be617308743ddf9910fdf",
-    "src/nexus_agent_ai/agent/tools.py": "ef23ef0f39b6577f45de395ad9f1f10b5889c84b2f770b9a410f05ce7dad9c3e",
-    "src/nexus_agent_ai/providers/local_provider.py": "11661be1d23f4ed53f4f97895c9b5472e9d9bd713d128ccd7c00d21ea6c0e48e",
-    "tests/test_budget_diagnostic_route.py": "0b3fee9741081fc1dc09ddda974550a2afca454317138373df16ae04ae2b7370",
-    "tests/test_local_provider.py": "8ec48936fe664ef0d991a24e8ba9e0de229f4984b8b7ecd3745c0d4cb5fcd416",
-    "tests/test_q1_diagnostics_route.py": "4e203fb4f37dd202cfbfef9844a635e499852ee6f7141b167e5aebff212f050d",
-    "tests/test_q1_interactive_core.py": "559038fc1b6fd6a94791c6cf9ab58fc1136358eb522a224dac02fb8374ba7ed3",
-    "tests/test_q1_interactive_route.py": "49132c2ccb7a54228cce6f4f2b8c61f3910c5fd1e18175ef21e31ef8fc09d5f9",
-    "tests/test_q1_native_route.py": "8247b31ce598818a00afb5e1d1123ca81e3a92044910f14b78b6b3ccc339e074",
-    "tests/test_q1_route.py": "132a7366eb17ee1e461f76b8ae7219f502b95f915a8e09dd4a0badbeba9ce2cf",
-    "tests/test_tools.py": "a396628e84a05266bd97e74628e7605f3955e1aa38d02d9500bfabaf1e0c9e98",
-    ".github/workflows/q1-windows-conpty.yml": "cdfc69d60053b3f427f06e06b68504b4956a3926418b35970993b97ad00c4271"
+    "src/nexus_agent_ai/agent/core.py": "6dca2d961b5656867c41ba600423e1628b3587a6a0897324eaa1f2ba9242e92c",
+    "src/nexus_agent_ai/agent/guardrails.py": "43404da2245ffe74b3a3acecdd4893547bc68069d5df202f6f62a1a746c4e990",
+    "tests/test_unverified_content_claims.py": "0982d9a31eaface7b0823db6ce8fd1c3b07e8bbd98e7e8f60c8c0ad37dd37ada",
+    "tests/test_q1_interactive_route.py": "a49aba164345187b697a46a4d9d70484d7e276eace999a47f69e3fd5f3d91a78",
+    "tests/test_q1_native_route.py": "fdf252f5c6942768ef3577df8b53886b656b6441a664ce39022f8dd671d424c2",
+    "tests/test_overflow_retry.py": "0cd939e51598b157c01569d66aef7f1b83995b695abc3ee7ddd85b7fa022a328",
+    "tests/test_context_management.py": "ac5709481e5b8fcdc52975f950354d81f6120e6dda1e4afb2ddf2667f23f1dfe",
 }
 
 
