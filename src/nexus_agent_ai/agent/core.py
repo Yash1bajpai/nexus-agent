@@ -16,6 +16,7 @@ from .guardrails import (
     IdenticalFailureTracker, LoopGuard, guardrails_enabled, promises_tool_use, function_request_prose,
     requested_function_names, check_function_requirements,
     requested_literal_assignment, check_literal_assignment_requirement,
+    _file_identity, known_file_entry, unverified_file_content_claims, tool_result_succeeded,
 )
 from ..cli import display
 from ..utils.config import estimate_cost
@@ -297,8 +298,12 @@ def _routing_request(user_input: str, history: list) -> str:
     return user_input
 
 
-def parse_at_mentions(user_input: str) -> str:
-    """Detect @filename mentions, synchronously read files, attach context invisibly, and clean prompt."""
+def parse_at_mentions(user_input: str, attached_out: Optional[list] = None) -> str:
+    """Detect @filename mentions, synchronously read files, attach context invisibly, and clean prompt.
+
+    attached_out, when given, receives the resolved path of each genuinely
+    attached file (executor-verified reads only; marker-shaped text grants nothing).
+    """
     matches = re.findall(r'(?:^|\s)@\s*(?:"([^"]+)"|\'([^\']+)\'|([\w\.\-\/\\:]+))', user_input)
     if not matches:
         return user_input
@@ -314,11 +319,24 @@ def parse_at_mentions(user_input: str) -> str:
             resolved_path = Path(fpath)
 
         if resolved_path.exists() and resolved_path.is_file():
-            from .tools import execute_read_file
+            from .tools import execute_read_file, _is_sensitive_path
+            # Bind only for the provenance ledger, and never hash a sensitive
+            # path (its read is refused anyway). _file_identity is the
+            # version-tolerant form of the same sha256 content identity.
+            _bind = attached_out is not None and not _is_sensitive_path(resolved_path)
+            _attach_before = _file_identity(resolved_path) if _bind else None
             content = execute_read_file(str(resolved_path))
+            _attach_after = _file_identity(resolved_path) if _bind else None
             if content.startswith("ERROR:"):
                 attachments.append(f"[Warning: Could not attach @{fpath}: {content}]")
                 continue
+            if attached_out is not None:
+                # Bound only when the content identity was identical across the read.
+                _bound = _attach_after if (_attach_before is not None
+                                           and _attach_before == _attach_after
+                                           and isinstance(_attach_after, tuple)
+                                           and _attach_after[0] == "file") else None
+                attached_out.append((str(resolved_path), _bound))
             pattern = r'(?:^|\s)@\s*(?:"' + re.escape(raw_fpath) + r'"|\'' + re.escape(raw_fpath) + r'\'|' + re.escape(raw_fpath) + r')(?=\s|$|[.!,?;:])'
             clean_input = re.sub(pattern, ' ', clean_input).strip()
             attachments.append(f"[Context attached from @{fpath}: \n{content}\n]")
@@ -415,6 +433,9 @@ class Agent:
         self.unfulfilled_action = False
         self.response_incomplete = False
         self.changed_files: set[str] = set()
+        self.unverified_content_claim = False  # reply presented file contents with no verified source on record
+        self._session_known_files: dict = {}  # path -> known_file_entry record for files successfully
+        # read/written via tools or attached via @file this session (content provenance + freshness)
         self.requirements_incomplete: List[str] = []
         self._identical_failures = IdenticalFailureTracker()
         self._mutation_outcomes: Dict[str, Dict[str, Any]] = {}
@@ -598,6 +619,10 @@ class Agent:
             self._audit("session_record_injected", {
                 "turn": self._turn_id, "fields_included": stats.get("fields_included", {}),
             })
+        if (stats.get("omission_tokens", 0) or stats.get("compacted_messages", 0)
+                or stats.get("evicted_turns", 0)):
+            # The sent view lost content; a source-bearing message may be gone.
+            self._mark_provenance_unverifiable()
         for facts in stats.get("claim_redactions", []):
             self._audit("claim_redacted", facts)
 
@@ -946,12 +971,22 @@ class Agent:
         )
         return result
 
+    def _mark_provenance_unverifiable(self):
+        """Actual context removal/omission: a source may have left the model's
+        context. Records stay historical-trusted but lose any freshness claim,
+        so later contents claims warn as unverifiable instead of staying silent."""
+        for _entry in self._session_known_files.values():
+            _entry["state"] = None
+
     def compact(self, keep_turns: int = 2):
         """Shrink stored history; returns (before_tokens, after_tokens, info)."""
         before = context.history_tokens(self.memory.get())
         new, info = context.compact_messages(self.memory.get(), keep_turns=keep_turns)
         if info["removed_messages"]:
             self.memory.replace(new)
+            # Actual source removal only: records stay historical-trusted but
+            # can no longer claim verified freshness in the current context.
+            self._mark_provenance_unverifiable()
         return before, context.history_tokens(self.memory.get()), info
 
     @diagnostics.capture_turn
@@ -971,6 +1006,7 @@ class Agent:
         self._fresh_reads = {}
         self._pending_calls = []
         self._turn_had_execution = False
+        self._stream_emitted_corrections = []
         routing_input = _routing_request(user_input, self.memory.get())
         requires_search = bool(_LIVE_SEARCH_REQUEST.search(routing_input))
         wants_edit = require_edit or (
@@ -980,7 +1016,11 @@ class Agent:
             _named_function_requirements(routing_input) if self.guardrails else ({}, [])
         )
         literal_assignment_requirement = requested_literal_assignment(routing_input) if self.guardrails else None
-        processed_input = parse_at_mentions(attach_named_files(user_input))
+        _attached_files = []
+        processed_input = parse_at_mentions(attach_named_files(user_input), attached_out=_attached_files)
+        for _attached_path, _attached_state in _attached_files:
+            self._session_known_files[_attached_path] = known_file_entry(
+                _attached_path, base_dir=str(Path.cwd()), bound_state=_attached_state)
         self.memory.add("user", processed_input)
         error_nudges = 0
         messages = self.memory.get()
@@ -1037,6 +1077,7 @@ class Agent:
         try:
             while iteration < effective_max_iter:
                 iteration += 1
+                streamed_text = ""
                 diagnostics.set_iteration(self, iteration)
                 display.update_status(status, "Thinking...")
                 self._sync_context_window()
@@ -1261,6 +1302,28 @@ class Agent:
                                        if target_path is not None else "This tool has no target-file state.")
                                 )
                                 display.print_warn(repeated_failure_stop)
+                            _known_path = tool_call.args.get("path") if hasattr(tool_call, "args") else None
+                            if (isinstance(_known_path, str) and _known_path
+                                    and tool_result_succeeded(result)
+                                    and tool_call.name in (("read_file",) + _WRITE_TOOLS)):
+                                # Bind provenance to the executor's own before/after
+                                # observation: a read counts as bound only when the target
+                                # state was identical across the read; a write binds its
+                                # post-write state. Anything else stays historical-only.
+                                if tool_call.name == "read_file":
+                                    _bound_state = after_state if (before_state is not None
+                                                                   and before_state == after_state) else None
+                                else:
+                                    _bound_state = after_state
+                                # _target_snapshot's _file_state is a ("file", sha256)
+                                # content identity; anything else is not a bound observation.
+                                if not (isinstance(_bound_state, tuple) and len(_bound_state) == 2
+                                        and _bound_state[0] == "file" and isinstance(_bound_state[1], bytes)):
+                                    _bound_state = None
+                                # Anchor to the same root the tool resolved against
+                                # (_validate_workspace_path: process cwd at execution time).
+                                self._session_known_files[_known_path] = known_file_entry(
+                                    _known_path, base_dir=str(Path.cwd()), bound_state=_bound_state)
                             if tool_call.name == "search_web" and str(result).startswith("Search results for:"):
                                 search_succeeded = True
                                 for u in re.findall(r"^\s*URL:\s*(https?://\S+)", str(result), re.MULTILINE):
@@ -1327,7 +1390,15 @@ class Agent:
                         capacity_refused = getattr(result, "refusal_class", None) is RefusalClass.CAPACITY
                         count_refused = (tool_call.name == "count_file_text"
                                          and isinstance(getattr(result, "refusal_class", None), RefusalClass))
-                        if runner_failed or capacity_refused or count_refused or str(result).startswith(("ERROR:", "SANDBOX BLOCK:")):
+                        # Content is data: a successful read whose bytes begin with
+                        # "ERROR:" is not a tool failure. Trust the handler receipt
+                        # (executed=True, no refusal) over the payload's prefix; bare
+                        # legacy strings without receipts keep the prefix fallback.
+                        status_proven_success = (getattr(result, "refusal_class", None) is None
+                                                 and getattr(result, "executed", None) is True)
+                        if (runner_failed or capacity_refused or count_refused
+                                or (str(result).startswith(("ERROR:", "SANDBOX BLOCK:"))
+                                    and not status_proven_success)):
                             tool_errors.append(str(result))
                             unresolved[error_key] = str(result)
                             unresolved_tool[error_key] = tool_call.name
@@ -1436,6 +1507,64 @@ class Agent:
                     if self.unfulfilled_action:
                         final_text += ("\n\nNot completed: the model announced an action, but no tool was executed "
                                        "in this turn. Any calculation or verification above is unverified.")
+                    self.unverified_content_claim = False
+                    if not self.response_incomplete:
+                        _claim_report = unverified_file_content_claims(
+                            response.text,
+                            known_files=list(self._session_known_files.values()),
+                            workspace_root=str(Path.cwd()),
+                        )
+                        if _claim_report.unverified or _claim_report.stale or _claim_report.unverifiable:
+                            # Truthful narrow record: disk verification only, no
+                            # claim about what sources the model may have had.
+                            # Model words untouched. Prepended when the body has
+                            # not been shown yet; appended AND emitted under
+                            # streaming so the already-streamed body is never
+                            # replayed and the warning is actually shown.
+                            self.unverified_content_claim = True
+                            _place = "above" if stream else "below"
+                            _uv_parts = []
+                            if _claim_report.unverified:
+                                _uv_parts.append(
+                                    "Warning: unverified file review - no successful disk read of "
+                                    + ", ".join(_claim_report.unverified)
+                                    + " is on record in the current context; the file contents and "
+                                    "conclusions " + _place
+                                    + " were not verified against the file on disk."
+                                )
+                            if _claim_report.stale:
+                                _uv_parts.append(
+                                    "Warning: possibly stale file review - "
+                                    + ", ".join(_claim_report.stale)
+                                    + " was read or written earlier, but the file on disk has changed or "
+                                    "become unavailable since; the contents " + _place
+                                    + " were not re-verified against the current file."
+                                )
+                            if _claim_report.unverifiable:
+                                _uv_parts.append(
+                                    "Warning: unverified file review - a read or write of "
+                                    + ", ".join(_claim_report.unverifiable)
+                                    + " is on record, but it could not be verified against the file on "
+                                    "disk in the current context; the contents "
+                                    + _place
+                                    + " may not reflect the current file."
+                                )
+                            _uv_text = "\n".join(_uv_parts)
+                            if stream:
+                                # Always appended to the returned text. Emitted
+                                # immediately ONLY when the body was actually
+                                # streamed: guard-retry, tool-error recovery and
+                                # capacity-stop branches can discard final_text
+                                # before the end-of-turn suffix runs; the suffix
+                                # strips this recorded emission. A response-only
+                                # stream shows body and warning together, once,
+                                # via the final renderer or the response event.
+                                final_text += "\n\n" + _uv_text
+                                if streamed_text:
+                                    self._stream_emitted_corrections.append("\n\n" + _uv_text)
+                                    self._stream_correction("\n\n" + _uv_text)
+                            else:
+                                final_text = _uv_text + "\n\n" + final_text
                     if guard and not self.response_incomplete:
                         verdict, reviewed = guard.review_final(final_text)
                         if verdict == "retry":
@@ -1593,7 +1722,10 @@ class Agent:
                                 correction = final_text[len(baseline):]
                             else:
                                 correction = "\n\nCorrected outcome:\n" + final_text
-                            self._stream_correction(correction + "\n")
+                            for _already in self._stream_emitted_corrections:
+                                correction = correction.replace(_already, "", 1)
+                            if correction.strip():
+                                self._stream_correction(correction + "\n")
                         elif not self.event_callback:
                             display.print_response(final_text)
 

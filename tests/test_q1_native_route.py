@@ -52,7 +52,7 @@ def candidate(tmp_path, monkeypatch):
     parent = repo.commit_tree(base_tree, base, message="synthetic declared parent")
     repo.head(parent)
 
-    # Candidate files: exact 21 paths (5 added, 16 modified)
+    # Candidate files: exactly the declared candidate paths
     payload = {}
     for name in gate.ALLOWED_PATHS:
         blob = get_payload_blob(ROOT, name)
@@ -127,7 +127,7 @@ def test_github_sha_mismatch_against_approved_seal_rejected(candidate, monkeypat
 @pytest.mark.parametrize("change", ["extra", "existing_modified", "missing", "wrong_pin", "executable", "symlink"])
 def test_candidate_refuses_scope_content_or_mode_change(candidate, change):
     c = candidate
-    selected = "tests/test_q1_native_route.py"
+    selected = "src/nexus_agent_ai/agent/core.py"  # a declared, non-verifier payload path
     if change == "extra":
         c.repo.write("unreviewed.py", "unexpected\n")
     elif change == "existing_modified":
@@ -148,7 +148,7 @@ def test_candidate_refuses_scope_content_or_mode_change(candidate, change):
 def test_payload_table_must_pin_exact_non_verifier_files(candidate, monkeypatch):
     c = candidate
     pins = dict(c.gate.PAYLOAD_SHA256)
-    pins.pop("tests/test_q1_native_route.py")
+    pins.pop("src/nexus_agent_ai/agent/core.py")
     monkeypatch.setattr(c.gate, "PAYLOAD_SHA256", pins)
     with pytest.raises(c.gate.ReviewError, match="non-verifier candidate files"):
         c.gate.verify_tree(c.repo.path, c.tree)
