@@ -1388,6 +1388,14 @@ def _child_rlimits_supported() -> bool:
 
 def execute_run_code(code: str, language: str = "python") -> str:
     """Run Python code snippet in a sandboxed subprocess with AST analysis + timeout."""
+    # Probe-only kill switch (checked before any spawn): on platforms without an
+    # enforced OS containment boundary (no rlimits, no Job Objects - e.g.
+    # Windows), qualification environments set this flag so model-supplied code
+    # is refused outright. Default product behavior is unchanged when unset.
+    if os.environ.get("NEXUS_AGENT_DISABLE_RUN_CODE") == "1":
+        return runner_result(refusal(RefusalClass.PERMISSION,
+            "ERROR: run_code is disabled in this environment; no code execution is available."),
+            tool="run_code", status=RunnerStatus.NOT_EXECUTED)
     if language.lower() not in ["python", "py"]:
         return runner_result(refusal(RefusalClass.OTHER, f"ERROR: Running language '{language}' is not supported yet. Only Python is supported."),
                              tool="run_code", status=RunnerStatus.NOT_EXECUTED)

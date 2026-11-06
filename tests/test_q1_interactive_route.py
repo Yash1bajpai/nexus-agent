@@ -1,5 +1,8 @@
 """Local B candidate/A-prerequisite/collector tests. Never launch a model or network."""
 from __future__ import annotations
+import os as _route_os
+_route_os.environ.setdefault("NEXUS_NATIVE_BRANCH", "qualification/q1-windows-native-v12-20261105-2335-8af3d120")
+_route_os.environ.setdefault("NEXUS_REALMODEL_BRANCH", "qualification/q1-windows-realmodel-v12-20261105-2335-8af3d120")
 
 import hashlib
 import importlib.util
@@ -74,7 +77,7 @@ def test_exact_candidate_and_clean_local_checkout(candidate, monkeypatch):
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     result = c.gate.verify_checkout(c.repo.path, local=True, approved_commit=c.sha, approved_tree=c.tree)
     assert result["commit"] == c.sha and result["parent"] == c.parent
-    assert len(result["exact_delta_paths"]) == 21
+    assert len(result["exact_delta_paths"]) == len(c.gate.ALLOWED_PATHS)
     assert result["qualified"] is False and result["external_execution_approval"] is False
     c.repo.write("src/preserved.py", "changed\n")
     with pytest.raises(c.gate.ReviewError, match="Dirty"):
