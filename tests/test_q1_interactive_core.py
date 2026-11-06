@@ -38,10 +38,12 @@ def mock_successful_ownership(monkeypatch, root: Path, pid: int = 4242) -> None:
     """Record fake facts and mock process recording without launching real processes."""
     out = root / "output"
     out.mkdir(parents=True, exist_ok=True)
-    facts = [{"pid": pid, "create_time": 1000.0, "exe": "mock.exe", "cmdline": ["mock"]}]
+    facts = [{"pid": pid, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "mock.exe", "cmdline": ["mock"]}]
     (out / "owned_processes.json").write_text(json.dumps(facts), encoding="utf-8")
-    monkeypatch.setattr(core, "record_owned_process", lambda r, p: None)
+    monkeypatch.setattr(core, "record_owned_process", lambda r, p, **kw: None)
     monkeypatch.setattr(core, "scan_and_record_descendants", lambda r, p: None)
+    monkeypatch.setattr(core, "_capture_registration_identity",
+                        lambda p: {"create_ticks": 1000000, "exe": "mock.exe", "creator_pid": 4242})
 
 
 class FakePtyProcess:
@@ -96,8 +98,9 @@ def test_ready_prompt_detection_vs_echo(tmp_path, monkeypatch):
     ])
     session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
     try:
-        buf, ready = session.wait_for_ready_prompt(timeout=2.0, deadline=time.monotonic() + 5.0)
+        buf, ready, consent_wait = session.wait_for_ready_prompt(timeout=2.0, deadline=time.monotonic() + 5.0)
         assert ready is True
+        assert consent_wait is False
         assert "Processing..." in buf
     finally:
         session.close()
@@ -109,8 +112,9 @@ def test_wait_for_ready_prompt_timeout(tmp_path, monkeypatch):
     fake = FakePtyProcess(["Still working...\r\n"])
     session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
     try:
-        buf, ready = session.wait_for_ready_prompt(timeout=0.1, deadline=time.monotonic() + 0.1)
+        buf, ready, consent_wait = session.wait_for_ready_prompt(timeout=0.1, deadline=time.monotonic() + 0.1)
         assert ready is False
+        assert consent_wait is False
     finally:
         session.close()
 
@@ -317,26 +321,823 @@ def test_assess_task_calculator_review_requires_explicit_relation():
     assert res_amb["task"]["status"] == assess.REVIEW
 
 
-def test_verify_calculator_behavior_and_ast_preservation(tmp_path):
+def test_verify_calculator_static_never_executes_model_code(tmp_path):
+    """Static verification: syntax/add-preservation/multiply-changed without execution.
+
+    A hostile top-level statement in the model-written file must never run:
+    no import, no exec, no compile-and-call from the harness."""
     workspace = tmp_path / "calc_ws"
     workspace.mkdir()
     before_src = "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a + b\n"
-    (workspace / "calculator.py").write_text(
-        "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n",
-        encoding="utf-8"
+    sentinel = workspace / "SENTINEL_EXECUTED"
+    hostile = (
+        "from pathlib import Path as _P\n"
+        f"_P({str(sentinel)!r}).write_text('pwned')\n"
+        "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n"
     )
-    beh_ok, add_ok = core.verify_calculator_behavior(workspace, before_src)
-    assert beh_ok is True
-    assert add_ok is True
+    (workspace / "calculator.py").write_text(hostile, encoding="utf-8")
+    facts = core.verify_calculator_static(workspace, before_src)
+    assert facts == {"syntax_ok": True, "add_preserved": True, "multiply_changed": True}
+    assert not sentinel.exists(), "model-written code must never execute during verification"
 
-    # Broken add AST
+    # Broken add AST -> not preserved
     (workspace / "calculator.py").write_text(
-        "def add(a, b):\n    return a + b + 0  # modified AST\n\ndef multiply(a, b):\n    return a * b\n",
+        "def add(a, b):\n    return a + b + 0\n\ndef multiply(a, b):\n    return a * b\n",
         encoding="utf-8"
     )
-    beh_ok2, add_ok2 = core.verify_calculator_behavior(workspace, before_src)
-    assert add_ok2 is False
-    assert beh_ok2 is False
+    assert core.verify_calculator_static(workspace, before_src)["add_preserved"] is False
+
+    # Unchanged multiply (bug not fixed) -> not changed
+    (workspace / "calculator.py").write_text(before_src, encoding="utf-8")
+    assert core.verify_calculator_static(workspace, before_src)["multiply_changed"] is False
+
+    # Syntax error -> static fail, still no execution
+    (workspace / "calculator.py").write_text("def broken(:\n", encoding="utf-8")
+    assert core.verify_calculator_static(workspace, before_src)["syntax_ok"] is False
+
+    # Missing file
+    (workspace / "calculator.py").unlink()
+    assert core.verify_calculator_static(workspace, before_src) == {
+        "syntax_ok": False, "add_preserved": False, "multiply_changed": False}
+
+
+def test_assess_task_calculator_fix_review_never_pass_and_behavior_not_tested():
+    """Static-complete fix yields REVIEW (behavior NOT_TESTED), never PASS; gaps yield FAIL."""
+    mutation_msgs = [
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+          "function": {"name": "patch_file", "arguments": json.dumps({"path": "calculator.py"})}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "patch_file", "content": "patched",
+         "metadata": {"executed": True}},
+    ]
+    before_src = "def add(a, b): return a + b\ndef multiply(a, b): return a + b\n"
+    after_src = "def add(a, b): return a + b\ndef multiply(a, b): return a * b\n"
+    good = {"syntax_ok": True, "add_preserved": True, "multiply_changed": True}
+    res = assess.assess_task_calculator_fix(good, before_src, after_src, mutation_msgs)
+    assert res["task"]["status"] == assess.REVIEW
+    assert res["task"]["status"] != assess.PASS
+    assert "NOT_TESTED" in res["task"]["evidence"][0]["behavior"]
+    assert res["task"]["evidence"][0]["static_only"] is True
+
+    # No bound mutation -> FAIL
+    res_no_mut = assess.assess_task_calculator_fix(good, before_src, after_src, [])
+    assert res_no_mut["task"]["status"] == assess.FAIL
+
+    # Static gap (multiply unchanged) -> FAIL
+    res_static_gap = assess.assess_task_calculator_fix(
+        {"syntax_ok": True, "add_preserved": True, "multiply_changed": False},
+        before_src, before_src, mutation_msgs)
+    assert res_static_gap["task"]["status"] == assess.FAIL
+
+
+def _strict_psutil(monkeypatch, processes):
+    """Fake psutil over a {pid: [create_time, exe, running]} table (mutable running)."""
+    class FakeProc:
+        def __init__(self, pid):
+            if pid not in processes:
+                raise FakePsutil.NoSuchProcess(pid)
+            self.pid = pid
+        def create_time(self):
+            return processes[self.pid][0]
+        def exe(self):
+            return processes[self.pid][1]
+        def is_running(self):
+            return processes[self.pid][2]
+
+    class FakePsutil:
+        class NoSuchProcess(Exception):
+            pass
+        @staticmethod
+        def Process(pid):
+            return FakeProc(pid)
+
+    monkeypatch.setitem(sys.modules, "psutil", FakePsutil)
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    return processes
+
+
+def _owned(tmp_path, entries):
+    out = tmp_path / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "owned_processes.json").write_text(json.dumps(entries), encoding="utf-8")
+    return out
+
+
+def test_terminate_kills_verified_identity_persists_receipt_then_allows_handoff(tmp_path, monkeypatch):
+    """Success handoff: verified termination, exit proof, receipt on disk before return."""
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    out = _owned(tmp_path, [entry])
+    processes = _strict_psutil(monkeypatch, {4321: [1000.0, "ours.exe", True]})
+    kills = []
+
+    def fake_terminate(e, result):
+        kills.append(e["pid"])
+        processes[e["pid"]][2] = False
+        return True
+
+    monkeypatch.setattr(core, "_terminate_verified", fake_terminate)
+    closed = type("S", (), {"pty": type("P", (), {"isalive": lambda self: False})()})()
+    tracker = [0]
+    res = core.terminate_owned_processes(tmp_path, tracker, "after_session_001", pty=closed, settle_seconds=1.0)
+    assert res["terminated"] is True
+    assert kills == [4321]
+    receipt = json.loads((out / "termination_after_session_001.json").read_text(encoding="utf-8"))
+    assert receipt["terminated"] is True and receipt["killed_pids"] == [4321] and receipt["pty_closed"] is True
+    assert tracker[0] > 0, "receipt must be charged against the evidence budget"
+
+
+def test_terminate_fails_closed_on_survivor(tmp_path, monkeypatch):
+    entry = {"pid": 5555, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    out = _owned(tmp_path, [entry])
+    _strict_psutil(monkeypatch, {5555: [1000.0, "ours.exe", True]})  # never stops running
+    monkeypatch.setattr(core, "_terminate_verified", lambda e, result: True)
+    res = core.terminate_owned_processes(tmp_path, [0], "after_session_001", settle_seconds=0.3)
+    assert res["terminated"] is False
+    assert 5555 in res["remaining"]
+    receipt = json.loads((out / "termination_after_session_001.json").read_text(encoding="utf-8"))
+    assert receipt["terminated"] is False and 5555 in receipt["remaining"]
+
+
+def test_terminate_pid_reuse_never_kills_occupant(tmp_path, monkeypatch):
+    """Same PID, different create_time/exe: occupant untouched, mismatch reported, no absolute
+    PID-reuse claim - the recorded identity is simply gone."""
+    entry = {"pid": 7777, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    _owned(tmp_path, [entry])
+    _strict_psutil(monkeypatch, {7777: [2000.0, "occupant.exe", True]})
+    kills = []
+    monkeypatch.setattr(core, "_terminate_verified", lambda e, result: kills.append(e["pid"]))
+    res = core.terminate_owned_processes(tmp_path, [0], "after_session_001", settle_seconds=0.2)
+    assert kills == [], "a PID-reuse occupant must never be terminated"
+    assert res["skipped_identity_mismatch"] == [7777]
+    assert res["terminated"] is True
+
+
+def test_terminate_never_adopts_ambient_server(tmp_path, monkeypatch):
+    """An unrecorded llama-server pointing at this root is never terminated (no adoption)."""
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    _owned(tmp_path, [entry])
+    _strict_psutil(monkeypatch, {9999: [500.0, "llama-server.exe", True]})  # ambient only
+    kills = []
+    monkeypatch.setattr(core, "_terminate_verified", lambda e, result: kills.append(e["pid"]))
+    res = core.terminate_owned_processes(tmp_path, [0], "after_session_001", settle_seconds=0.2)
+    assert kills == []
+    assert res["terminated"] is True
+
+
+def test_terminate_zero_kill_on_strict_metadata_violations(tmp_path, monkeypatch):
+    """Every malformed identity shape fails closed with zero kills."""
+    kills = []
+    monkeypatch.setattr(core, "_terminate_verified",
+                        lambda e, result: (_ for _ in ()).throw(AssertionError("kill attempted")))
+    _strict_psutil(monkeypatch, {4321: [1000.0, "ours.exe", True]})
+    bad_shapes = [
+        "not json",
+        "[]",
+        json.dumps([{"pid": True, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe"}]),          # bool pid
+        json.dumps([{"pid": "4321", "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe"}]),        # string pid
+        json.dumps([{"pid": -1, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe"}]),            # negative pid
+        json.dumps([{"pid": 4321, "create_time": True, "exe": "ours.exe"}]),            # bool time
+        json.dumps([{"pid": 4321, "create_time": 0, "exe": "ours.exe"}]),               # zero time
+        json.dumps([{"pid": 4321, "create_time": float("inf"), "exe": "ours.exe"}]),    # inf time
+        json.dumps([{"pid": 4321, "create_time": float("nan"), "exe": "ours.exe"}]),    # nan time
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000}]),                             # missing exe
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "exe": ""}]),                  # empty exe
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "exe": "   "}]),               # blank exe
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "exe": "ours.exe"}]),          # missing ticks (legacy)
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": True, "exe": "ours.exe"}]),       # bool ticks
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 0, "exe": "ours.exe"}]),          # zero ticks
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": -5, "exe": "ours.exe"}]),         # negative ticks
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000.5, "exe": "ours.exe"}]),     # float ticks
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": "1000000", "exe": "ours.exe"}]),  # string ticks
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "exe": "ours.exe"}]),  # missing creator (legacy)
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": True, "exe": "ours.exe"}]),   # bool creator
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 0, "exe": "ours.exe"}]),     # zero creator
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": "4242", "exe": "ours.exe"}]), # string creator
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "creator_ticks": True, "exe": "ours.exe"}]),   # bool creator_ticks
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "creator_ticks": 0, "exe": "ours.exe"}]),     # zero creator_ticks
+        json.dumps([{"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "creator_ticks": 1.5, "exe": "ours.exe"}]),   # float creator_ticks
+    ]
+    for bad in bad_shapes:
+        res = core.terminate_owned_processes(_owned(tmp_path, []) .parent.parent if False else
+                                             _write_bad(tmp_path, bad), [0], "r", settle_seconds=0.05)
+        assert res["terminated"] is False, bad
+        assert res["errors"], bad
+    assert kills == []
+
+
+def _write_bad(tmp_path, bad):
+    out = tmp_path / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "owned_processes.json").write_text(bad, encoding="utf-8")
+    return tmp_path
+
+
+def test_terminate_fails_closed_on_observation_errors(tmp_path, monkeypatch):
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    out = _owned(tmp_path, [entry])
+    (out / "observation_errors.json").write_text(json.dumps(["descendant scan failed"]), encoding="utf-8")
+    _strict_psutil(monkeypatch, {4321: [1000.0, "ours.exe", True]})
+    monkeypatch.setattr(core, "_terminate_verified",
+                        lambda e, result: (_ for _ in ()).throw(AssertionError("kill attempted")))
+    res = core.terminate_owned_processes(tmp_path, [0], "after_session_001", settle_seconds=0.1)
+    assert res["terminated"] is False
+
+
+def test_terminate_fails_closed_on_failed_inspection(tmp_path, monkeypatch):
+    """psutil inspection error (not NoSuchProcess) -> fail closed, no termination."""
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    _owned(tmp_path, [entry])
+
+    class FakePsutil:
+        class NoSuchProcess(Exception):
+            pass
+        @staticmethod
+        def Process(pid):
+            raise RuntimeError("inspection failed")
+
+    monkeypatch.setitem(sys.modules, "psutil", FakePsutil)
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_terminate_verified",
+                        lambda e, result: (_ for _ in ()).throw(AssertionError("kill attempted")))
+    res = core.terminate_owned_processes(tmp_path, [0], "after_session_001", settle_seconds=0.1)
+    assert res["terminated"] is False
+    assert any("pre-kill inspection" in e for e in res["errors"])
+
+
+def test_terminate_fails_closed_on_live_pty(tmp_path, monkeypatch):
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    _owned(tmp_path, [entry])
+    _strict_psutil(monkeypatch, {4321: [1000.0, "ours.exe", True]})
+    monkeypatch.setattr(core, "_terminate_verified",
+                        lambda e, result: (_ for _ in ()).throw(AssertionError("kill attempted")))
+    live = type("S", (), {"pty": type("P", (), {"isalive": lambda self: True})()})()
+    res = core.terminate_owned_processes(tmp_path, [0], "after_session_001", pty=live, settle_seconds=0.1)
+    assert res["terminated"] is False
+    assert res["pty_closed"] is False
+
+
+def test_terminate_fails_closed_on_receipt_write_failure(tmp_path, monkeypatch):
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe", "cmdline": ["ours"]}
+    _owned(tmp_path, [entry])
+    processes = _strict_psutil(monkeypatch, {4321: [1000.0, "ours.exe", True]})
+
+    def fake_terminate(e, result):
+        processes[e["pid"]][2] = False
+        return True
+
+    monkeypatch.setattr(core, "_terminate_verified", fake_terminate)
+    monkeypatch.setattr(core, "charge_and_write",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("evidence cap")))
+    res = core.terminate_owned_processes(tmp_path, [0], "after_session_001", settle_seconds=0.5)
+    assert res["terminated"] is False, "no receipt, no handoff"
+    assert any("receipt persist failed" in e for e in res["errors"])
+
+
+class _RegistrationPsutil:
+    """Fake psutil for registration tests: {pid: [create_time, exe, cmdline]}."""
+
+    class NoSuchProcess(Exception):
+        pass
+
+    table = {}
+
+    @classmethod
+    def Process(cls, pid):
+        if pid not in cls.table:
+            raise cls.NoSuchProcess(pid)
+        create_time, exe, cmdline = cls.table[pid]
+        return type("P", (), {"create_time": staticmethod(lambda: create_time),
+                              "exe": staticmethod(lambda: exe),
+                              "cmdline": staticmethod(lambda: cmdline)})()
+
+
+def _registration_rig(monkeypatch, tmp_path, identities, table=None):
+    """Fake psutil + fake single-channel capture over {pid: identity|None}."""
+    monkeypatch.setitem(sys.modules, "psutil", _RegistrationPsutil)
+    _RegistrationPsutil.table = table or {pid: [1000.0, "ours.exe", ["ours", "--flag"]]
+                                          for pid in identities}
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_capture_registration_identity", lambda pid, _diag=None: identities.get(pid))
+    return tmp_path
+
+
+def _read_owned(root):
+    f = root / "output" / "owned_processes.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+
+
+def _obs_errors(root):
+    f = root / "output" / "observation_errors.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+
+
+def test_registration_single_channel_identity_recorded(tmp_path, monkeypatch):
+    """Root spawn: identity (ticks + exe + creator) from ONE handle, creator is
+    the harness, psutil fields retained as display-only observation anchors."""
+    identity = {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": os.getpid()}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: identity})
+    core.record_owned_process(root, 4321, expected=identity, expected_creator=os.getpid())
+    stored = _read_owned(root)
+    assert stored == [{"pid": 4321, "create_time": 1000.0, "create_ticks": 5000000,
+                       "exe": "ours.exe", "creator_pid": os.getpid(), "creator_ticks": None,
+                       "observed_exe": "ours.exe", "cmdline": ["ours", "--flag"]}]
+    assert core._valid_owned_entry(stored[0]) is True
+
+
+def test_registration_anchor_mismatch_fails_closed(tmp_path, monkeypatch):
+    """Process replaced between earliest observation and registration: exact
+    anchor mismatch -> raise, nothing registered, occupant never adopted."""
+    anchor = {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": os.getpid()}
+    occupant = {"create_ticks": 9000000, "exe": "ours.exe", "creator_pid": os.getpid()}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: occupant})
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(root, 4321, expected=anchor, expected_creator=os.getpid())
+    assert _read_owned(root) == []
+    assert any("anchor mismatch" in str(e) for e in _obs_errors(root))
+
+
+def test_registration_foreign_creator_fails_closed(tmp_path, monkeypatch):
+    """Creator is neither the harness nor a registered parent: unowned
+    occupant refused even with a plausible identity."""
+    identity = {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": 99999}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: identity})
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(root, 4321, expected=identity)
+    assert _read_owned(root) == []
+    assert any("creator" in str(e).lower() for e in _obs_errors(root))
+
+
+def test_registration_expected_creator_mismatch_fails_closed(tmp_path, monkeypatch):
+    identity = {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": 99999}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: identity})
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(root, 4321, expected=identity, expected_creator=os.getpid())
+    assert _read_owned(root) == []
+
+
+def test_registration_missing_required_anchor_fails_closed(tmp_path, monkeypatch):
+    """First capture failed (expected=None) but the registration-time capture
+    succeeds: refuse - the earliest-observation comparison and the first
+    capture's failure (e.g. CloseHandle) must never be skipped."""
+    identity = {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": os.getpid()}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: identity})
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(root, 4321, expected=None, expected_creator=os.getpid())
+    assert _read_owned(root) == []
+    assert any("anchor missing" in str(e) for e in _obs_errors(root))
+
+
+def test_ptysession_first_capture_failure_skips_registration(tmp_path, monkeypatch):
+    """Root anchor capture returns None (first attempt failed): registration
+    is never reached, no second capture can bypass it, no protocol input."""
+    writes = []
+    calls = {"record": 0, "capture": 0}
+
+    class RecPty:
+        pid = 4242
+        def read(self, size=1024): return ""
+        def isalive(self): return True
+        def write(self, text): writes.append(text)
+        def close(self): pass
+
+    def fake_capture(pid):
+        calls["capture"] += 1
+        return None  # first (anchor) capture failed, e.g. CloseHandle failure
+
+    monkeypatch.setattr(core, "_capture_registration_identity", fake_capture)
+    monkeypatch.setattr(core, "record_owned_process",
+                        lambda *a, **kw: calls.__setitem__("record", calls["record"] + 1))
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=RecPty())
+    assert session.error_flag is not None and session.error_flag.startswith("root_ownership_failed")
+    assert calls["record"] == 0, "registration must not run without a valid anchor"
+    assert calls["capture"] == 1, "no bypass second capture"
+    assert writes == []
+    assert not hasattr(session, "_reader_thread")
+
+
+def test_registration_identity_unavailable_raises(tmp_path, monkeypatch):
+    """No single-channel capture (incl. CloseHandle failure): registration
+    raises and records an observation error - never a ticks-None record that
+    lets the protocol start without a cleanup-valid root."""
+    identity = {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": os.getpid()}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: None})
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(root, 4321, expected=identity, expected_creator=os.getpid())
+    assert _read_owned(root) == []
+    assert any("identity unavailable" in str(e) for e in _obs_errors(root))
+
+
+def test_registration_descendant_of_verified_parent(tmp_path, monkeypatch):
+    """Descendant: creator is a registered parent whose identity re-verifies
+    NOW; child records the parent's verified ticks as creator_ticks."""
+    parent_identity = {"create_ticks": 4000000, "exe": "parent.exe", "creator_pid": os.getpid()}
+    child_identity = {"create_ticks": 5000000, "exe": "child.exe", "creator_pid": 4321}
+    table = {4321: [1000.0, "parent.exe", ["parent"]], 5555: [1001.0, "child.exe", ["child"]]}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: parent_identity, 5555: child_identity},
+                             table=table)
+    core.record_owned_process(root, 4321, expected=parent_identity, expected_creator=os.getpid())
+    core.record_owned_process(root, 5555, expected=child_identity)
+    stored = _read_owned(root)
+    assert stored[1]["creator_pid"] == 4321
+    assert stored[1]["creator_ticks"] == 4000000
+    assert core._valid_owned_entry(stored[1]) is True
+
+
+def test_registration_descendant_parent_drift_fails_closed(tmp_path, monkeypatch):
+    """Registered parent was recycled after registration (re-verification
+    returns different ticks): the child is refused, not adopted."""
+    parent_identity = {"create_ticks": 4000000, "exe": "parent.exe", "creator_pid": os.getpid()}
+    drifted_parent = {"create_ticks": 4100000, "exe": "parent.exe", "creator_pid": os.getpid()}
+    child_identity = {"create_ticks": 5000000, "exe": "child.exe", "creator_pid": 4321}
+    table = {4321: [1000.0, "parent.exe", ["parent"]], 5555: [1001.0, "child.exe", ["child"]]}
+    captures = {"count": 0}
+
+    def fake_capture(pid, _diag=None):
+        if pid == 4321:
+            captures["count"] += 1
+            return parent_identity if captures["count"] == 1 else drifted_parent
+        return child_identity
+
+    monkeypatch.setitem(sys.modules, "psutil", _RegistrationPsutil)
+    _RegistrationPsutil.table = table
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_capture_registration_identity", fake_capture)
+    core.record_owned_process(tmp_path, 4321, expected=parent_identity, expected_creator=os.getpid())
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(tmp_path, 5555, expected=child_identity)
+    stored = _read_owned(tmp_path)
+    assert [e["pid"] for e in stored] == [4321]
+
+
+def test_registration_child_predates_parent_fails_closed(tmp_path, monkeypatch):
+    parent_identity = {"create_ticks": 5000000, "exe": "parent.exe", "creator_pid": os.getpid()}
+    child_identity = {"create_ticks": 4000000, "exe": "child.exe", "creator_pid": 4321}
+    table = {4321: [1000.0, "parent.exe", ["parent"]], 5555: [999.0, "child.exe", ["child"]]}
+    root = _registration_rig(monkeypatch, tmp_path, {4321: parent_identity, 5555: child_identity},
+                             table=table)
+    core.record_owned_process(root, 4321, expected=parent_identity, expected_creator=os.getpid())
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(root, 5555, expected=child_identity)
+    assert [e["pid"] for e in _read_owned(root)] == [4321]
+
+
+def test_ptysession_no_protocol_input_when_root_ownership_fails(tmp_path, monkeypatch):
+    """Regression: identity capture/registration failure raises BEFORE any
+    protocol input - the session records root_ownership_failed, closes, the
+    reader never starts, and zero bytes are written to the PTY."""
+    writes = []
+
+    class RecPty:
+        pid = 4242
+        def read(self, size=1024): return ""
+        def isalive(self): return True
+        def write(self, text): writes.append(text)
+        def close(self): pass
+
+    monkeypatch.setattr(core, "record_owned_process",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("capture failed")))
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=RecPty())
+    assert session.error_flag is not None and session.error_flag.startswith("root_ownership_failed")
+    assert writes == [], "no protocol input may be sent after ownership failure"
+    assert not hasattr(session, "_reader_thread"), "reader starts only after ownership is valid"
+    assert any("root_ownership_failed" in str(e) for e in _obs_errors(tmp_path))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle semantics only verifiable on Windows")
+def test_terminate_verified_real_os_handle_identity(tmp_path):
+    """Real OS proof (no mocks) through the PRODUCTION registration path.
+
+    A safe disposable child spawned by THIS test (not a phone/user process)
+    is anchored immediately, registered via production record_owned_process,
+    read back through strict metadata validation, then: ticks off by one
+    refused with the child alive, wrong image refused alive, and production
+    terminate_owned_processes kills exactly the recorded identity
+    (child.wait confirms exit). The creator binding must report this test
+    process as the parent."""
+    import subprocess as sp
+    child = sp.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        import psutil
+        anchor = core._capture_registration_identity(child.pid)
+        assert anchor is not None, "single-channel capture must succeed on the Windows gate"
+        assert type(anchor["create_ticks"]) is int and anchor["create_ticks"] > 0
+        assert anchor["creator_pid"] == os.getpid(), "subprocess child's creator is this test process"
+
+        core.record_owned_process(tmp_path, child.pid, expected=anchor,
+                                  expected_creator=os.getpid())
+        read_back = {"errors": []}
+        entries = core._read_strict_owned_metadata(tmp_path, read_back)
+        assert entries and not read_back["errors"], read_back
+        entry = entries[0]
+        assert entry["creator_pid"] == os.getpid() and entry["create_ticks"] == anchor["create_ticks"]
+
+        res_bad_ticks = {"errors": []}
+        assert core._terminate_verified({**entry, "create_ticks": entry["create_ticks"] + 1},
+                                        res_bad_ticks) is False
+        assert psutil.pid_exists(child.pid), "wrong identity must never terminate"
+
+        res_bad_exe = {"errors": []}
+        assert core._terminate_verified({**entry, "exe": entry["exe"] + ".wrong"},
+                                        res_bad_exe) is False
+        assert psutil.pid_exists(child.pid)
+
+        res = core.terminate_owned_processes(tmp_path, [0], "native_test", settle_seconds=0.5)
+        assert res["terminated"] is True, res
+        child.wait(timeout=10)
+        assert child.poll() is not None, "exact recorded identity must terminate"
+        receipt_dir = os.environ.get("NEXUS_Q1_NATIVE_RECEIPT_DIR")
+        if receipt_dir:
+            # Retain the bounded child receipt in the harness upload output,
+            # only after the real termination outcome above has been asserted.
+            (Path(receipt_dir) / "termination_native_test.json").write_bytes(
+                (tmp_path / "output" / "termination_native_test.json").read_bytes())
+    finally:
+        if child.poll() is None:
+            child.kill()
+
+
+def test_terminate_verified_fails_closed_without_stable_handle(monkeypatch):
+    """Non-Windows: no stable handle, no termination, explicit error."""
+    monkeypatch.setattr(core, "_IS_WINDOWS", False)
+    result = {"errors": []}
+    assert core._terminate_verified({"pid": 1, "create_time": 1.0, "exe": "x"}, result) is False
+    assert any("stable process handle unavailable" in e for e in result["errors"])
+
+
+class _FakeKernel32:
+    """Logic-level fake for the handle lifecycle (NOT OS proof): drives the
+    real _terminate_verified control flow with scripted Win32 outcomes."""
+
+    def __init__(self, close_ok=True, terminate_ok=True, ticks=1000000, image="ours.exe"):
+        self.close_ok = close_ok
+        self.terminate_ok = terminate_ok
+        self.ticks = ticks
+        self.image = image
+        self.terminated = False
+        self.closed = False
+
+    def OpenProcess(self, access, inherit, pid):
+        return 1234
+
+    def GetProcessTimes(self, handle, creation, exit_time, kernel, user):
+        creation._obj.dwHighDateTime = self.ticks >> 32
+        creation._obj.dwLowDateTime = self.ticks & 0xFFFFFFFF
+        return True
+
+    def QueryFullProcessImageNameW(self, handle, flags, buf, size):
+        buf.value = self.image
+        return True
+
+    def TerminateProcess(self, handle, code):
+        self.terminated = True
+        return self.terminate_ok
+
+    def CloseHandle(self, handle):
+        self.closed = True
+        return self.close_ok
+
+
+def _fake_windows(monkeypatch, fake):
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_load_kernel32", lambda: fake)
+
+
+def test_terminate_verified_logic_exact_identity_success(monkeypatch):
+    """Mock-control-flow only: exact ticks + image -> terminate issued, True."""
+    fake = _FakeKernel32()
+    _fake_windows(monkeypatch, fake)
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe"}
+    result = {"errors": []}
+    assert core._terminate_verified(entry, result) is True
+    assert fake.terminated and fake.closed
+    assert result["errors"] == []
+
+
+def test_terminate_verified_logic_ticks_mismatch_no_terminate(monkeypatch):
+    """Ticks off by one: refused, no terminate issued, handle still closed."""
+    fake = _FakeKernel32(ticks=1000001)
+    _fake_windows(monkeypatch, fake)
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe"}
+    result = {"errors": []}
+    assert core._terminate_verified(entry, result) is False
+    assert fake.terminated is False and fake.closed is True
+    assert any("exact creation ticks differ" in e for e in result["errors"])
+
+
+def test_terminate_verified_fails_closed_on_close_handle_failure(monkeypatch):
+    """CloseHandle failure: diagnostics recorded, no success claim even though
+    TerminateProcess was issued on the verified handle."""
+    fake = _FakeKernel32(close_ok=False)
+    _fake_windows(monkeypatch, fake)
+    entry = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe"}
+    result = {"errors": []}
+    assert core._terminate_verified(entry, result) is False
+    assert fake.terminated is True
+    assert any("CloseHandle failed" in e for e in result["errors"])
+
+
+class _FakeNtdll:
+    """Scripted NtQueryInformationProcess (logic-level, NOT OS proof)."""
+
+    def __init__(self, status=0, unique=4321, creator=4242, returned=None):
+        self.status = status
+        self.unique = unique
+        self.creator = creator
+        self.returned = returned
+
+    def NtQueryInformationProcess(self, handle, info_class, buf, length, ret_len):
+        import ctypes as _c
+        info = buf._obj
+        info.UniqueProcessId = self.unique
+        info.InheritedFromUniqueProcessId = self.creator
+        ret_len._obj.value = self.returned if self.returned is not None else _c.sizeof(info)
+        return self.status
+
+
+def test_read_creator_pid_success():
+    fake = _FakeNtdll(status=0, unique=4321, creator=4242)
+    assert core._read_creator_pid(fake, 1234, 4321) == 4242
+
+
+def test_read_creator_pid_fails_closed_on_status():
+    assert core._read_creator_pid(_FakeNtdll(status=-1073741823), 1234, 4321) is None
+
+
+def test_read_creator_pid_fails_closed_on_short_return():
+    """A genuinely short ReturnLength (one byte under the native full size;
+    24 would be a VALID full x86 read, not short) fails closed."""
+    import ctypes as _c
+    full = _c.sizeof(core._process_basic_information_type())
+    assert core._read_creator_pid(_FakeNtdll(returned=full - 1), 1234, 4321) is None
+
+
+def test_read_creator_pid_fails_closed_on_layout_drift(monkeypatch):
+    monkeypatch.setattr(core, "_pbi_layout_supported", lambda pbi: False)
+    assert core._read_creator_pid(_FakeNtdll(), 1234, 4321) is None
+
+
+def test_read_creator_pid_fails_closed_on_unique_mismatch():
+    """UniqueProcessId not equal to the opened pid: wrong process or shifted
+    struct - never trust the creator field."""
+    assert core._read_creator_pid(_FakeNtdll(unique=9999), 1234, 4321) is None
+
+
+def test_read_creator_pid_fails_closed_on_nonpositive_creator():
+    assert core._read_creator_pid(_FakeNtdll(creator=0), 1234, 4321) is None
+
+
+def test_capture_registration_identity_single_channel(monkeypatch):
+    """All three identity parts come through ONE handle; CloseHandle failure
+    voids the whole capture."""
+    fake_k = _FakeKernel32(ticks=5000000, image="ours.exe")
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_load_kernel32", lambda: fake_k)
+    monkeypatch.setattr(core, "_load_ntdll", lambda: _FakeNtdll(unique=4321, creator=4242))
+    identity = core._capture_registration_identity(4321)
+    assert identity == {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": 4242}
+
+    monkeypatch.setattr(core, "_load_kernel32", lambda: _FakeKernel32(close_ok=False, ticks=5000000))
+    assert core._capture_registration_identity(4321) is None, "unaccounted handle lifecycle voids capture"
+
+
+def test_valid_owned_entry_strict_shapes():
+    good = {"pid": 4321, "create_time": 1000.0, "create_ticks": 1000000, "creator_pid": 4242, "exe": "ours.exe"}
+    assert core._valid_owned_entry(good) is True
+    assert core._valid_owned_entry({**good, "pid": True}) is False
+    assert core._valid_owned_entry({**good, "pid": "4321"}) is False
+    assert core._valid_owned_entry({**good, "pid": 0}) is False
+    assert core._valid_owned_entry({**good, "create_time": True}) is False
+    assert core._valid_owned_entry({**good, "create_time": float("nan")}) is False
+    assert core._valid_owned_entry({**good, "create_time": float("inf")}) is False
+    assert core._valid_owned_entry({**good, "create_time": -1}) is False
+    assert core._valid_owned_entry({**good, "exe": ""}) is False
+    assert core._valid_owned_entry({**good, "create_ticks": True}) is False
+    assert core._valid_owned_entry({**good, "create_ticks": 0}) is False
+    assert core._valid_owned_entry({**good, "create_ticks": -1}) is False
+    assert core._valid_owned_entry({**good, "create_ticks": 1000.5}) is False
+    assert core._valid_owned_entry({**good, "create_ticks": "1000000"}) is False
+    assert core._valid_owned_entry({k: v for k, v in good.items() if k != "exe"}) is False
+    assert core._valid_owned_entry({k: v for k, v in good.items() if k != "create_ticks"}) is False
+    assert core._valid_owned_entry({k: v for k, v in good.items() if k != "creator_pid"}) is False
+    assert core._valid_owned_entry({**good, "creator_pid": True}) is False
+    assert core._valid_owned_entry({**good, "creator_pid": 0}) is False
+    assert core._valid_owned_entry({**good, "creator_pid": "4242"}) is False
+    assert core._valid_owned_entry({**good, "creator_ticks": None}) is True
+    assert core._valid_owned_entry({**good, "creator_ticks": 4000000}) is True
+    assert core._valid_owned_entry({**good, "creator_ticks": True}) is False
+    assert core._valid_owned_entry({**good, "creator_ticks": 0}) is False
+    assert core._valid_owned_entry({**good, "creator_ticks": 1.5}) is False
+
+
+def _protocol(n):
+    return [{"name": f"row-{i:02d}", "kind": "model", "prompt": "p", "timeout": 1.0} for i in range(n)]
+
+
+def _rows(protocol):
+    return [{"name": r["name"], "task": {"status": assess.NOT_RUN}} for r in protocol]
+
+
+def test_orchestration_success_handoff_and_row_preservation():
+    """Blocked row preserved; verified termination precedes relaunch; remaining rows run in order."""
+    protocol = _protocol(4)
+    rows = _rows(protocol)
+    calls = []
+
+    def run_session(num, start):
+        calls.append(("run", num, start))
+        if num == 1:
+            rows[0]["task"] = {"status": assess.PASS}
+            rows[1]["task"] = {"status": assess.INCOMPLETE, "evidence": ["consent_wait_coverage_gap"]}
+            return False, 2
+        for r in range(start, len(rows)):
+            rows[r]["task"] = {"status": assess.PASS}
+        return True, None
+
+    def terminate(num):
+        calls.append(("terminate", num))
+        return {"terminated": True}
+
+    assert core.orchestrate_task_sessions(run_session, terminate, protocol, rows) is True
+    assert calls == [("run", 1, 0), ("terminate", 2), ("run", 2, 1)] or calls == [("run", 1, 0), ("terminate", 2), ("run", 2, 2)]
+    assert calls[1] == ("terminate", 2) and calls[2][0] == "run", "termination must precede relaunch"
+    assert rows[0]["task"]["status"] == assess.PASS
+    assert rows[1]["task"]["status"] == assess.INCOMPLETE  # coverage-gap row preserved
+    assert all(r["task"]["status"] == assess.PASS for r in rows[2:])
+
+
+def test_orchestration_termination_failure_blocks_relaunch():
+    protocol = _protocol(4)
+    rows = _rows(protocol)
+    calls = []
+
+    def run_session(num, start):
+        calls.append(("run", num, start))
+        rows[0]["task"] = {"status": assess.INCOMPLETE, "evidence": ["consent_wait_coverage_gap"]}
+        return False, 1
+
+    def terminate(num):
+        calls.append(("terminate", num))
+        return {"terminated": False, "errors": ["survivor"]}
+
+    assert core.orchestrate_task_sessions(run_session, terminate, protocol, rows) is False
+    assert calls == [("run", 1, 0), ("terminate", 2)], "no relaunch without verified termination"
+    assert rows[0]["task"]["status"] == assess.INCOMPLETE
+    for r in rows[1:]:
+        assert r["task"]["status"] == assess.INCOMPLETE
+        assert any("could not be stopped" in str(e) for e in r["task"]["evidence"])
+
+
+def test_orchestration_cap_exhaustion_marks_remaining_in_order():
+    protocol = _protocol(6)
+    rows = _rows(protocol)
+    calls = []
+
+    def run_session(num, start):
+        calls.append(("run", num, start))
+        rows[start]["task"] = {"status": assess.INCOMPLETE, "evidence": ["consent_wait_coverage_gap"]}
+        return False, start + 1
+
+    def terminate(num):
+        calls.append(("terminate", num))
+        return {"terminated": True}
+
+    assert core.orchestrate_task_sessions(run_session, terminate, protocol, rows, max_sessions=3) is False
+    assert calls == [("run", 1, 0), ("terminate", 2), ("run", 2, 1), ("terminate", 3), ("run", 3, 2)]
+    for r in rows[:3]:
+        assert r["task"]["status"] == assess.INCOMPLETE
+        assert any("consent_wait_coverage_gap" in str(e) for e in r["task"]["evidence"])
+    for r in rows[3:]:
+        assert any("restart limit" in str(e) for e in r["task"]["evidence"])
+    assert [r["name"] for r in rows] == [p["name"] for p in protocol], "row order preserved"
+
+
+def test_orchestration_should_stop_prevents_relaunch():
+    protocol = _protocol(3)
+    rows = _rows(protocol)
+    calls = []
+
+    def run_session(num, start):
+        calls.append(("run", num, start))
+        return False, 1
+
+    assert core.orchestrate_task_sessions(run_session, lambda n: calls.append(("t", n)),
+                                          protocol, rows, should_stop=lambda: True) is False
+    assert calls == [], "stop condition must prevent even the first launch"
+
+
+def test_static_verification_has_no_execution_primitives():
+    """verify_calculator_static must contain no execution primitive (source guard)."""
+    src = (Path(__file__).resolve().parents[1] / ".github/qualification/interactive_core.py").read_text(encoding="utf-8")
+    func_src = src[src.index("def verify_calculator_static"):src.index("class PtySession")]
+    for forbidden in ("subprocess", "exec(", "eval(", "compile(", "__import__", "runpy", "importlib", "Popen"):
+        assert forbidden not in func_src, f"static verification must not contain {forbidden}"
+
+
+def test_verify_calculator_static_rejects_non_file(tmp_path):
+    workspace = tmp_path / "calc_ws"
+    workspace.mkdir()
+    (workspace / "calculator.py").mkdir()  # directory, not a file
+    facts = core.verify_calculator_static(workspace, "def add(a, b):\n    return a + b\n")
+    assert facts == {"syntax_ok": False, "add_preserved": False, "multiply_changed": False}
 
 
 def test_assess_task_web_search_evidence_matching_and_outage():
@@ -558,16 +1359,106 @@ def test_protocol_timeout_and_remaining_not_run(tmp_path, monkeypatch):
     session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake_pty)
     try:
         tasks_rows = [{"name": r["name"], "task": {"status": assess.NOT_RUN}} for r in core.PROTOCOL_TASKS]
-        completed = core._execute_protocol_session(
+        completed, restart_idx = core._execute_protocol_session(
             core.PROTOCOL_TASKS, "fake_session", session, tmp_path, tmp_path, tmp_path / "history.db",
             deadline=time.monotonic() + 0.05, is_tasks=True, output_dir=tmp_path / "output",
             target_rows=tasks_rows, byte_tracker=[0]
         )
         assert completed is False
+        assert restart_idx is None
         assert tasks_rows[0]["task"]["status"] == assess.INCOMPLETE
         assert all(r["task"]["status"] == assess.NOT_RUN for r in tasks_rows[1:])
     finally:
         session.close()
+
+
+
+
+CONSENT_BLOCK = (
+    "\nNexus wants to run pytest in:\n  /tmp/ws\n"
+    "This runs the project's own code on your computer, with your permissions, not sandboxed.\n"
+    "  [o] once  - this folder, until Nexus exits (nothing saved)\n"
+    "  [a] always - this exact folder only, saved; undo with `nexus-agent trust revoke`\n"
+    "  [N] no\nAllow? [o/a/N]: "
+)
+
+
+def test_consent_block_is_coverage_gap_and_never_answered(tmp_path, monkeypatch):
+    """The full trust-prompt block yields consent_wait promptly; the harness writes nothing."""
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
+    writes = []
+    fake = FakePtyProcess(["working...\r\n", CONSENT_BLOCK])
+    monkeypatch.setattr(fake, "write", lambda text: writes.append(text))
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
+    try:
+        start = time.monotonic()
+        buf, ready, consent_wait = session.wait_for_ready_prompt(timeout=30.0, deadline=time.monotonic() + 30.0)
+        assert consent_wait is True
+        assert ready is False
+        assert time.monotonic() - start < 5.0, "must not wait out the row timeout"
+        assert "Allow? [o/a/N]:" in buf, "full prompt must stay in row evidence"
+        assert writes == [], "harness must never answer a consent prompt"
+    finally:
+        session.close()
+
+
+def test_spoofed_or_partial_consent_text_is_not_detected(tmp_path, monkeypatch):
+    """A bare suffix or partial block is not a consent wait; even a fully spoofed
+    block could only cause a fail-safe coverage gap, never execution."""
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
+    writes = []
+    fake = FakePtyProcess(["model prose ending in Allow? [o/a/N]: "])
+    monkeypatch.setattr(fake, "write", lambda text: writes.append(text))
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
+    try:
+        buf, ready, consent_wait = session.wait_for_ready_prompt(timeout=0.2, deadline=time.monotonic() + 0.2)
+        assert consent_wait is False
+        assert ready is False
+        assert writes == []
+    finally:
+        session.close()
+
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
+    fake2 = FakePtyProcess(["Nexus wants to run pytest in:\n  /tmp/ws\n  [o] once\n>> You: "])
+    session2 = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake2)
+    try:
+        buf2, ready2, consent_wait2 = session2.wait_for_ready_prompt(timeout=2.0, deadline=time.monotonic() + 5.0)
+        assert consent_wait2 is False
+        assert ready2 is True
+    finally:
+        session2.close()
+
+
+def test_consent_wait_row_recorded_and_restart_idx_returned(tmp_path, monkeypatch):
+    """A consent-blocked row is INCOMPLETE with an explicit coverage-gap marker,
+    and the caller gets the next row index for a fresh session."""
+    mock_successful_ownership(monkeypatch, tmp_path, 4242)
+    out_dir = tmp_path / "output"
+    (out_dir / "rows").mkdir(parents=True)
+    fake = FakePtyProcess([CONSENT_BLOCK])
+    session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake)
+    try:
+        tasks_rows = [{"name": r["name"], "task": {"status": assess.NOT_RUN}} for r in core.PROTOCOL_TASKS]
+        completed, restart_idx = core._execute_protocol_session(
+            core.PROTOCOL_TASKS, "fake_session", session, tmp_path, tmp_path, tmp_path / "history.db",
+            deadline=time.monotonic() + 10.0, is_tasks=True, output_dir=out_dir,
+            target_rows=tasks_rows, byte_tracker=[0]
+        )
+        assert completed is False
+        assert restart_idx == 1, "rows after the consent-blocked one continue in a fresh session"
+        row0 = tasks_rows[0]["task"]
+        assert row0["status"] == assess.INCOMPLETE
+        assert row0["status"] != assess.PASS
+        assert any("consent_wait_coverage_gap" in str(e) for e in row0["evidence"])
+        assert all(r["task"]["status"] == assess.NOT_RUN for r in tasks_rows[1:])
+        assert (out_dir / "rows" / "fake_session_00_row-01-readme.json").exists()
+    finally:
+        session.close()
+
+def test_child_environment_disables_run_code_for_probe(tmp_path):
+    """Probe REPL children inherit the run_code refusal flag (Windows has no rlimits/Job Objects)."""
+    env = core.child_environment(tmp_path / "home", tmp_path / "tmp", tmp_path / "ws")
+    assert env["NEXUS_AGENT_DISABLE_RUN_CODE"] == "1"
 
 
 def test_deadline_from_file(tmp_path):
@@ -601,8 +1492,9 @@ def test_reader_cap_is_incomplete_not_silent_success(tmp_path, monkeypatch):
     tracker = [core.EVIDENCE_CAP - core.MANIFEST_RESERVE]
     session = core.PtySession([], cwd=tmp_path, env={}, root=tmp_path, pty_proc=fake, byte_tracker=tracker)
     try:
-        _, ready = session.wait_for_ready_prompt(0.2, time.monotonic() + 0.2)
+        _, ready, consent_wait = session.wait_for_ready_prompt(0.2, time.monotonic() + 0.2)
         assert not ready
+        assert consent_wait is False
         assert session.error_flag == "output_cap_exceeded"
     finally:
         session.close()
@@ -628,8 +1520,9 @@ def test_regression_ownership_fail_closed_on_unrecorded_root_and_observation_fai
     try:
         assert session.error_flag is not None
         assert "root_ownership_failed" in session.error_flag
-        buf, ready = session.wait_for_ready_prompt(timeout=0.1, deadline=time.monotonic() + 0.1)
+        buf, ready, consent_wait = session.wait_for_ready_prompt(timeout=0.1, deadline=time.monotonic() + 0.1)
         assert ready is False
+        assert consent_wait is False
         with pytest.raises(RuntimeError, match="Cannot send input"):
             session.send_input("test\n")
     finally:
@@ -654,8 +1547,9 @@ def test_regression_descendant_observation_failure_halts_session(tmp_path, monke
             raise RuntimeError("descendant scan failed")
 
         monkeypatch.setattr(core, "scan_and_record_descendants", _failing_scan)
-        buf, ready = session.wait_for_ready_prompt(timeout=0.2, deadline=time.monotonic() + 0.2)
+        buf, ready, consent_wait = session.wait_for_ready_prompt(timeout=0.2, deadline=time.monotonic() + 0.2)
         assert ready is False
+        assert consent_wait is False
         assert "descendant_observation_error" in (session.error_flag or "")
         with pytest.raises(RuntimeError, match="Cannot send input"):
             session.send_input("test\n")
@@ -725,3 +1619,181 @@ def test_regression_positive_root_without_observed_identity_cannot_feed(tmp_path
         assert any("root_ownership_failed" in message for message in errors)
     finally:
         session.close()
+
+
+def _conpty_deadline(tmp_path):
+    f = tmp_path / "deadline.json"
+    f.write_text(json.dumps({"work_deadline_utc": time.time() + 600,
+                             "job_limit_minutes": 120, "reserve_minutes": 10}))
+    return f
+
+
+@pytest.mark.skipif(os.name == "nt", reason="off-Windows refusal is only exercisable off Windows")
+def test_conpty_check_refuses_off_windows(tmp_path):
+    """Non-Windows: explicit refusal, evidence retained, no model/qualification flags."""
+    code = core.main(["conpty-check", "--root", str(tmp_path / "root"),
+                      "--deadline-file", str(_conpty_deadline(tmp_path))])
+    assert code == 1
+    evidence = json.loads((tmp_path / "root" / "output" / "conpty-compat.json").read_text())
+    assert evidence["conpty_compatibility_only"] is True
+    assert evidence["interactive_qualification"] is False
+    assert evidence["final_qualification"] is False
+    assert evidence["model_execution_permitted"] is False
+    assert evidence["network_used"] is False
+    assert any("Windows" in e for e in evidence["errors"])
+
+
+def test_conpty_check_refuses_without_pywinpty(tmp_path, monkeypatch):
+    """Windows without pywinpty: fail closed before any spawn."""
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "PtyProcess", None)
+    code = core.main(["conpty-check", "--root", str(tmp_path / "root"),
+                      "--deadline-file", str(_conpty_deadline(tmp_path))])
+    assert code == 1
+    evidence = json.loads((tmp_path / "root" / "output" / "conpty-compat.json").read_text())
+    assert any("pywinpty" in e for e in evidence["errors"])
+    assert evidence["checks"] == {}
+    assert evidence["termination_receipt_sha256"] is None
+
+
+def test_capture_diag_open_stage(monkeypatch):
+    """OpenProcess failure: diag names the open stage and the native error;
+    capture still fails closed with no identity."""
+    class _OpenFailKernel32(_FakeKernel32):
+        def OpenProcess(self, access, inherit, pid):
+            return None
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_load_kernel32", lambda: _OpenFailKernel32())
+    monkeypatch.setattr(core, "_load_ntdll", lambda: _FakeNtdll())
+    monkeypatch.setattr(core, "_last_win_error", lambda: 87)
+    diag = {}
+    assert core._capture_registration_identity(4321, diag) is None
+    assert diag == {"stage": "open", "detail": "GetLastError=87"}
+
+
+def test_capture_diag_ticks_stage(monkeypatch):
+    """GetProcessTimes failure: diag names the ticks stage; image/creator are
+    never attempted after a ticks failure."""
+    class _TicksFailKernel32(_FakeKernel32):
+        def GetProcessTimes(self, handle, creation, exit_time, kernel, user):
+            return False
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_load_kernel32", lambda: _TicksFailKernel32())
+    monkeypatch.setattr(core, "_load_ntdll", lambda: _FakeNtdll())
+    monkeypatch.setattr(core, "_last_win_error", lambda: 5)
+    diag = {}
+    assert core._capture_registration_identity(4321, diag) is None
+    assert diag == {"stage": "ticks", "detail": "GetLastError=5"}
+
+
+def test_capture_diag_close_stage(monkeypatch):
+    """CloseHandle failure voids the capture; diag names the close stage."""
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_load_kernel32", lambda: _FakeKernel32(close_ok=False, ticks=5000000))
+    monkeypatch.setattr(core, "_load_ntdll", lambda: _FakeNtdll(unique=4321, creator=4242))
+    monkeypatch.setattr(core, "_last_win_error", lambda: 6)
+    diag = {}
+    assert core._capture_registration_identity(4321, diag) is None
+    assert diag == {"stage": "close", "detail": "GetLastError=6"}
+
+
+def test_capture_diag_untouched_on_success(monkeypatch):
+    fake_k = _FakeKernel32(ticks=5000000, image="ours.exe")
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_load_kernel32", lambda: fake_k)
+    monkeypatch.setattr(core, "_load_ntdll", lambda: _FakeNtdll(unique=4321, creator=4242))
+    diag = {}
+    identity = core._capture_registration_identity(4321, diag)
+    assert identity == {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": 4242}
+    assert diag == {}
+
+
+def test_read_creator_pid_diag_status():
+    diag = {}
+    assert core._read_creator_pid(_FakeNtdll(status=-1073741823), 1234, 4321, diag) is None
+    assert diag["stage"] == "creator"
+    assert diag["detail"] == "NTSTATUS=-1073741823 (0xC0000001)"
+
+
+def test_read_creator_pid_diag_short_return():
+    import ctypes as _c
+    full = _c.sizeof(core._process_basic_information_type())
+    diag = {}
+    assert core._read_creator_pid(_FakeNtdll(returned=full - 1), 1234, 4321, diag) is None
+    assert diag["stage"] == "creator"
+    assert diag["detail"].startswith("ReturnLength=")
+
+
+def test_read_creator_pid_diag_unique_mismatch():
+    diag = {}
+    assert core._read_creator_pid(_FakeNtdll(unique=9999), 1234, 4321, diag) is None
+    assert diag["detail"] == "UniqueProcessId=9999 != opened pid 4321"
+
+
+def test_read_creator_pid_diag_nonpositive_creator():
+    diag = {}
+    assert core._read_creator_pid(_FakeNtdll(creator=0), 1234, 4321, diag) is None
+    assert diag["detail"] == "nonpositive creator=0"
+
+
+def test_read_creator_pid_diag_layout_drift(monkeypatch):
+    monkeypatch.setattr(core, "_pbi_layout_supported", lambda pbi: False)
+    diag = {}
+    assert core._read_creator_pid(_FakeNtdll(), 1234, 4321, diag) is None
+    assert diag["detail"] == "native PROCESS_BASIC_INFORMATION layout unsupported"
+
+
+def test_registration_refusal_message_carries_diag_and_unverified_hint(tmp_path, monkeypatch):
+    """Identity capture refused: the observation error now carries the failing
+    stage/detail and a clearly-labeled UNVERIFIED_IDENTITY_OBSERVATION
+    best-effort existence hint. Still raises, still registers nothing."""
+    def _none_capture(pid, _diag=None):
+        if _diag is not None:
+            _diag.update({"stage": "open", "detail": "GetLastError=87"})
+        return None
+    root = _registration_rig(monkeypatch, tmp_path, {4321: None})
+    monkeypatch.setattr(core, "_capture_registration_identity", _none_capture)
+    identity = {"create_ticks": 5000000, "exe": "ours.exe", "creator_pid": os.getpid()}
+    with pytest.raises(RuntimeError):
+        core.record_owned_process(root, 4321, expected=identity, expected_creator=os.getpid())
+    assert _read_owned(root) == []
+    errors = [str(e) for e in _obs_errors(root)]
+    assert any("identity unavailable" in e and "stage=open" in e and "detail=GetLastError=87" in e
+               and "UNVERIFIED_IDENTITY_OBSERVATION pid_exists=" in e for e in errors)
+
+
+def test_descendant_anchor_diag_message_has_discovery_context(tmp_path, monkeypatch):
+    """Descendant anchor capture failure records the refused pid, the parent
+    under which it was discovered, and the failing stage/detail."""
+    class _ScanPsutil:
+        class NoSuchProcess(Exception):
+            pass
+        @staticmethod
+        def Process(pid):
+            assert pid == 4321
+            return type("P", (), {"create_time": staticmethod(lambda: 1000.0),
+                                  "exe": staticmethod(lambda: "parent.exe"),
+                                  "cmdline": staticmethod(lambda: ["parent"]),
+                                  "children": staticmethod(lambda recursive=False: [
+                                      type("C", (), {"pid": 6260})()])})()
+        @staticmethod
+        def pid_exists(pid):
+            return False
+    def _none_capture(pid, _diag=None):
+        if _diag is not None:
+            _diag.update({"stage": "open", "detail": "GetLastError=87"})
+        return None
+    parent_identity = {"create_ticks": 5000000, "exe": "parent.exe", "creator_pid": os.getpid()}
+    def _capture(pid, _diag=None):
+        if pid == 4321:
+            return parent_identity
+        return _none_capture(pid, _diag)
+    monkeypatch.setitem(sys.modules, "psutil", _ScanPsutil)
+    monkeypatch.setattr(core, "_IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_capture_registration_identity", _capture)
+    core.record_owned_process(tmp_path, 4321, expected=parent_identity, expected_creator=os.getpid())
+    core.scan_and_record_descendants(tmp_path, 4321)
+    errors = [str(e) for e in _obs_errors(tmp_path)]
+    assert any("descendant anchor capture failed for PID 6260" in e
+               and "discovered under parent 4321" in e
+               and "stage=open" in e and "detail=GetLastError=87" in e for e in errors)

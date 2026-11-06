@@ -169,6 +169,9 @@ def child_environment(home: Path, temporary: Path, workspace: Path) -> Dict[str,
         "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1",
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
         "GIT_NO_LAZY_FETCH": "1", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PROMPT_TOOLKIT_NO_CPR": "1",
+        # Probe-only: the AST allowlist is not OS containment and Windows has no
+        # rlimits/Job Objects here, so run_code is refused outright (coverage gap).
+        "NEXUS_AGENT_DISABLE_RUN_CODE": "1",
     }
 
 
@@ -216,8 +219,37 @@ def record_observation_error(root: Path | str, error_msg: str) -> None:
         print(f"Observation error (evidence write failed: {type(exc).__name__}): {error_msg}", file=sys.stderr)
 
 
-def record_owned_process(root: Path, pid: int) -> None:
-    """Record owned process metadata for cleanup."""
+def _verify_registered_parent(owned: List[Dict[str, Any]], parent_pid: int) -> Optional[Dict[str, Any]]:
+    """Re-verify a registered parent's identity RIGHT NOW through a fresh
+    handle: exact recorded ticks and canonical exe must match. Returns the
+    registry entry on success, None on any failure (caller fails closed).
+    This - not psutil enumeration freshness - is what proves the parent
+    relationship at registration time."""
+    entry = next((e for e in owned if e.get("pid") == parent_pid), None)
+    if entry is None or type(entry.get("create_ticks")) is not int:
+        return None
+    current = _capture_registration_identity(parent_pid)
+    if current is None:
+        return None
+    if current["create_ticks"] != entry["create_ticks"] or current["exe"] != entry.get("exe"):
+        return None
+    return entry
+
+
+def record_owned_process(root: Path, pid: int, expected: Optional[Dict[str, Any]] = None,
+                         expected_creator: Optional[int] = None) -> None:
+    """Record owned process metadata for cleanup, with source-bound ownership.
+
+    Ownership is established, never assumed: the single-channel registration
+    identity (exact ticks + canonical exe + creator pid through ONE handle)
+    must exactly match the earliest observed anchor when one was captured
+    (spawn time for roots, scan time for descendants), and the creator must
+    be the harness itself or a registered parent whose identity re-verifies
+    at this moment. Any failure records an observation error and raises
+    BEFORE the process is registered - a recycled occupant is never adopted.
+    psutil fields are retained as display-only observation anchors. Earliest
+    observation is itself post-spawn: this binds registration to the first
+    observed identity; it does not reach back to CreateProcessW."""
     if pid <= 0:
         err = f"Invalid PID {pid} to record as owned process"
         record_observation_error(root, err)
@@ -238,7 +270,6 @@ def record_owned_process(root: Path, pid: int) -> None:
             record_observation_error(root, err)
             raise RuntimeError(err)
 
-
     try:
         import psutil
         proc = psutil.Process(pid)
@@ -247,14 +278,79 @@ def record_owned_process(root: Path, pid: int) -> None:
             err = f"Process {pid} returned non-positive create_time: {create_time}"
             record_observation_error(root, err)
             raise RuntimeError(err)
-        exe, cmdline = proc.exe(), proc.cmdline()
+        ps_exe, cmdline = proc.exe(), proc.cmdline()
     except Exception as exc:
         record_observation_error(root, f"psutil inspection failed for PID {pid}: {exc}")
         raise
     if any(e.get("pid") == pid and e.get("create_time") == create_time for e in owned):
         return
 
-    owned.append({"pid": pid, "create_time": create_time, "exe": exe, "cmdline": cmdline})
+    capture_diag: Dict[str, str] = {}
+    identity = _capture_registration_identity(pid, capture_diag)
+    if identity is None:
+        # Best-effort existence hint to interpret the diagnostic gap later.
+        # UNVERIFIED: not an ownership record, never an input to termination.
+        try:
+            import psutil as _psutil
+            exists_hint: Any = _psutil.pid_exists(pid)
+        except Exception as exc:
+            exists_hint = f"unavailable:{type(exc).__name__}"
+        err = (f"Registration identity unavailable for PID {pid}: no single-channel "
+               f"handle capture (ticks/exe/creator) - refusing to register "
+               f"(stage={capture_diag.get('stage', 'unknown')}, "
+               f"detail={capture_diag.get('detail', 'unavailable')}; "
+               f"UNVERIFIED_IDENTITY_OBSERVATION pid_exists={exists_hint})")
+        record_observation_error(root, err)
+        raise RuntimeError(err)
+
+    if expected is None:
+        err = (f"Required ownership anchor missing for PID {pid}: the earliest "
+               f"observation capture failed or was never taken - refusing to "
+               f"register from a later capture alone")
+        record_observation_error(root, err)
+        raise RuntimeError(err)
+    if (identity["create_ticks"] != expected.get("create_ticks")
+            or identity["exe"] != expected.get("exe")
+            or identity["creator_pid"] != expected.get("creator_pid")):
+        err = (f"Ownership anchor mismatch for PID {pid}: process replaced between "
+               f"earliest observation and registration - refusing to adopt occupant")
+        record_observation_error(root, err)
+        raise RuntimeError(err)
+
+    harness_pid = os.getpid()
+    creator = identity["creator_pid"]
+    creator_ticks: Optional[int] = None
+    if expected_creator is not None:
+        if creator != expected_creator:
+            err = (f"Creator mismatch for PID {pid}: expected creator {expected_creator}, "
+                   f"observed {creator} - refusing to register")
+            record_observation_error(root, err)
+            raise RuntimeError(err)
+        if creator != harness_pid:
+            parent = _verify_registered_parent(owned, creator)
+            if parent is None:
+                err = (f"Expected creator {creator} of PID {pid} is not a registered, "
+                       f"currently verified parent - refusing to register")
+                record_observation_error(root, err)
+                raise RuntimeError(err)
+            creator_ticks = parent["create_ticks"]
+    elif creator != harness_pid:
+        parent = _verify_registered_parent(owned, creator)
+        if parent is None:
+            err = (f"Creator {creator} of PID {pid} is neither the harness nor a "
+                   f"registered, currently verified parent - refusing to register")
+            record_observation_error(root, err)
+            raise RuntimeError(err)
+        creator_ticks = parent["create_ticks"]
+    if creator_ticks is not None and identity["create_ticks"] < creator_ticks:
+        err = f"PID {pid} predates its verified parent - refusing to register"
+        record_observation_error(root, err)
+        raise RuntimeError(err)
+
+    owned.append({"pid": pid, "create_time": create_time,
+                  "create_ticks": identity["create_ticks"], "exe": identity["exe"],
+                  "creator_pid": creator, "creator_ticks": creator_ticks,
+                  "observed_exe": ps_exe, "cmdline": cmdline})
     try:
         owned_file.write_text(json.dumps(owned, indent=2), encoding="utf-8")
     except Exception as exc:
@@ -263,20 +359,63 @@ def record_owned_process(root: Path, pid: int) -> None:
 
 
 def scan_and_record_descendants(root: Path, parent_pid: int) -> None:
-    """Scan and record child processes of parent PID."""
+    """Scan and record child processes of parent PID.
+
+    The parent must be a registered, currently re-verified owned process
+    before any enumeration is trusted; psutil children() freshness alone is
+    not proof (enumeration can race). Each discovered child is anchored at
+    scan time (single-channel capture) and registered with that exact anchor
+    plus its verified creator. A child that fails registration records an
+    observation error (failing later cleanup closed) without aborting the
+    remaining scan."""
     if parent_pid <= 0:
         err = f"Invalid parent PID {parent_pid} for descendant scan"
         record_observation_error(root, err)
         raise ValueError(err)
+    output_dir = Path(root) / "output"
+    owned_file = output_dir / "owned_processes.json"
+    try:
+        owned = json.loads(owned_file.read_text(encoding="utf-8")) if owned_file.exists() else []
+    except Exception as exc:
+        err = f"owned metadata unreadable for parent verification: {exc}"
+        record_observation_error(root, err)
+        raise RuntimeError(err)
+    if _verify_registered_parent(owned, parent_pid) is None:
+        err = f"Parent PID {parent_pid} is not a registered, currently verified owned process"
+        record_observation_error(root, err)
+        raise RuntimeError(err)
     try:
         import psutil
-        proc = psutil.Process(parent_pid)
-        children = proc.children(recursive=True)
+        frontier = [parent_pid]
+        seen = {parent_pid}
+        while frontier:
+            current = frontier.pop(0)
+            try:
+                children = psutil.Process(current).children(recursive=False)
+            except Exception as exc:
+                record_observation_error(root, f"psutil children enumeration failed for PID {current}: {exc}")
+                continue
+            for child in children:
+                if child.pid in seen:
+                    continue
+                seen.add(child.pid)
+                anchor_diag: Dict[str, str] = {}
+                anchor = _capture_registration_identity(child.pid, anchor_diag)  # earliest observation
+                if anchor is None:
+                    record_observation_error(
+                        root, f"descendant anchor capture failed for PID {child.pid} "
+                              f"(discovered under parent {current}; stage={anchor_diag.get('stage', 'unknown')}, "
+                              f"detail={anchor_diag.get('detail', 'unavailable')}); not registered")
+                    continue
+                try:
+                    record_owned_process(root, child.pid, expected=anchor, expected_creator=current)
+                except Exception as exc:
+                    record_observation_error(root, f"descendant registration failed for PID {child.pid}: {exc}")
+                    continue
+                frontier.append(child.pid)
     except Exception as exc:
         record_observation_error(root, f"psutil scan children failed for PID {parent_pid}: {exc}")
         raise
-    for child in children:
-        record_owned_process(root, child.pid)
 
 def fetch_sqlite_messages(db_path: Path, session_id: str) -> List[Dict[str, Any]]:
     """Query synthetic session messages from history.db in read-only mode, extracting tool bindings."""
@@ -351,33 +490,33 @@ def snapshot_workspace_files(workspace: Path) -> Dict[str, str]:
     return res
 
 
-def verify_calculator_behavior(workspace: Path, before_src: str) -> Tuple[bool, bool]:
-    """Test multiply and add behavior on calculator.py and verify add AST preservation."""
-    calc_path = workspace / "calculator.py"
-    if not calc_path.is_file():
-        return False, False
-    code = ("import sys, json; sys.path.insert(0, '.'); import calculator; "
-            "print(json.dumps({'mult_3_4': calculator.multiply(3, 4), 'mult_neg': calculator.multiply(-2, 5), "
-            "'mult_zero': calculator.multiply(0, 7), 'add_3_4': calculator.add(3, 4)}))")
-    try:
-        proc = subprocess.run([sys.executable, "-c", code], cwd=str(workspace), capture_output=True, text=True, timeout=10)
-        if proc.returncode != 0:
-            return False, False
-        data = json.loads(proc.stdout.strip())
-        behavior_ok = (data.get("mult_3_4") == 12 and data.get("mult_neg") == -10 and data.get("mult_zero") == 0 and data.get("add_3_4") == 7)
-    except Exception:
-        return False, False
+def verify_calculator_static(workspace: Path, before_src: str) -> Dict[str, bool]:
+    """Static-only checks on the model-written calculator.py.
 
+    Never executes, imports or compiles the file: ast.parse is pure syntax
+    analysis, so model-written code cannot run on the runner from this path.
+    Behavioral coverage is NOT_TESTED by design."""
+    calc_path = workspace / "calculator.py"
+    facts = {"syntax_ok": False, "add_preserved": False, "multiply_changed": False}
+    if not calc_path.is_file():
+        return facts
     try:
         tree_old = ast.parse(before_src)
         tree_new = ast.parse(calc_path.read_text(encoding="utf-8"))
-        add_old = next((n for n in tree_old.body if isinstance(n, ast.FunctionDef) and n.name == "add"), None)
-        add_new = next((n for n in tree_new.body if isinstance(n, ast.FunctionDef) and n.name == "add"), None)
-        add_preserved = bool(add_old and add_new and ast.dump(add_old, include_attributes=False) == ast.dump(add_new, include_attributes=False))
+        facts["syntax_ok"] = True
     except Exception:
-        add_preserved = False
+        return facts
 
-    return behavior_ok and add_preserved, add_preserved
+    def _fn(tree, name):
+        return next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name), None)
+
+    add_old, add_new = _fn(tree_old, "add"), _fn(tree_new, "add")
+    facts["add_preserved"] = bool(add_old is not None and add_new is not None
+                                  and ast.dump(add_old, include_attributes=False) == ast.dump(add_new, include_attributes=False))
+    mult_old, mult_new = _fn(tree_old, "multiply"), _fn(tree_new, "multiply")
+    facts["multiply_changed"] = bool(mult_old is not None and mult_new is not None
+                                     and ast.dump(mult_old, include_attributes=False) != ast.dump(mult_new, include_attributes=False))
+    return facts
 
 
 class PtySession:
@@ -398,14 +537,26 @@ class PtySession:
         self.all_output = ""
         self.byte_tracker = byte_tracker if byte_tracker is not None else [0]
         self.error_flag: Optional[str] = None
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+        # Root ownership is established BEFORE the reader starts and before
+        # ANY protocol input: the earliest post-spawn identity anchor is
+        # captured immediately and registration must exactly match it.
+        # Failure sets root_ownership_failed and closes the session, so no
+        # prompt can be driven without a cleanup-valid root identity.
         try:
-            record_owned_process(self.root, self.pid)
+            anchor = _capture_registration_identity(self.pid) if self.pid > 0 else None
+            if self.pid > 0 and anchor is None:
+                raise RuntimeError(
+                    f"root anchor capture failed for PID {self.pid} "
+                    f"(single-channel ticks/exe/creator unavailable)")
+            record_owned_process(self.root, self.pid, expected=anchor,
+                                 expected_creator=os.getpid())
         except Exception as exc:
             self.error_flag = f"root_ownership_failed: {exc}"
             record_observation_error(self.root, self.error_flag)
             self.close()
+            return
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
 
     def _reader_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -444,33 +595,51 @@ class PtySession:
                 return False
         return True
 
-    def wait_for_ready_prompt(self, timeout: float, deadline: float, prompt_pattern: str = r"^>>\s*You:?\s*$") -> Tuple[str, bool]:
+    # The app's full multi-line run_tests trust prompt, matched as a whole block,
+    # never a bare suffix. The harness never answers it: consent is human-only,
+    # generic PTY text is not authentication, and even a fully spoofed block only
+    # causes a fail-safe row coverage gap plus a fresh session - never execution.
+    _CONSENT_BLOCK_RE = re.compile(
+        r"Nexus wants to run pytest in:[\s\S]*?\[o\] once[\s\S]*?\[a\] always[\s\S]*?\[N\] no[\s\S]*?Allow\?\s*\[o/a/N\]:\s*$")
+
+    def wait_for_ready_prompt(self, timeout: float, deadline: float, prompt_pattern: str = r"^>>\s*You:?\s*$") -> Tuple[str, bool, bool]:
+        """Wait for the ready prompt; returns (output chunk, ready, consent_wait).
+
+        consent_wait is True when the app's run_tests trust prompt blocked the
+        turn. The harness sends nothing, so the real consent gate is untouched
+        and the caller records a coverage gap instead of waiting out the timeout."""
         start = time.monotonic()
         buf = ""
         target_deadline = min(deadline, start + timeout)
         while time.monotonic() < target_deadline:
             if self.error_flag:
-                return buf, False
+                return buf, False, False
             if hasattr(self.pty, "isalive") and not self.pty.isalive() and self.out_queue.empty():
                 break
             try:
                 chunk = self.out_queue.get(timeout=0.05)
                 buf += chunk
                 self.all_output += chunk
-                lines = [l.strip() for l in assess.strip_ansi(buf).splitlines() if l.strip()]
+                stripped = assess.strip_ansi(buf)
+                if self._CONSENT_BLOCK_RE.search(stripped):
+                    return buf, False, True
+                lines = [l.strip() for l in stripped.splitlines() if l.strip()]
                 if lines and re.match(prompt_pattern, lines[-1]):
                     if not self._scan_descendants():
-                        return buf, False
-                    return buf, True
+                        return buf, False, False
+                    return buf, True, False
             except queue.Empty:
                 if not self._scan_descendants():
-                    return buf, False
+                    return buf, False, False
                 continue
-        lines = [l.strip() for l in assess.strip_ansi(buf).splitlines() if l.strip()]
+        stripped = assess.strip_ansi(buf)
+        if self._CONSENT_BLOCK_RE.search(stripped):
+            return buf, False, True
+        lines = [l.strip() for l in stripped.splitlines() if l.strip()]
         found = bool(lines and re.match(prompt_pattern, lines[-1])) and not bool(self.error_flag)
         if not self._scan_descendants():
-            return buf, False
-        return buf, found
+            return buf, False, False
+        return buf, found, False
 
     def wait_for_exit(self, timeout: float = PROCESS_EXIT_TIMEOUT, deadline: Optional[float] = None) -> Tuple[str, bool]:
         start = time.monotonic()
@@ -504,6 +673,451 @@ class PtySession:
             pass
 
 
+_IS_WINDOWS = os.name == "nt"  # test seam: monkeypatch this, never os.name
+
+
+def _valid_owned_entry(entry: Any) -> bool:
+    """Strict owned-identity shape.
+
+    type(pid) is exactly int (bool rejected) and positive; create_time is a
+    non-bool finite positive number; create_ticks is exactly int (bool
+    rejected) and positive - the exact handle-derived FILETIME identity
+    recorded at registration, never a float approximation; exe is a non-empty
+    recorded path; creator_pid is exactly int (bool rejected) and positive;
+    creator_ticks is None (harness root) or exactly int positive (verified
+    registered parent). Older metadata without create_ticks or creator_pid,
+    and anything else less, fails closed with zero kills - a partial
+    identity is never targeted."""
+    import math
+    return (isinstance(entry, dict)
+            and type(entry.get("pid")) is int and entry["pid"] > 0
+            and type(entry.get("create_time")) in (int, float)
+            and math.isfinite(entry["create_time"]) and entry["create_time"] > 0
+            and type(entry.get("create_ticks")) is int and entry["create_ticks"] > 0
+            and isinstance(entry.get("exe"), str) and bool(entry["exe"].strip())
+            and type(entry.get("creator_pid")) is int and entry["creator_pid"] > 0
+            and (entry.get("creator_ticks") is None
+                 or (type(entry.get("creator_ticks")) is int and entry["creator_ticks"] > 0)))
+
+
+def _read_strict_owned_metadata(root: Path, result: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Load owned-process metadata fail-closed: missing, unreadable, empty or any
+    malformed entry records an error and returns None so nothing is killed."""
+    try:
+        owned = json.loads((root / "output" / "owned_processes.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        result["errors"].append("owned metadata unreadable: " + type(exc).__name__)
+        return None
+    if not isinstance(owned, list) or not owned or any(not _valid_owned_entry(e) for e in owned):
+        result["errors"].append("owned metadata missing, empty or malformed")
+        return None
+    return owned
+
+
+def _observation_errors_present(root: Path, result: Dict[str, Any]) -> bool:
+    """Any recorded observation error (or unreadable record) fails closed."""
+    obs_file = root / "output" / "observation_errors.json"
+    if not obs_file.exists():
+        return False
+    try:
+        loaded = json.loads(obs_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        result["errors"].append("observation errors unreadable: " + type(exc).__name__)
+        return True
+    if loaded:
+        result["errors"].append("observation errors recorded; failing closed")
+        return True
+    return False
+
+
+def _load_kernel32():
+    """kernel32 with explicit 64-bit-safe HANDLE/DWORD/BOOL/UINT signatures
+    and use_last_error on every call. Raises on non-Windows."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    LPFILETIME = ctypes.POINTER(wintypes.FILETIME)
+    LPDWORD = ctypes.POINTER(wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, LPFILETIME, LPFILETIME, LPFILETIME, LPFILETIME]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, LPDWORD]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return kernel32
+
+
+def _last_win_error() -> Any:
+    """Calling thread's last error code after a use_last_error call. Falls
+    back to 0 only where the platform exposes no last-error facility - the
+    Win32 paths here are Windows-gated in production, so the fallback is
+    reachable solely by non-Windows test rigs."""
+    import ctypes
+    getter = getattr(ctypes, "get_last_error", None)
+    return getter() if getter is not None else 0
+
+
+def _read_creation_ticks(kernel32: Any, handle: Any, _diag: Optional[Dict[str, str]] = None) -> Optional[int]:
+    """Exact integer FILETIME creation ticks for the process pinned by handle,
+    or None on OS failure. Integer 100-ns ticks - no float conversion, so an
+    exact equality check against the registration record is meaningful.
+    _diag, when given, receives the failure stage and native error for
+    receipts only; it never changes the fail-closed outcome."""
+    import ctypes
+    from ctypes import wintypes
+    creation = wintypes.FILETIME()
+    exit_time = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                                    ctypes.byref(kernel), ctypes.byref(user)):
+        if _diag is not None:
+            _diag.update({"stage": "ticks", "detail": f"GetLastError={_last_win_error()}"})
+        return None
+    return (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+
+
+def _load_ntdll():
+    """ntdll with an explicit typed NtQueryInformationProcess binding:
+    NTSTATUS (signed LONG) result, full argument types, use_last_error."""
+    import ctypes
+    from ctypes import wintypes
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtQueryInformationProcess.restype = wintypes.LONG
+    ntdll.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE, wintypes.UINT, wintypes.LPVOID, wintypes.ULONG,
+        ctypes.POINTER(wintypes.ULONG)]
+    return ntdll
+
+
+def _process_basic_information_type():
+    """PROCESS_BASIC_INFORMATION per the Windows SDK winternl.h layout
+    (Reserved1, PebBaseAddress, Reserved2[2], UniqueProcessId,
+    InheritedFromUniqueProcessId), using platform-native ctypes alignment -
+    no manual packing."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [("Reserved1", wintypes.LPVOID),
+                    ("PebBaseAddress", wintypes.LPVOID),
+                    ("Reserved2", wintypes.LPVOID * 2),
+                    ("UniqueProcessId", wintypes.LPVOID),
+                    ("InheritedFromUniqueProcessId", wintypes.LPVOID)]
+    return PROCESS_BASIC_INFORMATION
+
+
+def _pbi_layout_supported(pbi: Any) -> bool:
+    """Native sizeof/offset gate for the documented layout: x64 sizeof 48 with
+    UniqueProcessId at 32 and InheritedFromUniqueProcessId at 40; x86 sizeof
+    24 with offsets 16/20. Any drift fails closed."""
+    import ctypes
+    import struct
+    if struct.calcsize("P") == 8:
+        return (ctypes.sizeof(pbi) == 48
+                and pbi.UniqueProcessId.offset == 32
+                and pbi.InheritedFromUniqueProcessId.offset == 40)
+    return (ctypes.sizeof(pbi) == 24
+            and pbi.UniqueProcessId.offset == 16
+            and pbi.InheritedFromUniqueProcessId.offset == 20)
+
+
+def _read_creator_pid(ntdll: Any, handle: Any, pid: int, _diag: Optional[Dict[str, str]] = None) -> Optional[int]:
+    """Creator (InheritedFromUniqueProcessId) of the process pinned by handle.
+
+    Accepts only STATUS_SUCCESS (0), a full-structure ReturnLength, a
+    supported native layout, UniqueProcessId == the opened pid (drift/wrong
+    process guard), and a positive creator. Everything else fails closed.
+    _diag, when given, records which guard failed for receipts only; it never
+    changes the fail-closed outcome."""
+    def _fail(detail: str) -> None:
+        if _diag is not None:
+            _diag.update({"stage": "creator", "detail": detail})
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pbi = _process_basic_information_type()
+        if not _pbi_layout_supported(pbi):
+            _fail("native PROCESS_BASIC_INFORMATION layout unsupported")
+            return None
+        info = pbi()
+        returned = wintypes.ULONG(0)
+        status = ntdll.NtQueryInformationProcess(handle, 0, ctypes.byref(info),
+                                                 ctypes.sizeof(info), ctypes.byref(returned))
+        if status != 0:
+            _fail(f"NTSTATUS={status} (0x{status & 0xFFFFFFFF:08X})")
+            return None
+        if returned.value != ctypes.sizeof(info):
+            _fail(f"ReturnLength={returned.value} expected={ctypes.sizeof(info)}")
+            return None
+        unique = int(info.UniqueProcessId or 0)
+        creator = int(info.InheritedFromUniqueProcessId or 0)
+        if unique != pid:
+            _fail(f"UniqueProcessId={unique} != opened pid {pid}")
+            return None
+        if creator <= 0:
+            _fail(f"nonpositive creator={creator}")
+            return None
+        return creator
+    except Exception as exc:
+        _fail(f"exception:{type(exc).__name__}")
+        return None
+
+
+def _read_image_path(kernel32: Any, handle: Any, _diag: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Canonical image path of the process pinned by handle, or None.
+    _diag, when given, receives the failure stage and native error for
+    receipts only; it never changes the fail-closed outcome."""
+    import ctypes
+    from ctypes import wintypes
+    size = wintypes.DWORD(1024)
+    buf = ctypes.create_unicode_buffer(size.value)
+    if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        if _diag is not None:
+            _diag.update({"stage": "image", "detail": f"GetLastError={_last_win_error()}"})
+        return None
+    return buf.value
+
+
+def _capture_registration_identity(pid: int, _diag: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+    """Single-channel registration identity: exact integer FILETIME creation
+    ticks, the canonical image path, AND the creator pid, all read through
+    ONE stable open handle (QUERY_LIMITED_INFORMATION only - no termination
+    rights). The handle pins the process object, so ticks, exe and creator
+    always describe one real process and can never be mixed across a
+    recycled occupant. None on non-Windows, any OS failure, any layout or
+    status failure, or any CloseHandle failure (lifecycle unaccounted);
+    callers fail closed on None. _diag, when given, records which capture
+    stage failed (open/ticks/image/creator/close/exception) with the native
+    error for receipts only; it never changes the fail-closed outcome."""
+    if not _IS_WINDOWS:
+        return None
+    try:
+        kernel32 = _load_kernel32()
+        ntdll = _load_ntdll()
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            if _diag is not None:
+                _diag.update({"stage": "open", "detail": f"GetLastError={_last_win_error()}"})
+            return None
+        close_ok = True
+        try:
+            ticks = _read_creation_ticks(kernel32, handle, _diag)
+            exe = _read_image_path(kernel32, handle, _diag) if ticks is not None else None
+            creator = _read_creator_pid(ntdll, handle, pid, _diag) if exe else None
+        finally:
+            if not kernel32.CloseHandle(handle):
+                close_ok = False
+                if _diag is not None:
+                    _diag.update({"stage": "close", "detail": f"GetLastError={_last_win_error()}"})
+        # No identity record unless the handle lifecycle is fully accounted.
+        if not close_ok or ticks is None or not exe or creator is None:
+            return None
+        return {"create_ticks": ticks, "exe": exe, "creator_pid": creator}
+    except Exception as exc:
+        if _diag is not None:
+            _diag.update({"stage": "exception", "detail": f"exception:{type(exc).__name__}"})
+        return None
+
+
+def _terminate_verified(entry: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """Terminate exactly the recorded identity via a stable Windows process handle.
+
+    Opens a handle to the PID FIRST, then verifies identity THROUGH THAT
+    HANDLE (which pins the process object): the exact integer FILETIME
+    creation ticks recorded at ownership registration must equal the handle's
+    creation ticks exactly (no float, no tolerance), and the image path must
+    match exactly. Only then is THAT handle terminated. A PID recycled after
+    recording never matches, and there is no check-then-kill TOCTOU window
+    because identity is bound to the handle, not the number. Only this exact
+    identity is terminated - no tree adoption. Fails closed (records an
+    error, returns False) whenever a stable handle, handle-based
+    verification, or handle cleanup cannot be accounted for - a
+    CloseHandle failure means no success claim. A True return is not exit
+    proof: TerminateProcess is asynchronous and the outer poll/receipt gate
+    supplies verified exit."""
+    if not _IS_WINDOWS:
+        result["errors"].append("stable process handle unavailable on this platform")
+        return False
+    try:
+        import ctypes
+        kernel32 = _load_kernel32()
+        handle = kernel32.OpenProcess(0x1000 | 0x0001, False, entry["pid"])  # QUERY_LIMITED_INFORMATION | TERMINATE
+        if not handle:
+            result["errors"].append(f"OpenProcess failed for pid {entry['pid']}: error {_last_win_error()}")
+            return False
+        try:
+            handle_create_ticks = _read_creation_ticks(kernel32, handle)
+            if handle_create_ticks is None:
+                result["errors"].append(f"GetProcessTimes failed for pid {entry['pid']}: error {_last_win_error()}")
+                return False
+            if handle_create_ticks != entry.get("create_ticks"):
+                result["errors"].append(f"handle identity mismatch for pid {entry['pid']}: exact creation ticks differ")
+                return False
+            handle_exe = _read_image_path(kernel32, handle)
+            if handle_exe is None:
+                result["errors"].append(f"QueryFullProcessImageName failed for pid {entry['pid']}: error {_last_win_error()}")
+                return False
+            if handle_exe != entry["exe"]:
+                result["errors"].append(f"handle identity mismatch for pid {entry['pid']}: image path differs")
+                return False
+            if not kernel32.TerminateProcess(handle, 1):
+                result["errors"].append(f"TerminateProcess failed for pid {entry['pid']}: error {_last_win_error()}")
+                return False
+        finally:
+            # No success claim before the handle lifecycle is accounted for:
+            # a CloseHandle failure records diagnostics and fails closed.
+            close_error = None
+            if not kernel32.CloseHandle(handle):
+                close_error = _last_win_error()
+                result["errors"].append(f"CloseHandle failed for pid {entry['pid']}: error {close_error}")
+        if close_error is not None:
+            return False
+        # True only means: identity verified THROUGH the handle and termination
+        # issued on that exact handle with its lifecycle fully accounted.
+        # TerminateProcess is asynchronous - this is NOT exit proof; the outer
+        # poll and receipt gate supply verified exit before any handoff.
+        return True
+    except Exception as exc:
+        result["errors"].append("stable handle termination: " + type(exc).__name__)
+        return False
+
+
+def _mark_rows_incomplete(protocol, target_rows, start_idx: int, message: str, detail: Any = None) -> None:
+    for r in range(start_idx, len(protocol)):
+        if target_rows[r]["task"]["status"] == assess.NOT_RUN:
+            evidence: List[Any] = [message] + ([detail] if detail else [])
+            target_rows[r] = {"name": protocol[r]["name"], "task": {"status": assess.INCOMPLETE, "evidence": evidence}}
+
+
+def orchestrate_task_sessions(run_session, terminate_blocked, protocol, target_rows,
+                              max_sessions: int = 3, should_stop=None) -> bool:
+    """Tasks-protocol restart orchestration.
+
+    run_session(session_num, start_idx) -> (completed, restart_idx|None).
+    terminate_blocked(session_num) is invoked ONLY after a consent-blocked
+    session, before the fresh one launches, and must return a mapping with
+    "terminated" (the persisted receipt). A fresh session launches solely
+    after verified termination. Bounded by max_sessions; on cap, stop
+    condition or termination failure the remaining rows are marked INCOMPLETE
+    (never PASS) in their original order."""
+    start_idx = 0
+    for session_num in range(1, max_sessions + 1):
+        if should_stop is not None and should_stop():
+            return False
+        if session_num > 1:
+            term = terminate_blocked(session_num)
+            if not term.get("terminated"):
+                _mark_rows_incomplete(protocol, target_rows, start_idx,
+                                      "Blocked session owned processes could not be stopped and exit-verified; "
+                                      "fresh session not launched over a live uncontrolled process", term)
+                return False
+        seg_completed, restart_idx = run_session(session_num, start_idx)
+        if restart_idx is not None:
+            start_idx = restart_idx
+            continue
+        return bool(seg_completed)
+    _mark_rows_incomplete(protocol, target_rows, start_idx, "Consent-prompt session restart limit reached")
+    return False
+
+
+def terminate_owned_processes(
+                              root: Path, byte_tracker: List[int], receipt_name: str,
+                              pty: Any = None, settle_seconds: float = 10.0) -> Dict[str, Any]:
+    """Stop recorded owned processes for root, verify exit, persist a receipt.
+
+    Kills ONLY positively established identities from strictly validated
+    root/output/owned_processes.json (exact handle-derived integer creation
+    ticks + recorded exe verified THROUGH the kill handle BEFORE each kill). No ambient process discovery or adoption. PID reuse is
+    safe: a mismatched occupant is never killed. Missing/malformed/empty
+    metadata or any recorded observation error fails closed with zero kills.
+    The receipt (kills, mismatches, survivors, PTY closure proof) is persisted
+    to evidence before returning, so a fresh session launches only after the
+    blocked session's closure and exit are proven on disk. Workspace and
+    evidence are preserved."""
+    root = Path(root).resolve()
+    result: Dict[str, Any] = {"terminated": False, "killed_pids": [], "remaining": [],
+                              "skipped_identity_mismatch": [], "pty_closed": None, "errors": []}
+
+    if pty is not None:
+        alive = bool(getattr(pty.pty, "isalive", lambda: False)())
+        result["pty_closed"] = not alive
+        if alive:
+            result["errors"].append("blocked session PTY still open")
+
+    owned = _read_strict_owned_metadata(root, result)
+    if owned is not None:
+        _observation_errors_present(root, result)
+    try:
+        import psutil
+    except ImportError:
+        result["errors"].append("psutil unavailable")
+        psutil = None
+    if not _IS_WINDOWS:
+        result["errors"].append("Windows cleanup not exercised on this platform")
+
+    if owned is not None and psutil is not None and _IS_WINDOWS and not result["errors"]:
+        for entry in owned:
+            try:
+                candidate = psutil.Process(entry["pid"])
+                if candidate.create_time() != entry["create_time"] or \
+                        str(candidate.exe()) != entry["exe"]:
+                    # Recorded identity already gone; PID occupant is not ours - never kill it.
+                    result["skipped_identity_mismatch"].append(entry["pid"])
+                    continue
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as exc:
+                result["errors"].append("pre-kill inspection: " + type(exc).__name__)
+                continue
+            # Terminate exactly this recorded identity through a stable handle
+            # verified after opening: no PID-based taskkill TOCTOU, no /T tree
+            # adoption (descendants are recorded identities of their own).
+            if _terminate_verified(entry, result):
+                result["killed_pids"].append(entry["pid"])
+
+        deadline = time.monotonic() + settle_seconds
+        while not result["errors"]:
+            remaining: List[int] = []
+            verify_failed = False
+            for entry in owned:
+                try:
+                    process = psutil.Process(entry["pid"])
+                    if process.create_time() == entry["create_time"] and process.is_running():
+                        remaining.append(entry["pid"])
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception:
+                    verify_failed = True
+            if verify_failed:
+                result["errors"].append("exit verification failed")
+                break
+            if not remaining:
+                result["terminated"] = True
+                break
+            if time.monotonic() >= deadline:
+                result["remaining"] = remaining
+                break
+            time.sleep(0.2)
+
+    receipt = {"receipt": receipt_name, "terminated": result["terminated"],
+               "killed_pids": result["killed_pids"],
+               "skipped_identity_mismatch": result["skipped_identity_mismatch"],
+               "remaining": result["remaining"], "pty_closed": result["pty_closed"],
+               "errors": result["errors"], "recorded_at": time.time()}
+    try:
+        charge_and_write(root / "output" / f"termination_{receipt_name}.json",
+                         json.dumps(receipt, indent=2).encode("utf-8"), byte_tracker)
+    except Exception as exc:
+        result["errors"].append("receipt persist failed: " + type(exc).__name__)
+        result["terminated"] = False
+    return result
+
+
 def cleanup_root(root: Path | str) -> Dict[str, Any]:
     """Clean up owned processes recorded under root. Never startup model or kill unrelated trees."""
     root = Path(root).resolve()
@@ -522,68 +1136,55 @@ def cleanup_root(root: Path | str) -> Dict[str, Any]:
         except (OSError, ValueError) as exc:
             errors.append(f"observation errors unreadable: {type(exc).__name__}")
 
+    strict: Dict[str, Any] = {"errors": []}
     if not owned_file.exists():
         owned = []
         errors.append("missing owned metadata")
     else:
-        try:
-            owned = json.loads(owned_file.read_text(encoding="utf-8"))
-            if (not isinstance(owned, list) or not owned or
-                    any(not isinstance(e, dict) or not isinstance(e.get("pid"), int)
-                        or e["pid"] <= 0 or not isinstance(e.get("create_time"), (int, float))
-                        or not e["create_time"] > 0 for e in owned)):
-                owned = []
-                errors.append("missing owned metadata")
-        except (OSError, ValueError):
+        loaded = _read_strict_owned_metadata(root, strict)
+        if loaded is None:
             owned = []
-            errors.append("owned metadata unreadable")
+            errors.extend(strict["errors"])
+        else:
+            owned = loaded
     try:
         import psutil
     except ImportError:
         psutil = None
         errors.append("psutil unavailable")
-    if os.name != "nt":
+    if not _IS_WINDOWS:
         errors.append("Windows cleanup not exercised on this platform")
 
-    def same_process(process, entry):
-        return process.create_time() == entry.get("create_time") and entry.get("create_time", 0) > 0
-
-    def server_under_root(process):
-        if (process.info.get("name") or "").lower() not in ("llama-server", "llama-server.exe"):
-            return False
-        args = process.info.get("cmdline") or []
-        return any(str(root).lower() in arg.lower() for arg in args)
-
-    if psutil is not None and os.name == "nt":
+    if psutil is not None and _IS_WINDOWS:
+        # Only positively established recorded identities are killed: exact
+        # create_time + recorded exe checked BEFORE every kill. No ambient
+        # server discovery or adoption; an unrecorded process is never touched.
         for entry in owned:
             try:
                 process = psutil.Process(entry["pid"])
-                if same_process(process, entry):
-                    result = subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
-                                            capture_output=True, timeout=10)
-                    killed.append({"pid": process.pid, "returncode": result.returncode})
+                if process.create_time() != entry["create_time"] or \
+                        str(process.exe()) != entry["exe"]:
+                    continue  # recorded identity gone; PID occupant is not ours
             except psutil.NoSuchProcess:
-                pass
+                continue
             except Exception as exc:
-                errors.append("owned tree cleanup: " + type(exc).__name__)
-        # Server arguments point at this fresh HOME; never target a name alone.
+                errors.append("pre-kill inspection: " + type(exc).__name__)
+                continue
+            # Stable-handle termination of exactly this recorded identity: no
+            # PID-based taskkill TOCTOU, no /T tree adoption.
+            term_result: Dict[str, Any] = {"errors": []}
+            if _terminate_verified(entry, term_result):
+                killed.append({"pid": entry["pid"], "method": "verified_handle"})
+            errors.extend(term_result["errors"])
         try:
-            for process in psutil.process_iter(["pid", "name", "cmdline"]):
-                if server_under_root(process):
-                    result = subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
-                                            capture_output=True, timeout=10)
-                    killed.append({"pid": process.pid, "returncode": result.returncode})
             time.sleep(0.5)
             for entry in owned:
                 try:
                     process = psutil.Process(entry["pid"])
-                    if same_process(process, entry) and process.is_running():
+                    if process.create_time() == entry["create_time"] and process.is_running():
                         remaining.append(process.pid)
                 except psutil.NoSuchProcess:
                     pass
-            for process in psutil.process_iter(["pid", "name", "cmdline"]):
-                if server_under_root(process):
-                    remaining_llama.append(process.pid)
         except Exception as exc:
             errors.append("owned process final check: " + type(exc).__name__)
     result = {"confirmed": bool(owned) and not errors and not remaining and not remaining_llama,
@@ -597,13 +1198,22 @@ def cleanup_root(root: Path | str) -> Dict[str, Any]:
 def _execute_protocol_session(protocol: List[Dict[str, Any]], session_id: str, pty: PtySession,
                               workspace: Path, home: Path, history_db: Path, deadline: float,
                               is_tasks: bool, output_dir: Path, target_rows: List[Dict[str, Any]],
-                              byte_tracker: List[int], on_after_first_real_task: Any = None) -> bool:
-    """Execute a declared protocol table in-place, preserving row IDs and stopping on first timeout."""
+                              byte_tracker: List[int], on_after_first_real_task: Any = None,
+                              start_idx: int = 0) -> Tuple[bool, Optional[int]]:
+    """Execute a declared protocol table in-place, preserving row IDs and stopping on first timeout.
+
+    Returns (completed, restart_idx). restart_idx is set when a row stopped at
+    the app's run_tests trust prompt: the harness records that row as a consent
+    coverage gap (never a pass, never answered) and the caller continues the
+    remaining rows in a fresh session so one expected prompt cannot consume the
+    whole matrix."""
     session_stopped = False
     first_real_checked = False
     context_metrics_before: Dict[str, Any] = {}
 
     for idx, step in enumerate(protocol):
+        if idx < start_idx:
+            continue
         name, kind, prompt, timeout = step["name"], step["kind"], step["prompt"], step["timeout"]
         if session_stopped or pty.error_flag or time.monotonic() >= deadline:
             target_rows[idx] = {"name": name, "task": {"status": assess.NOT_RUN, "evidence": ["Session stopped or deadline exhausted"]}}
@@ -639,12 +1249,25 @@ def _execute_protocol_session(protocol: List[Dict[str, Any]], session_id: str, p
             session_stopped = True
             continue
 
-        raw_chunk, ready = pty.wait_for_ready_prompt(timeout=min(timeout, rem), deadline=deadline)
+        raw_chunk, ready, consent_wait = pty.wait_for_ready_prompt(timeout=min(timeout, rem), deadline=deadline)
         after_db = fetch_sqlite_messages(history_db, session_id)
         after_files = snapshot_workspace_files(workspace)
         delta_msgs = canonical_diff(before_db, after_db)
         assistant_ans = assess.extract_assistant_turn_answer(delta_msgs)
         user_msg = next((m for m in delta_msgs if m.get("role") == "user"), None)
+
+        if consent_wait:
+            target_rows[idx] = {"name": name,
+                                "task": {"status": assess.INCOMPLETE,
+                                         "evidence": ["consent_wait_coverage_gap: prompt-shaped output observed (shape only, not an "
+                                                      "authenticated request); no approval, grant or any other input was sent. "
+                                                      "Session closure and owned-process exit are verified separately and persisted "
+                                                      "in output/termination_*.json before any fresh launch", pty.error_flag]},
+                                "raw_chunk": raw_chunk, "canonical_before": before_db, "canonical_after": after_db,
+                                "known_files_before": before_files, "known_files_after": after_files}
+            charge_and_write(output_dir / "rows" / f"{session_id}_{idx:02d}_{name}.json",
+                             json.dumps(target_rows[idx], indent=2).encode(), byte_tracker)
+            return False, idx + 1
 
         if not ready or (kind == "model" and not assistant_ans):
             target_rows[idx] = {"name": name, "task": {"status": assess.INCOMPLETE, "evidence": ["Timeout, incomplete turn or reader failure", pty.error_flag]},
@@ -665,8 +1288,8 @@ def _execute_protocol_session(protocol: List[Dict[str, Any]], session_id: str, p
         elif name == "row-04-slash-review":
             row_res = assess.assess_task_calculator_review(assistant_ans, before_files.get("slash_bug.py", ""), after_files.get("slash_bug.py", ""), delta_msgs, is_slash=True)
         elif name == "row-05-calculator-fix":
-            beh_ok, add_ok = verify_calculator_behavior(workspace, before_files.get("calculator.py", ""))
-            row_res = assess.assess_task_calculator_fix(beh_ok, add_ok, before_files.get("calculator.py", ""), after_files.get("calculator.py", ""), delta_msgs)
+            static_facts = verify_calculator_static(workspace, before_files.get("calculator.py", ""))
+            row_res = assess.assess_task_calculator_fix(static_facts, before_files.get("calculator.py", ""), after_files.get("calculator.py", ""), delta_msgs)
         elif name == "row-06-web-search":
             row_res = assess.assess_task_web_search(assistant_ans, delta_msgs)
         elif name == "compact-turn-02-brief":
@@ -706,7 +1329,7 @@ def _execute_protocol_session(protocol: List[Dict[str, Any]], session_id: str, p
             except Exception:
                 pass
 
-    return not session_stopped
+    return not session_stopped, None
 
 
 def capture_backend_identity(root: Path, output_dir: Path, deadline: float, source_root: Path) -> Dict[str, Any]:
@@ -904,29 +1527,50 @@ def run_driver(args: argparse.Namespace) -> int:
         return True
 
     try:
-        # Session 1: tasks
-        s1_id = "interactive-tasks-001"
-        argv1 = [sys.executable, "-I", "-X", "utf8", "-c", CONTROLLER_CODE,
-                 "repl", "--provider", "local", "--context-size", "4096", "--max-output-tokens", "512",
-                 "--max-iterations", "10", "--persist", "--session", s1_id, "--no-stream"]
-        pty1 = PtySession(argv1, cwd=workspace, env=env, root=root, byte_tracker=byte_tracker)
-        s1_completed = False
-        try:
-            init_out1, ready1 = pty1.wait_for_ready_prompt(timeout=STARTUP_TIMEOUT, deadline=deadline)
-            tty_probe_tasks = assess.parse_tty_probe(init_out1)
-            if ready1:
-                s1_completed = _execute_protocol_session(
+        # Session 1: tasks. A row that stops at the app's run_tests trust prompt
+        # is recorded as a consent coverage gap (human-only consent; the harness
+        # never answers); the blocked session's owned processes are verifiably
+        # terminated (receipt persisted) BEFORE the remaining rows continue in a
+        # fresh session, so one expected prompt cannot consume the whole matrix.
+        blocked_pty: List[Any] = [None]
+
+        def _run_one_tasks_session(session_num: int, start_idx: int):
+            nonlocal tty_probe_tasks
+            s1_id = f"interactive-tasks-{session_num:03d}"
+            argv1 = [sys.executable, "-I", "-X", "utf8", "-c", CONTROLLER_CODE,
+                     "repl", "--provider", "local", "--context-size", "4096", "--max-output-tokens", "512",
+                     "--max-iterations", "10", "--persist", "--session", s1_id, "--no-stream"]
+            pty1 = PtySession(argv1, cwd=workspace, env=env, root=root, byte_tracker=byte_tracker)
+            try:
+                init_out1, ready1, _cw1 = pty1.wait_for_ready_prompt(timeout=STARTUP_TIMEOUT, deadline=deadline)
+                if session_num == 1:
+                    tty_probe_tasks = assess.parse_tty_probe(init_out1)
+                if not ready1:
+                    tasks_rows[start_idx] = {"name": PROTOCOL_TASKS[start_idx]["name"],
+                                             "task": {"status": assess.INCOMPLETE, "evidence": ["Startup timeout"]}}
+                    return False, None
+                return _execute_protocol_session(
                     PROTOCOL_TASKS, s1_id, pty1, workspace, home, history_db,
                     deadline=deadline, is_tasks=True, output_dir=output_dir, target_rows=tasks_rows,
-                    byte_tracker=byte_tracker, on_after_first_real_task=on_after_first_real_task_hook
+                    byte_tracker=byte_tracker,
+                    on_after_first_real_task=on_after_first_real_task_hook if session_num == 1 else None,
+                    start_idx=start_idx
                 )
-            else:
-                tasks_rows[0] = {"name": PROTOCOL_TASKS[0]["name"], "task": {"status": assess.INCOMPLETE, "evidence": ["Startup timeout"]}}
-        finally:
-            try:
-                charge_and_write(transcripts_dir / "tasks.log", pty1.all_output.encode("utf-8", errors="replace"), byte_tracker)
             finally:
-                pty1.close()
+                try:
+                    log_name = "tasks.log" if session_num == 1 else f"tasks-{session_num}.log"
+                    charge_and_write(transcripts_dir / log_name, pty1.all_output.encode("utf-8", errors="replace"), byte_tracker)
+                finally:
+                    pty1.close()
+                    blocked_pty[0] = pty1
+
+        def _terminate_blocked_session(session_num: int):
+            return terminate_owned_processes(root, byte_tracker, f"after_session_{session_num - 1:03d}",
+                                             pty=blocked_pty[0])
+
+        s1_completed = orchestrate_task_sessions(
+            _run_one_tasks_session, _terminate_blocked_session, PROTOCOL_TASKS, tasks_rows,
+            max_sessions=3, should_stop=lambda: time.monotonic() >= deadline)
 
         # Session 2: compact (only if tasks session completed all turns and model verified)
         if s1_completed and model_verified_initial and time.monotonic() < deadline:
@@ -936,7 +1580,7 @@ def run_driver(args: argparse.Namespace) -> int:
                      "--max-iterations", "10", "--persist", "--session", s2_id, "--no-stream"]
             pty2 = PtySession(argv2, cwd=workspace, env=env, root=root, byte_tracker=byte_tracker)
             try:
-                init_out2, ready2 = pty2.wait_for_ready_prompt(timeout=STARTUP_TIMEOUT, deadline=deadline)
+                init_out2, ready2, _cw2 = pty2.wait_for_ready_prompt(timeout=STARTUP_TIMEOUT, deadline=deadline)
                 tty_probe_compact = assess.parse_tty_probe(init_out2)
                 if ready2:
                     _execute_protocol_session(
@@ -984,8 +1628,18 @@ def run_driver(args: argparse.Namespace) -> int:
 
         complete = bool(summary.get("automated_core_pass", False) and backend_identity.get("complete", False))
 
+        coverage_gaps = [
+            "run_tests: consent_wait_coverage_gap possible (human-only consent; the harness never answers "
+            "and no project-code execution is approved); affected rows record INCOMPLETE, never PASS",
+            "row-05 calculator behavior: NOT_TESTED (harness execution/import of model-written files "
+            "removed; static syntax/content checks only, best outcome REVIEW)",
+            "run_code: refused probe-only via NEXUS_AGENT_DISABLE_RUN_CODE=1 (AST allowlist is not OS "
+            "containment and this runner has no rlimits/Job Objects); sandboxed-computation behavior NOT_TESTED",
+        ]
+
         results = {
             "commit": commit, "wheel": wheel.name, "native_evidence_verified": True,
+            "coverage_gaps": coverage_gaps,
             "native_gate": {
                 "commit": native_gate.get("commit"), "platform": native_gate.get("platform"),
                 "success": native_gate.get("success"), "qualified": native_gate.get("qualified"),
@@ -1017,6 +1671,106 @@ def run_driver(args: argparse.Namespace) -> int:
     return 0 if complete else 1
 
 
+def conpty_check(args: argparse.Namespace) -> int:
+    """Non-model ConPTY compatibility proof through the production PtySession path.
+
+    Spawns ONE benign child (this interpreter, held on stdin) through the
+    production PtySession: the ownership anchor and creator registration must
+    succeed BEFORE any I/O, which is only possible when ConPTY creates the
+    child in-process (creator == this harness). A winpty-agent fallback or any
+    ownership failure closes the session and fails this check. One bounded
+    echo round is observed, then the live recorded child is terminated through
+    production terminate_owned_processes with the receipt retained in
+    root/output. Never a model, never network, never an unrelated process.
+    This evidence is NOT interactive qualification and permits no model use."""
+    root = Path(args.root).resolve()
+    deadline = deadline_from_file(args.deadline_file)
+    byte_tracker: List[int] = [0]
+    evidence: Dict[str, Any] = {
+        "platform": sys.platform,
+        "conpty_compatibility_only": True,
+        "interactive_qualification": False,
+        "final_qualification": False,
+        "model_execution_permitted": False,
+        "external_execution_approval": False,
+        "network_used": False,
+        "checks": {},
+        "errors": [],
+    }
+
+    def finish(code: int) -> int:
+        out = root / "output"
+        out.mkdir(parents=True, exist_ok=True)
+        receipt = out / "termination_conpty_check.json"
+        evidence["termination_receipt_sha256"] = (
+            hashlib.sha256(receipt.read_bytes()).hexdigest()
+            if receipt.is_file() else None)
+        charge_and_write(out / "conpty-compat.json",
+                         json.dumps(evidence, indent=2).encode("utf-8"), byte_tracker)
+        print(json.dumps(evidence, indent=2))
+        return code
+
+    if not _IS_WINDOWS:
+        evidence["errors"].append("ConPTY compatibility is only verifiable on Windows")
+        return finish(1)
+    if PtyProcess is None:
+        evidence["errors"].append("pywinpty unavailable")
+        return finish(1)
+    build = sys.getwindowsversion().build  # Windows-only attribute
+    evidence["windows_build"] = build
+    evidence["conpty_expected_by_build"] = build >= 17763
+
+    argv = [sys.executable, "-c",
+            "import sys; print('conpty-echo-ok', flush=True); sys.stdin.readline()"]
+    session = PtySession(argv, cwd=root, env=dict(os.environ), root=root,
+                         byte_tracker=byte_tracker)
+    try:
+        if session.error_flag:
+            evidence["errors"].append(session.error_flag)
+            return finish(1)
+        evidence["checks"]["ownership_registered_pre_io"] = True
+        evidence["child_pid"] = session.pid
+        read_back: Dict[str, Any] = {"errors": []}
+        entries = _read_strict_owned_metadata(root, read_back)
+        if read_back["errors"]:
+            evidence["errors"].extend(read_back["errors"])
+            return finish(1)
+        entry = next((e for e in (entries or []) if e.get("pid") == session.pid), None)
+        evidence["creator_pid"] = entry.get("creator_pid") if entry else None
+        evidence["checks"]["creator_is_harness"] = bool(
+            entry and entry.get("creator_pid") == os.getpid())
+        if not evidence["checks"]["creator_is_harness"]:
+            evidence["errors"].append(
+                "PTY child creator is not this harness (agent-fallback backend?)")
+            return finish(1)
+
+        buf = ""
+        echo_deadline = min(time.monotonic() + 60.0, deadline - 5)
+        while time.monotonic() < echo_deadline and "conpty-echo-ok" not in buf:
+            try:
+                buf += session.out_queue.get(timeout=0.5)
+            except queue.Empty:
+                if session.error_flag:
+                    break
+        evidence["checks"]["echo_observed"] = "conpty-echo-ok" in buf
+        if not evidence["checks"]["echo_observed"]:
+            evidence["errors"].append(
+                session.error_flag or "bounded echo not observed")
+            return finish(1)
+
+        term = terminate_owned_processes(root, byte_tracker, "conpty_check",
+                                         settle_seconds=5.0)
+        evidence["termination"] = {k: term[k] for k in
+                                   ("terminated", "killed_pids",
+                                    "skipped_identity_mismatch", "remaining", "errors")}
+        evidence["checks"]["terminated"] = term["terminated"] is True
+        if not evidence["checks"]["terminated"]:
+            return finish(1)
+        return finish(0)
+    finally:
+        session.close()
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1032,6 +1786,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     cleanup_parser = sub.add_parser("cleanup", help="Clean up owned processes for root")
     cleanup_parser.add_argument("--root", required=True)
 
+    conpty_parser = sub.add_parser("conpty-check",
+                                   help="Non-model ConPTY compatibility proof (not qualification)")
+    conpty_parser.add_argument("--root", required=True)
+    conpty_parser.add_argument("--deadline-file", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "run":
         try:
@@ -1043,6 +1802,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         result = cleanup_root(args.root)
         print(json.dumps(result, indent=2))
         return 0 if result.get("confirmed", False) else 1
+    elif args.command == "conpty-check":
+        try:
+            return conpty_check(args)
+        except Exception as e:
+            print(f"CONPTY CHECK FAILED: {e}", file=sys.stderr)
+            return 1
     return 1
 
 
