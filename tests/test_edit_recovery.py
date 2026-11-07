@@ -431,3 +431,58 @@ def test_credential_shaped_stopped_text_has_hash_only_audit_and_corrected_histor
     assert "Executor record:" in canonical[-1]["content"]
     assert "No corrected edit was attempted" in canonical[-1]["content"]
     assert "workspace unchanged" not in final.lower()
+
+
+def test_composed_recovery_result_declares_snapshot_satisfies_reread(tmp_path):
+    source = canonical()
+    projected, injected = project_recovery(source, pending(tmp_path))
+    assert injected
+    content = projected[-1]["content"]
+    marker = ("The DATA snapshot above is the verified fresh re-read of this path's "
+              "current on-disk state that the refusal requires. It is an excerpt (at most "
+              "30 lines / 2000 characters): if your edit's OLD source is fully present in "
+              "it, no further read_file call is needed; if any needed source lies outside "
+              "the excerpt, read the file again first.\n")
+    assert content.count(marker) == 1
+    # Guidance sits after the DATA boundary and before the re-issue instruction.
+    assert content.index("--- END FILE DATA ---\n") < content.index(marker)
+    assert content.index(marker) < content.index("Re-issue one corrected edit")
+    # The snapshot data itself carries no guidance.
+    data_block = content.split("DATA: fresh read snapshot", 1)[1].split("--- END FILE DATA ---", 1)[0]
+    assert "read_file call" not in data_block
+
+
+def test_reread_clarification_never_alters_truthful_refusal_history(tmp_path):
+    source = canonical()
+    before = copy.deepcopy(source)
+    projected, injected = project_recovery(source, pending(tmp_path))
+    assert injected and source == before
+    original = next(message for message in before if message.get("tool_call_id") == "actual")
+    result = projected[-1]
+    assert result["content"].startswith(original["content"] + "\n\n--- BEGIN HARNESS EDIT RECOVERY ---")
+    # No injection, no clarification: a plain result without pending recovery is untouched.
+    plain, injected_again = project_recovery(before, {"status": "resolved", "call_id": "actual",
+                                                      "path": "f.py", "reason": "targeting",
+                                                      "excerpt": "value = 1\r\n", "read_ids": []})
+    assert not injected_again and plain == before
+
+
+def test_partial_excerpt_guidance_never_implies_complete_file(tmp_path):
+    # Boundary: a file whose relevant code can lie beyond the excerpt. The
+    # excerpt is provably partial, and the guidance must still permit the
+    # read needed to obtain omitted source.
+    big = "".join(f"# filler line {i}\n" for i in range(120)) + "def target():\n    return 1\n"
+    assert len(big) > 2000
+    excerpt = recovery_excerpt(big)
+    assert excerpt != big and len(excerpt) <= 2000 and "def target" not in excerpt
+    recovery = pending(tmp_path)
+    recovery["excerpt"] = excerpt
+    projected, injected = project_recovery(canonical(), recovery)
+    assert injected
+    content = projected[-1]["content"]
+    assert excerpt in content and big not in content
+    assert ("if any needed source lies outside the excerpt, read the file again first."
+            in content)
+    # The freshness clause stays truthful for the partial excerpt: it claims a
+    # verified fresh re-read of current state, not file completeness.
+    assert "no further read_file call is needed; if any needed source lies outside" in content
