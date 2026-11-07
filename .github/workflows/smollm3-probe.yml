@@ -1,0 +1,121 @@
+name: Isolated Qwen3-4B-Instruct-2507 Windows model experiment (deterministic forced-refusal recovery probe on v16-r8v5 wheel)
+on:
+  push:
+    branches: [experiment/qwen3-4b-2507-v16r8v5-20261107-recovery-guid-a9ffb7f5]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  model-probe:
+    if: >-
+      github.event.created == true && github.event.before == '0000000000000000000000000000000000000000' &&
+      github.event.deleted == false && github.event.forced == false && github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: experiment
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Fail-closed candidate seal verification
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $seal = Get-Content -Raw experiment/.github/experiments/candidate-seal.json | ConvertFrom-Json
+          $c1 = git -C experiment rev-parse HEAD~1
+          if ($LASTEXITCODE -ne 0 -or $c1 -ne $seal.c1_commit) { throw 'Candidate content commit differs from reviewed seal' }
+          $t1 = git -C experiment rev-parse 'HEAD~1^{tree}'
+          if ($LASTEXITCODE -ne 0 -or $t1 -ne $seal.c1_tree) { throw 'Candidate content tree differs from reviewed seal' }
+          $changed = @(git -C experiment diff --name-only HEAD~1 HEAD)
+          if ($changed.Count -ne 1 -or $changed[0] -ne '.github/experiments/candidate-seal.json') { throw 'Candidate seal commit modifies more than the seal file' }
+          if (git -C experiment status --porcelain) { throw 'Candidate experiment checkout is dirty' }
+          $probeHash = (Get-FileHash -Algorithm SHA256 experiment/.github/experiments/qwen_recovery_probe.py).Hash.ToLower()
+          if ($probeHash -ne $seal.probe_sha256) { throw 'Candidate probe bytes differ from reviewed seal' }
+          $ymlHash = (Get-FileHash -Algorithm SHA256 experiment/.github/workflows/smollm3-probe.yml).Hash.ToLower()
+          if ($ymlHash -ne $seal.workflow_sha256) { throw 'Candidate workflow bytes differ from reviewed seal' }
+      - uses: actions/checkout@v4
+        with:
+          ref: 77fe4dde1868b877df56165a7090f4a44d8a6a51
+          path: baseline
+          fetch-depth: 6
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fresh isolated root and work deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          if (Test-Path $root) { throw 'Experiment root already exists' }
+          New-Item -ItemType Directory $root | Out-Null
+          # Anchor the unchanged 110-minute work deadline to the workflow run's
+          # actual start, not to this step: checkout/seal/setup time before this
+          # step must not erode the cleanup/evidence reserve inside the 120-minute job cap.
+          $runMeta = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $runMeta.run_started_at) { throw 'Run start anchor unavailable' }
+          $started = [DateTimeOffset]::Parse($runMeta.run_started_at)
+          @{work_deadline_utc=($started.ToUnixTimeSeconds()+110*60);job_limit_minutes=120;reserve_minutes=10;anchored_to='run_started_at';run_started_at=$runMeta.run_started_at} | ConvertTo-Json | Set-Content -Encoding utf8 "$root/deadline.json"
+      - name: Verify unchanged actual attempt-one native baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/42396534309" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $metadata.head_sha -ne '77fe4dde1868b877df56165a7090f4a44d8a6a51' -or $metadata.run_attempt -ne 1 -or $metadata.status -ne 'completed' -or $metadata.conclusion -ne 'success') { throw 'Baseline native run changed or unavailable' }
+      - uses: actions/download-artifact@v4
+        with:
+          name: q1-windows-untraced-native
+          path: ${{ runner.temp }}/smollm3-experiment/native-evidence
+          repository: ${{ github.repository }}
+          run-id: 42396534309
+          github-token: ${{ github.token }}
+      - name: Verify and install unchanged native-qualified wheel
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          $wheels = @(Get-ChildItem "$root/native-evidence" -Filter 'nexus_agent_ai-*.whl' -Recurse -File)
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one native-qualified wheel' }
+          python -I -B baseline/.github/qualification/verify_windows_interactive.py check-native --native-evidence "$root/native-evidence/native-gate.json" --wheel $wheels[0].FullName --commit 77fe4dde1868b877df56165a7090f4a44d8a6a51 --tree 578426be5d064e29a83bcc2df5411925cfb87261
+          if ($LASTEXITCODE -ne 0) { throw 'Native baseline verification failed' }
+          python -I -m venv "$root/venv"
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh venv failed' }
+          & "$root/venv/Scripts/python.exe" -I -m pip install "$($wheels[0].FullName)[dev,cloud]" 'pywinpty==2.0.15'
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated dependencies failed' }
+      - name: One pinned model experiment, no warmup or retry
+        timeout-minutes: 110
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          $wheels = @(Get-ChildItem "$root/native-evidence" -Filter 'nexus_agent_ai-*.whl' -Recurse -File)
+          if ($wheels.Count -ne 1) { throw 'Wheel missing' }
+          & "$root/venv/Scripts/python.exe" -I -B experiment/.github/experiments/qwen_recovery_probe.py --source-root "$env:GITHUB_WORKSPACE/baseline" --root $root --wheel $wheels[0].FullName --native-evidence "$root/native-evidence/native-gate.json" --deadline-file "$root/deadline.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Model experiment failed or incomplete, no rerun' }
+      - name: Always clean owned process trees
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          if (Test-Path "$root/venv/Scripts/python.exe") {
+            & "$root/venv/Scripts/python.exe" -I -B baseline/.github/qualification/interactive_core.py cleanup --root $root
+            if ($LASTEXITCODE -ne 0) { throw 'Owned process cleanup incomplete' }
+          }
+      - name: Always collect bounded synthetic evidence
+        if: always()
+        timeout-minutes: 2
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
+          python -I -B baseline/.github/qualification/verify_windows_interactive.py collect --output-root "$root/output" --upload-root "$root/upload"
+          if ($LASTEXITCODE -ne 0) { throw 'Evidence incomplete' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smollm3-windows-model-experiment
+          path: ${{ runner.temp }}/smollm3-experiment/upload
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 7
