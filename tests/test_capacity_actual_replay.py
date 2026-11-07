@@ -40,9 +40,7 @@ def no_runtime_calls(monkeypatch):
 
 @pytest.mark.parametrize("row,kind,tokens", [
     ("filler-2", "failure", None),
-    ("filler-2", "latest_success", 1531),
     ("filler-3", "failure", None),
-    ("filler-3", "latest_success", 1489),
 ])
 def test_original_capture_replays_exact_error_or_success_without_mutation(row, kind, tokens):
     snapshot = load_snapshot(row, kind)
@@ -82,11 +80,23 @@ def test_actual_filler3_full_nudge_is_rejected_before_another_request(tmp_path, 
     assert original["role"] == "assistant" and not original.get("tool_calls")
     assert nudge["role"] == "user" and nudge["metadata"] == {"internal": True}
     assert failure["projected_messages"] == failure["canonical_messages"]
-    assert [context.message_tokens(message) for message in (original, nudge)] == [91, 183]
+    # Token constants re-derived under max-view wire estimation (providers
+    # .messages.serialized_wire_views): canonical metadata is no longer
+    # charged, and each message is charged its largest ACTUAL adapter
+    # serialization (OpenAI canonical view, Anthropic content blocks, Gemini
+    # parts). Per message the delta vs the old basis is the adapter wrapper
+    # (+~8 tokens) minus the removed metadata: nudge 183 -> 182 (wrapper +8,
+    # metadata -9), original 91 -> 99 (wrapper +8, no metadata), lower bound
+    # 1661 -> 1734 (wrappers, plus the Gemini function_response bound-name
+    # duplication on the protected nameless results, charged in JSON-escaped
+    # wire form), pair 144 -> 142 (wrapper +16, metadata -18).
+    # The behavior contract below is unchanged: a rejected saved nudge must not
+    # infer, dispatch, retain, or commit fit state.
+    assert [context.message_tokens(message) for message in (original, nudge)] == [99, 182]
     report = replay.replay_snapshot(failure)
-    assert report["protected_lower_bound"]["tokens"] == 1661
+    assert report["protected_lower_bound"]["tokens"] == 1734
     assert report["effective_budget_tokens"] == 1564
-    assert report["checkpoint_accounting"][-1]["actual_pair_tokens"] == 144
+    assert report["checkpoint_accounting"][-1]["actual_pair_tokens"] == 142
 
     # Use the approved replay's combined numeric overhead surrogate, not private
     # prompts or invented tool schemas. Its planner/reserve policy is unchanged.
@@ -139,6 +149,56 @@ def test_actual_filler3_full_nudge_is_rejected_before_another_request(tmp_path, 
     assert agent.output_reserve == 512 and agent.last_trim == {"original": True}
     assert calls == []
     assert load_snapshot("filler-3", "failure") == failure
+
+
+def test_success_capture_filler2_now_fails_closed_at_both_reserves():
+    """filler-2's capture no longer fits even at the halved reserve.
+
+    Recorded at 1531 tokens under metadata-inclusive estimation. Under
+    max-view estimation the adapter wrappers on this tool-call-heavy,
+    metadata-light history exceed the removed phantom, so the replay fails
+    closed at reserve 512 AND at 256: no over-budget request is sent. That is
+    the intended fail-closed behavior, asserted as such; the snapshot is not
+    mutated.
+    """
+    snapshot = load_snapshot("filler-2", "latest_success")
+    before = copy.deepcopy(snapshot)
+    report = replay.replay_snapshot(snapshot)
+    assert report["status"] == "mismatch"
+    assert snapshot == before
+    assert report["token_identical"] is False
+    attempts = report["attempts"]
+    assert [(a["reserve"], a.get("error", {}).get("class")) for a in attempts] == [
+        (512, "ContextBudgetError"), (256, "ContextBudgetError")]
+
+
+def test_success_capture_filler3_replays_with_wrapper_net_increase():
+    """filler-3's capture still replays; the net basis shift is now upward.
+
+    Recorded at 1489 tokens under metadata-inclusive estimation. Under
+    max-view estimation this metadata-light capture replays at 1554 tokens:
+    the actual adapter wrappers (Anthropic content blocks / Gemini parts)
+    plus the Gemini function_response bound-name duplication on its nameless
+    stored results exceed the removed phantom bookkeeping. The reserve-halving contract is
+    unchanged (512 fails closed, 256 succeeds), genuine-pressure eviction and
+    the omission protocol still operate, and the fitted messages are
+    byte-identical to the capture - only the accounting changed.
+    """
+    snapshot = load_snapshot("filler-3", "latest_success")
+    before = copy.deepcopy(snapshot)
+    report = replay.replay_snapshot(snapshot)
+    assert report["status"] == "mismatch"
+    assert snapshot == before
+    assert report["token_identical"] is False
+    assert report["hashes"]["captured_fitted"] == report["hashes"]["replayed_fitted"]
+    attempts = report["attempts"]
+    assert attempts[0]["reserve"] == 512 and attempts[0].get("error", {}).get("class") == "ContextBudgetError"
+    assert attempts[-1]["reserve"] == 256 and "stats" in attempts[-1]
+    stats = report["replayed_result"]["stats"]
+    assert stats["tokens"] == 1554
+    assert stats["tokens"] > 1489  # wrappers + name binding exceeded phantom here
+    assert stats["omission_tokens"] == 142
+    assert stats["evicted_turns"] == 2
 
 
 def test_actual_filler2_receipt_floor_stays_notexecuted_and_unmodified():

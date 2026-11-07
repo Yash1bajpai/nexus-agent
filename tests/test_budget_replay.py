@@ -199,7 +199,13 @@ def test_previous_tool_body_is_blank_but_bindings_arguments_and_text_contribute(
     assert bound["tokens"] == context.history_tokens(minimal) + context.history_tokens(context._omission_pair())
     contribution = next(item for item in bound["messages"] if item["index"] == 2)
     assert contribution["blanked_tool_payloads"] == 1
-    assert contribution["lower_bound_tokens"] == context.message_tokens(minimal[2])
+    # The lower bound includes the Gemini function_response bound-name
+    # duplication: the stored result is nameless, so the bound "read_file"
+    # name is charged on top of the message itself, in its JSON-escaped wire
+    # form.
+    import json as _json
+    assert contribution["lower_bound_tokens"] == \
+        context.message_tokens(minimal[2]) + context.estimate_tokens(_json.dumps("read_file"))
     assert contribution["input_tokens"] > contribution["lower_bound_tokens"]
     assert bound["messages"][1]["input_hash"] == bound["messages"][1]["lower_bound_hash"]
     assert messages == original

@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .memory import is_genuine_user_message
 from .outcomes import fitted_claim_view
 from . import budget_diagnostics as diagnostics
+from ..providers.messages import applied_result_names, serialized_wire_views
 
 CHARS_PER_TOKEN = 3.5
 MESSAGE_OVERHEAD_TOKENS = 6
@@ -103,15 +104,46 @@ def estimate_tokens(text: str) -> int:
 
 
 def message_tokens(message: Dict[str, Any]) -> int:
+    # Charge the largest actual provider-bound serialization: canonical
+    # metadata is session bookkeeping that no adapter serializes, but adapter
+    # transformations (nested tool_use blocks, function_call parts) add their
+    # own structural wrappers, and no source-level cap bounds tool_calls per
+    # message, so no fixed per-message or per-call constant can provably cover
+    # them. serialized_wire_views returns the real per-adapter serializations;
+    # taking the maximum keeps the estimate at or above every supported
+    # adapter's actual wire by construction. The chars-per-token ratio and
+    # per-message overhead are unchanged, preserving the conservative margin
+    # over the final rendered template.
     try:
-        raw = json.dumps(message, default=str, ensure_ascii=False)
+        raw = max(serialized_wire_views(message).values(), key=len)
     except Exception:
         raw = str(message)
     return estimate_tokens(raw) + MESSAGE_OVERHEAD_TOKENS
 
 
 def history_tokens(messages: List[Dict[str, Any]]) -> int:
-    return sum(message_tokens(m) for m in messages)
+    # Additive per-message accounting, plus the one cross-message cost that is
+    # real and unbounded: Gemini's function_response duplicates the applied
+    # tool name onto every result. applied_result_names mirrors the adapter's
+    # ordered per-position precedence (most recent preceding call wins over
+    # the result's own 'name'), so a later call reusing an id never changes an
+    # earlier result's charge, and normalization-first: legacy native shapes
+    # (parts/function_call) bind only after _expand, exactly like the adapter.
+    # The surcharge is the applied name exactly once in its JSON-escaped wire
+    # form (raw str would under-charge quote, backslash and newline names),
+    # skipped only when the result's own wire view already carries that name. Per-message terms are exactly
+    # additive; across a slice cut that drops a binding, the parts can only
+    # sum to LESS than the whole (the surcharge stays with the retained
+    # total), so the fit's subtractive arithmetic (eviction, anchors,
+    # checkpoint projections) can over-retain, never under-retain - the
+    # conservative-safe direction.
+    total = 0
+    applied = applied_result_names(messages)
+    for index, message in enumerate(messages):
+        total += message_tokens(message)
+        for applied_name in applied.get(index, ()):
+            total += estimate_tokens(json.dumps(str(applied_name), ensure_ascii=False))
+    return total
 
 
 def tools_tokens(tools: Optional[list]) -> int:
@@ -484,6 +516,7 @@ def _diagnostic_checkpoint(view, msgs, starts, pinned, stats, cut, active_start,
             )
         lower_bound = 0
         protected = []
+        applied_names = applied_result_names(msgs)
         for offset, message in enumerate(msgs):
             original_index = cut + offset
             reason = ("pinned" if original_index in pinned else
@@ -498,6 +531,11 @@ def _diagnostic_checkpoint(view, msgs, starts, pinned, stats, cut, active_start,
                     if name is not None:
                         owner[key] = ""
             cost = message_tokens(minimal)
+            for applied_name in applied_names.get(offset, ()):
+                # Gemini's function_response duplicates the applied
+                # (unbounded) tool name onto the result; keep the lower
+                # bound consistent with history_tokens.
+                cost += estimate_tokens(json.dumps(str(applied_name), ensure_ascii=False))
             lower_bound += cost
             protected.append({"index": original_index, "reason": reason, "lower_bound_tokens": cost})
         diagnostics.fitter_checkpoint(

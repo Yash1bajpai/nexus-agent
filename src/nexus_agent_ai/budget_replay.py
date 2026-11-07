@@ -217,6 +217,7 @@ def _protected_bound(messages, record):
     pinned = context._pinned_read_messages(view)
     pinned.update(i for i, m in enumerate(view) if context._pinned_evidence(m))
     contributions, calls = [], {}
+    applied_names = context.applied_result_names(clean)
     for index, message in enumerate(clean):
         for call_id, name, arguments in context._tool_calls(message):
             calls[call_id] = (name or "unknown_tool", context._call_paths(arguments))
@@ -232,10 +233,17 @@ def _protected_bound(messages, record):
                 if name is not None:
                     owner[key] = ""
                     omitted += 1
+        surcharge = 0
+        for applied_name in applied_names.get(index, ()):
+            # Gemini's function_response duplicates the applied (unbounded)
+            # tool name onto the result; the lower bound must carry the same
+            # surcharge history_tokens charges.
+            surcharge += context.estimate_tokens(
+                json.dumps(str(applied_name), ensure_ascii=False))
         contributions.append({
             "index": index, "reason": reason,
-            "input_tokens": context.message_tokens(message),
-            "lower_bound_tokens": context.message_tokens(minimal),
+            "input_tokens": context.message_tokens(message) + surcharge,
+            "lower_bound_tokens": context.message_tokens(minimal) + surcharge,
             "blanked_tool_payloads": omitted,
             "input_hash": stable_hash(message), "lower_bound_hash": stable_hash(minimal),
         })

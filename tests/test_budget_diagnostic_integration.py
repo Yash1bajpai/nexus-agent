@@ -201,7 +201,13 @@ def test_real_adaptive_attempt_errors_and_success_replay_exactly(isolated):
     agent.memory.add_raw({"role": "user", "content": "fixture " * 125})
     agent.memory.add_raw({"role": "assistant", "content": "Earlier observation."})
     agent.memory.set_session_metadata("SESSION_RECORD", RECORD)
-    wanted = 4096 - 512 - 500
+    # +19: the omission anchor/acknowledgement pair's {"internal": true}
+    # bookkeeping (19 tokens after integer rounding) is no longer charged
+    # under wire-view estimation; grow the synthetic system prompt by the
+    # same amount so the reserve-halving boundary (512 fails, 256 succeeds)
+    # is exercised as before. +18 lands exactly on the fit boundary and
+    # passes at 512; +19 restores the 1-token overflow.
+    wanted = 4096 - 512 - 500 + 19
     agent.system = "s" * math.ceil((wanted - 1) * context.CHARS_PER_TOKEN)
     with diagnostics.activate_scope(Path(isolated["scope_path"]), "seed"):
         assert agent.run(diagnostics.frozen_argv("seed")[-1]) == "Synthetic observation."

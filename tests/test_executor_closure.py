@@ -101,7 +101,12 @@ def test_closed_turn_eviction_preserves_native_bindings_and_canonical_bytes(proj
     assert stats["evicted_closed_turns"] == 1
     assert fitted[0]["content"].splitlines()[0] == (
         f"Older turns evicted ({count}/50 index only; 1 ended without an answer).")
-    assert fitted[0]["content"].endswith(ANCHOR)
+    # Wire-view estimation no longer charges the pair's {"internal": true}
+    # bookkeeping, so the retained-fields lines now fit under the 150-token
+    # omission allowance and follow the anchor. Assert the anchor's
+    # structural position (line 2, before any retained-fields lines) rather
+    # than its old terminal position.
+    assert fitted[0]["content"].splitlines()[1] == ANCHOR
     assert fitted[1]["content"] == ACK
     assert stats["omission_tokens"] == ctx.history_tokens(fitted[:2]) <= 150
     assert fitted[2:] == flatten(turns[count:])

@@ -144,6 +144,31 @@ def openai_messages(messages):
     ]
 
 
+# Fields every provider adapter serializes onto the wire. Canonical metadata
+# (executor facts, refusal classes, mutation outcomes, claim records) is
+# session bookkeeping: openai_messages strips it, and the anthropic/gemini
+# translations below never carry it either. Estimating context cost over this
+# boundary charges what is actually sent, never the bookkeeping.
+_WIRE_MESSAGE_FIELDS = ("role", "content", "tool_calls", "tool_call_id", "name", "parts")
+
+
+def wire_message(message):
+    """The provider-visible field set of one normalized message.
+
+    Canonical view within serialized_wire_views, the estimator's cost basis:
+    every adapter (openai_messages, anthropic_messages, gemini_messages)
+    serializes only these fields plus its own structural wrapper, which the
+    estimator accounts by taking the maximum actual serialization rather than
+    an assumed constant. 'name' is kept although the
+    OpenAI adapter drops it on tool results, because the Gemini
+    function_response binding sends it; keeping it can only over-estimate.
+    'parts' is the Gemini adapter's serialized container; keeping it means a
+    Gemini-shaped view passed back through the estimator is still charged for
+    its payload instead of being under-counted as an empty shell.
+    """
+    return {k: message[k] for k in _WIRE_MESSAGE_FIELDS if k in message}
+
+
 def anthropic_messages(messages):
     output = []
     for m in normalize_messages(messages):
@@ -196,6 +221,91 @@ def gemini_messages(messages):
         else:
             output.append({"role": role, "parts": parts or [{"text": ""}]})
     return output
+
+
+def serialized_wire_views(message):
+    """Actual provider-bound serializations of one message, for cost accounting.
+
+    Returns {view_name: json_string}: the canonical wire_message view plus each
+    supported adapter's single-message serialization. Tool-call wrapper cost is
+    structural and no source-level cap bounds tool_calls per message (the
+    agent's iteration cap does not), so no fixed per-call constant can provably
+    cover every adapter's nested conversion; the honest basis is the actual
+    transformed view. The estimator takes the maximum across these views, so
+    the estimate can never sit below any supported adapter's real serialization
+    by construction. A view that rejects a partial or projected shape (for
+    example a Gemini function_response without a bound name) is skipped; the
+    wire view remains and already charges every adapter-serialized payload
+    field, including 'parts'.
+    """
+    views = {"wire": json.dumps(wire_message(message), default=str, ensure_ascii=False)}
+    for name, transform in (("openai", openai_messages),
+                            ("anthropic", anthropic_messages),
+                            ("gemini", gemini_messages)):
+        try:
+            transformed = transform([message])
+            # One message in normally means one serialized message out; charge
+            # that message, not the list wrapper. If an adapter merged or
+            # split it, charge the whole serialized list instead.
+            views[name] = json.dumps(
+                transformed[0] if len(transformed) == 1 else transformed,
+                default=str, ensure_ascii=False)
+        except Exception:
+            continue
+    return views
+
+
+def applied_result_names(messages):
+    """Per-original-message tool-result names to charge, adapter-exact.
+
+    The Gemini adapter normalizes first (normalize_messages) and THEN binds:
+    legacy native shapes (parts with function_call/function_response,
+    tool_use/tool_result blocks) become canonical calls/results before the
+    binding pass, and empty result ids are matched to a pending call by name.
+    A raw pass over message["tool_calls"] misses names embedded in those
+    legacy shapes (owner-reproduced: parts function_call with a 1000-char
+    name + nameless result estimated 363 vs 639 actual). This pass mirrors
+    the adapter exactly: each original message is expanded the same way
+    (_expand), bindings are recorded in conversation order, and each result's
+    applied name is the most recent PRECEDING binding for its call id,
+    preferred over the result's own 'name'.
+
+    Returns {original_index: [names to charge]}: one entry per result whose
+    applied name is not already carried by that result's own wire view
+    (canonical 'name' field or legacy parts payload). Compound native
+    messages that expand to several sub-messages map all of their surcharges
+    to the original index. A message that fails expansion falls back to a raw
+    pass over its own fields. A result with neither binding nor explicit
+    name has no applied name - the adapter refuses such requests at send
+    time, so there is no wire cost to charge.
+    """
+    bindings, applied, pending = {}, {}, []
+    for index, message in enumerate(messages):
+        try:
+            expanded = _expand(message)
+        except Exception:
+            expanded = [message]
+        for m in expanded:
+            for call in m.get("tool_calls") or []:
+                try:
+                    call_id, call_name = call["id"], call["function"]["name"]
+                except (KeyError, TypeError):
+                    continue
+                bindings[call_id] = call_name
+                pending.append((call_id, call_name))
+            if m.get("role") != "tool":
+                continue
+            call_id = m.get("tool_call_id")
+            explicit = m.get("name")
+            if not call_id:
+                match = next(((i, n) for i, n in pending if n == explicit), None)
+                if match:
+                    call_id = match[0]
+            pending = [(i, n) for i, n in pending if i != call_id]
+            applied_name = bindings.get(call_id) or explicit
+            if applied_name and applied_name != explicit:
+                applied.setdefault(index, []).append(applied_name)
+    return applied
 
 
 def extract_json_tool_calls(text):
