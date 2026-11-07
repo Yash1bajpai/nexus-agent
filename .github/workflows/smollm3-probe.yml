@@ -1,7 +1,7 @@
-name: Isolated Qwen3-4B-Instruct-2507 Windows model experiment (repeat on v16-r8v5 qualification wheel)
+name: Isolated Qwen3-4B-Instruct-2507 Windows model experiment (deterministic forced-refusal recovery probe on v16-r8v5 wheel)
 on:
   push:
-    branches: [experiment/qwen3-4b-2507-v16r8v5-20261107-0927-f803d5d1]
+    branches: [experiment/qwen3-4b-2507-v16r8v5-20261107-recovery-f803d5d1]
 permissions:
   contents: read
   actions: read
@@ -19,7 +19,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: experiment
+          fetch-depth: 2
           persist-credentials: false
+      - name: Fail-closed candidate seal verification
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $seal = Get-Content -Raw experiment/.github/experiments/candidate-seal.json | ConvertFrom-Json
+          $c1 = git -C experiment rev-parse HEAD~1
+          if ($LASTEXITCODE -ne 0 -or $c1 -ne $seal.c1_commit) { throw 'Candidate content commit differs from reviewed seal' }
+          $t1 = git -C experiment rev-parse 'HEAD~1^{tree}'
+          if ($LASTEXITCODE -ne 0 -or $t1 -ne $seal.c1_tree) { throw 'Candidate content tree differs from reviewed seal' }
+          $changed = @(git -C experiment diff --name-only HEAD~1 HEAD)
+          if ($changed.Count -ne 1 -or $changed[0] -ne '.github/experiments/candidate-seal.json') { throw 'Candidate seal commit modifies more than the seal file' }
+          if (git -C experiment status --porcelain) { throw 'Candidate experiment checkout is dirty' }
+          $probeHash = (Get-FileHash -Algorithm SHA256 experiment/.github/experiments/qwen_recovery_probe.py).Hash.ToLower()
+          if ($probeHash -ne $seal.probe_sha256) { throw 'Candidate probe bytes differ from reviewed seal' }
+          $ymlHash = (Get-FileHash -Algorithm SHA256 experiment/.github/workflows/smollm3-probe.yml).Hash.ToLower()
+          if ($ymlHash -ne $seal.workflow_sha256) { throw 'Candidate workflow bytes differ from reviewed seal' }
       - uses: actions/checkout@v4
         with:
           ref: f803d5d16add2edb0963b181ee530e75cbcf91d8
@@ -30,12 +46,20 @@ jobs:
         with:
           python-version: '3.12'
       - name: Fresh isolated root and work deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
           if (Test-Path $root) { throw 'Experiment root already exists' }
           New-Item -ItemType Directory $root | Out-Null
-          @{work_deadline_utc=([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()+110*60);job_limit_minutes=120;reserve_minutes=10} | ConvertTo-Json | Set-Content -Encoding utf8 "$root/deadline.json"
+          # Anchor the unchanged 110-minute work deadline to the workflow run's
+          # actual start, not to this step: checkout/seal/setup time before this
+          # step must not erode the cleanup/evidence reserve inside the 120-minute job cap.
+          $runMeta = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $runMeta.run_started_at) { throw 'Run start anchor unavailable' }
+          $started = [DateTimeOffset]::Parse($runMeta.run_started_at)
+          @{work_deadline_utc=($started.ToUnixTimeSeconds()+110*60);job_limit_minutes=120;reserve_minutes=10;anchored_to='run_started_at';run_started_at=$runMeta.run_started_at} | ConvertTo-Json | Set-Content -Encoding utf8 "$root/deadline.json"
       - name: Verify unchanged actual attempt-one native baseline
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,7 +93,7 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'smollm3-experiment'
           $wheels = @(Get-ChildItem "$root/native-evidence" -Filter 'nexus_agent_ai-*.whl' -Recurse -File)
           if ($wheels.Count -ne 1) { throw 'Wheel missing' }
-          & "$root/venv/Scripts/python.exe" -I -B experiment/.github/experiments/smollm3_probe.py --source-root "$env:GITHUB_WORKSPACE/baseline" --root $root --wheel $wheels[0].FullName --native-evidence "$root/native-evidence/native-gate.json" --deadline-file "$root/deadline.json"
+          & "$root/venv/Scripts/python.exe" -I -B experiment/.github/experiments/qwen_recovery_probe.py --source-root "$env:GITHUB_WORKSPACE/baseline" --root $root --wheel $wheels[0].FullName --native-evidence "$root/native-evidence/native-gate.json" --deadline-file "$root/deadline.json"
           if ($LASTEXITCODE -ne 0) { throw 'Model experiment failed or incomplete, no rerun' }
       - name: Always clean owned process trees
         if: always()
