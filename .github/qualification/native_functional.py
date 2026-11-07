@@ -98,8 +98,9 @@ def stage_tests(source_root, destination, frozen):
     # Stage the candidate payloads as read-only neutral data for route tests
     # Never placed in importable src/
     candidate_gate = load_module(source_root / ".github/qualification/verify_windows_native.py", "native_gate_for_staging")
+    interactive_gate = load_module(source_root / ".github/qualification/verify_windows_interactive.py", "interactive_gate_for_staging")
     candidate_payloads = {}
-    for name in sorted(candidate_gate.ALLOWED_PATHS):
+    for name in sorted(candidate_gate.ALLOWED_PATHS | interactive_gate.ALLOWED_PATHS):
         p_src = source_root / name
         require(p_src.is_file() and not p_src.is_symlink(), "Missing candidate payload file: " + name)
         p_blob = p_src.read_bytes()

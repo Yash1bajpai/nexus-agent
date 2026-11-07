@@ -45,7 +45,9 @@ def candidate(tmp_path, monkeypatch):
 
     # Base setup: baseline files present before candidate
     repo.write("src/preserved.py", "frozen production baseline\n")
-    for name in gate.MODIFIED_PATHS:
+    # The native gate always binds the interactive verifier out of band, so the
+    # baseline must carry it even when it is not part of the candidate delta.
+    for name in gate.MODIFIED_PATHS | {gate.INTERACTIVE_GATE_PATH}:
         repo.write(name, "baseline unmodified content\n")
     base_tree = repo.stage_tree()
     base = repo.commit_tree(base_tree, message="synthetic grounded base")
@@ -127,7 +129,7 @@ def test_github_sha_mismatch_against_approved_seal_rejected(candidate, monkeypat
 @pytest.mark.parametrize("change", ["extra", "existing_modified", "missing", "wrong_pin", "executable", "symlink"])
 def test_candidate_refuses_scope_content_or_mode_change(candidate, change):
     c = candidate
-    selected = "src/nexus_agent_ai/agent/core.py"  # a declared, non-verifier payload path
+    selected = sorted(c.gate.PAYLOAD_SHA256)[0]  # a declared, non-verifier payload path, derived from the gate under test
     if change == "extra":
         c.repo.write("unreviewed.py", "unexpected\n")
     elif change == "existing_modified":
@@ -148,7 +150,7 @@ def test_candidate_refuses_scope_content_or_mode_change(candidate, change):
 def test_payload_table_must_pin_exact_non_verifier_files(candidate, monkeypatch):
     c = candidate
     pins = dict(c.gate.PAYLOAD_SHA256)
-    pins.pop("src/nexus_agent_ai/agent/core.py")
+    pins.pop(next(iter(pins)))  # any one dropped pin must fail closed, independent of the current payload set
     monkeypatch.setattr(c.gate, "PAYLOAD_SHA256", pins)
     with pytest.raises(c.gate.ReviewError, match="non-verifier candidate files"):
         c.gate.verify_tree(c.repo.path, c.tree)
@@ -253,6 +255,15 @@ def test_native_staging_produces_isolated_suite_without_src(tmp_path):
     # Candidate payloads for staging
     candidate_gate = load_gate()
     for name in candidate_gate.ALLOWED_PATHS:
+        repo.write(name, get_payload_blob(ROOT, name))
+    # Dual-gate staging also reads the interactive gate's payloads.
+    ispec = importlib.util.spec_from_file_location(
+        "q1_interactive_gate_for_staging",
+        ROOT / ".github/qualification/verify_windows_interactive.py",
+    )
+    ig = importlib.util.module_from_spec(ispec)
+    ispec.loader.exec_module(ig)
+    for name in ig.ALLOWED_PATHS:
         repo.write(name, get_payload_blob(ROOT, name))
     repo.write("src/unstaged.py", "must not be imported or staged\n")
     repo.stage_tree()
