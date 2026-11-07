@@ -9,17 +9,18 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 import sys
 import time
 import urllib.request
 
 BASE_COMMIT = 'f803d5d16add2edb0963b181ee530e75cbcf91d8'
 BASE_TREE = '7f371e3d8acf46c6091527cad19b02faed68ef0a'
-MODEL_REPO = 'ggml-org/SmolLM3-3B-GGUF'
-MODEL_FILE = 'SmolLM3-Q4_K_M.gguf'
-MODEL_REVISION = '4965cb60b150737b68a0408c36aeefb65078f894'
-MODEL_SHA = '8334b850b7bd46238c16b0c550df2138f0889bf433809008cc17a8b05761863e'
-MODEL_SIZE = 1915305312
+MODEL_REPO = 'unsloth/Qwen3-4B-Instruct-2507-GGUF'
+MODEL_FILE = 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf'
+MODEL_REVISION = 'a06e946bb6b655725eafa393f4a9745d460374c9'
+MODEL_SHA = '3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597'
+MODEL_SIZE = 2497281120
 HARNESS_SHA = 'a96392bef56afc1ff8faf1fbc89648364c5e2fc2d7f12ba657d5d4ca0ba53da0'
 MODEL_URL = f'https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{MODEL_FILE}'
 
@@ -30,6 +31,55 @@ def sha(path):
         for block in iter(lambda: f.read(4 * 1024 * 1024), b''):
             h.update(block)
     return h.hexdigest()
+
+
+class PeakMemorySampler:
+    """Telemetry-only peak RSS sampler for llama-server processes under the
+    experiment root. Never alters the run: read-only psutil polls on a daemon
+    thread, written once in the finally block. A sampling failure records an
+    error string, never a changed outcome."""
+
+    def __init__(self, root):
+        self._root = Path(root).resolve()
+        self._stop = threading.Event()
+        self.samples = 0
+        self.peak = {}
+        self.error = None
+
+    def _poll_once(self):
+        import psutil
+        for proc in psutil.process_iter(['pid', 'name', 'exe']):
+            try:
+                exe = proc.info.get('exe') or ''
+                if 'llama-server' not in (proc.info.get('name') or '') or not exe:
+                    continue
+                if not Path(exe).resolve().is_relative_to(self._root):
+                    continue
+                rss = proc.memory_info().rss
+                key = str(proc.info['pid'])
+                if rss > self.peak.get(key, 0):
+                    self.peak[key] = rss
+                self.samples += 1
+            except Exception:
+                continue
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self._poll_once()
+            except Exception as exc:
+                self.error = type(exc).__name__
+            self._stop.wait(2.0)
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=5)
+        return False
 
 
 def main():
@@ -54,7 +104,7 @@ def main():
     core = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(core)
     core.MODEL_SHA256 = MODEL_SHA
-    core.MODEL_REL = Path('.nexus-agent/models/ggml-org--SmolLM3-3B-GGUF') / MODEL_FILE
+    core.MODEL_REL = Path('.nexus-agent/models/unsloth--Qwen3-4B-Instruct-2507-GGUF') / MODEL_FILE
     original_env = core.child_environment
     end = json.loads(Path(args.deadline_file).read_text(encoding='utf-8-sig'))['work_deadline_utc']
 
@@ -98,38 +148,44 @@ def main():
 
     core.child_environment = model_only_env
     args.commit, args.tree = BASE_COMMIT, BASE_TREE
-    try:
-        return core.run_driver(args)
-    finally:
-        # Diagnostic capture cannot mask the protocol outcome or skip its cleanup.
-        output = root / 'output'
+    with PeakMemorySampler(root) as sampler:
         try:
-            output.mkdir(parents=True, exist_ok=True)
-            logs = root / 'home/.nexus-agent/llama-server'
-            if logs.is_symlink() or not logs.resolve().is_relative_to(root.resolve()):
-                raise RuntimeError('Unsafe owned log directory')
-            for index, log in enumerate(sorted(logs.glob('server-*.log')) if logs.exists() else []):
-                if index >= 4 or log.is_symlink() or not log.is_file() or not log.resolve().is_relative_to(logs.resolve()):
-                    continue
-                cap = 2 * 1024 * 1024
-                core.check_evidence_cap(output, reserve=cap + core.MANIFEST_RESERVE)
-                with log.open('rb') as stream:
-                    raw = stream.read(cap + 1)
-                # Child environment contains no tokens and corpus is synthetic.
-                # Still redact conventional credential-shaped assignments defensively.
-                import re
-                text = raw[:cap].decode('utf-8', errors='replace')
-                text = re.sub(r'(?i)(authorization|api[_-]?key|access[_-]?token|password)([=: ]+)[^\s,;]+', r'\1\2[REDACTED]', text)
-                encoded = text.encode('utf-8')[:cap]
-                (output / f'model-server-{index}.log').write_bytes(encoded)
-                (output / f'model-server-{index}-capture.json').write_text(json.dumps({
-                    'owned_file': log.name, 'original_bytes': log.stat().st_size,
-                    'captured_bytes': len(encoded), 'truncated': len(raw) > cap,
-                    'meaning': 'Actual load/template/thinking diagnostics, not a separate model invocation'}, indent=2), encoding='utf-8')
-            core.check_evidence_cap(output)
-        except Exception as error:
-            # Log collection failure is evidence incompleteness, never a changed model score.
-            print('MODEL_LOG_CAPTURE_INCOMPLETE:' + type(error).__name__, file=sys.stderr)
+            return core.run_driver(args)
+        finally:
+            # Diagnostic capture cannot mask the protocol outcome or skip its cleanup.
+            output = root / 'output'
+            try:
+                output.mkdir(parents=True, exist_ok=True)
+                (output / 'peak-memory.json').write_text(json.dumps({
+                    'kind': 'TELEMETRY_ONLY_PEAK_RSS_SAMPLES',
+                    'samples': sampler.samples,
+                    'peak_rss_bytes_by_pid': sampler.peak,
+                    'sampler_error': sampler.error}, indent=2), encoding='utf-8')
+                logs = root / 'home/.nexus-agent/llama-server'
+                if logs.is_symlink() or not logs.resolve().is_relative_to(root.resolve()):
+                    raise RuntimeError('Unsafe owned log directory')
+                for index, log in enumerate(sorted(logs.glob('server-*.log')) if logs.exists() else []):
+                    if index >= 4 or log.is_symlink() or not log.is_file() or not log.resolve().is_relative_to(logs.resolve()):
+                        continue
+                    cap = 2 * 1024 * 1024
+                    core.check_evidence_cap(output, reserve=cap + core.MANIFEST_RESERVE)
+                    with log.open('rb') as stream:
+                        raw = stream.read(cap + 1)
+                    # Child environment contains no tokens and corpus is synthetic.
+                    # Still redact conventional credential-shaped assignments defensively.
+                    import re
+                    text = raw[:cap].decode('utf-8', errors='replace')
+                    text = re.sub(r'(?i)(authorization|api[_-]?key|access[_-]?token|password)([=: ]+)[^\s,;]+', r'\1\2[REDACTED]', text)
+                    encoded = text.encode('utf-8')[:cap]
+                    (output / f'model-server-{index}.log').write_bytes(encoded)
+                    (output / f'model-server-{index}-capture.json').write_text(json.dumps({
+                        'owned_file': log.name, 'original_bytes': log.stat().st_size,
+                        'captured_bytes': len(encoded), 'truncated': len(raw) > cap,
+                        'meaning': 'Actual load/template/thinking diagnostics, not a separate model invocation'}, indent=2), encoding='utf-8')
+                core.check_evidence_cap(output)
+            except Exception as error:
+                # Log collection failure is evidence incompleteness, never a changed model score.
+                print('MODEL_LOG_CAPTURE_INCOMPLETE:' + type(error).__name__, file=sys.stderr)
 
 
 
