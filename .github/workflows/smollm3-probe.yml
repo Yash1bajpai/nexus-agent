@@ -1,7 +1,7 @@
-name: Isolated Qwen3-4B-Instruct-2507 Windows model experiment (repeat on v16-r8v5 qualification wheel)
+name: Isolated Qwen3-4B-Instruct-2507 Windows model experiment (run-to-run repeat 2 on v16-r8v5 qualification wheel)
 on:
   push:
-    branches: [experiment/qwen3-4b-2507-v16r8v5-20261107-0927-f803d5d1]
+    branches: [experiment/qwen3-4b-2507-v16r8v5-20261107-1412-f803d5d1-r2]
 permissions:
   contents: read
   actions: read
