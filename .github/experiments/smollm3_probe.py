@@ -62,6 +62,7 @@ def main():
         env = original_env(home, temporary, workspace)
         env['NEXUS_AGENT_MODEL_REPO'] = MODEL_REPO
         env['NEXUS_AGENT_MODEL_FILENAME'] = MODEL_FILE
+        env['NEXUS_AGENT_ENABLE_THINKING'] = '1'
         target = Path(home) / core.MODEL_REL
         if target.exists():
             raise RuntimeError('Model destination not fresh')

@@ -1,7 +1,7 @@
-name: Isolated SmolLM3 thinking-OFF Windows model experiment (repeat on v16-r8v5 qualification wheel)
+name: Isolated SmolLM3 thinking-ON Windows model experiment (repeat on v16-r8v5 qualification wheel)
 on:
   push:
-    branches: [experiment/smollm3-thinkingoff-v16r8v5-20261106-2256-f803d5d1]
+    branches: [experiment/smollm3-thinkingon-v16r8v5-20261107-0830-f803d5d1]
 permissions:
   contents: read
   actions: read
