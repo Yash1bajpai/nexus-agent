@@ -47,6 +47,14 @@ def read_regular_bytes(path: Path, limit: int) -> bytes:
     def identity(st):
         return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
+    def cross_identity(st):
+        if os.name != "nt":
+            return identity(st)
+        # CPython 3.12 Windows pathname ctime is birthtime while descriptor
+        # ctime is ChangeTime. Never equate these cross-API meanings.
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+                getattr(st, "st_birthtime_ns", None))
+
     before = path.lstat()
     for parent in path.absolute().parents:
         pst = parent.lstat()
@@ -60,14 +68,15 @@ def read_regular_bytes(path: Path, limit: int) -> bytes:
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
         opened = os.fstat(fd)
-        if identity(before) != identity(opened):
+        if cross_identity(before) != cross_identity(opened):
             raise ValueError("File identity changed before read")
         with os.fdopen(fd, "rb", closefd=False) as f:
             data = f.read(limit + 1)
         after = os.fstat(fd)
         current = path.lstat()
         if (len(data) > limit or identity(opened) != identity(after)
-                or identity(after) != identity(current)
+                or identity(before) != identity(current)
+                or cross_identity(after) != cross_identity(current)
                 or getattr(current, "st_file_attributes", 0) & 0x400):
             raise ValueError("File changed during read or exceeded limit")
         return data

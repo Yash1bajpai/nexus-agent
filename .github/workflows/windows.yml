@@ -39,7 +39,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           $observerHash = (Get-FileHash ci/observe_normal_turns.py -Algorithm SHA256).Hash.ToLower()
           Write-Host "Observer source SHA256: $observerHash"
-          if ($observerHash -ne '5a44f1da6e0cb3e6089b1cfc1e5bd9a67c5473bee1f45711ea444c3890925843') { throw 'Observer source changed' }
+          if ($observerHash -ne 'e8e72487c119d2a1355f7560000af1cc697ef071bb8a9a054c5d54a2db8e937e') { throw 'Observer source changed' }
           python ci/reader_diagnostic.py
           $rc = $LASTEXITCODE
           Write-Host "Reader diagnostic raw exit code: $rc"
