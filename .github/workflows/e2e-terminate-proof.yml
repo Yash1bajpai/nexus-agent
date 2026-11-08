@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - experiment/terminate-confirm-proof-20261108-1750
+      - experiment/terminate-confirm-proof-20261108-1834
 
 permissions: {}
 

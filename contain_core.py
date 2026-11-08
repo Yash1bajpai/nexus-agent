@@ -932,13 +932,13 @@ def terminate_and_confirm(
         return TerminationResult(
             status="KILL_UNCONFIRMED",
             stage="child_survivors",
-            evidence={"child_pids": sweep.child_pids, "sweep_ms": sweep_ms},
+            evidence={"child_pids": sweep.child_pids, "error_details": sweep.error_details, "sweep_ms": sweep_ms},
         )
     elif sweep.indeterminate_pids:
         return TerminationResult(
             status="KILL_UNCONFIRMED",
             stage="indeterminate",
-            evidence={"indeterminate_pids": sweep.indeterminate_pids, "sweep_ms": sweep_ms},
+            evidence={"indeterminate_pids": sweep.indeterminate_pids, "error_details": sweep.error_details, "sweep_ms": sweep_ms},
         )
     else:
         return TerminationResult(

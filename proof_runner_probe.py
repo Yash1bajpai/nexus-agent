@@ -61,7 +61,7 @@ if str(SELF_DIR) not in sys.path:
     sys.path.insert(0, str(SELF_DIR))
 
 EXPECTED_SHA256 = {
-    "contain_core.py": "41ad522dbe3366d30e611a179ab176459af685fe2858ea9524e2f9d7a3cb53cd",
+    "contain_core.py": "14d6a4fe28736db2b2a1694a82d8f308e0e624bbc3e68e4912207b06b30e06f0",
     "contain_core_selftest.py": "fbcdb4ea002d90568d1f391fbd65afceeb7246cf9ee064196e6c72d98beb676c",
 }
 
