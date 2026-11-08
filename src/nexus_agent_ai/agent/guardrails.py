@@ -87,6 +87,7 @@ _TOOL_ACTION = r"(?:run_code|search_web|read_file|run_tests|patch_file|write_fil
 _ACTION_PROMISE = re.compile(
     r"\bi(?:'ll|\s+will|\s+am\s+going\s+to)\s+(?:now\s+)?"
     r"(?:verify|run(?!\s+through\b)|execute|search|check|read|patch|edit|test|"
+    r"modify\s+(?:the\s+)?(?:function|code|file)\b|"
     r"use\s+(?:the\s+)?" + _TOOL_ACTION + r"|" + _TOOL_ACTION + r")\b|"
     r"\b" + _TOOL_ACTION + r"\s+"
     r"(?:initiated|started|running)\b",

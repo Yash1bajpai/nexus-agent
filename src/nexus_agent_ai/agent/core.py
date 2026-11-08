@@ -169,15 +169,52 @@ _RETRY_REQUEST = re.compile(
 )
 
 
+_CONTEXTUAL_RETURN_EDIT = re.compile(
+    r"^(?:now\s+)?(?:please\s+)?make\s+(?:it|this\s+function|that\s+function)\s+return\b",
+    re.IGNORECASE,
+)
+
+
+def _affirmative_code_edit(request: str) -> bool:
+    """Conservative antecedent gate, not a general natural-language classifier."""
+    if not re.match(
+        r"^(?:please\s+)?(?:fix|change|edit|modify|update|replace|rewrite|refactor|patch|"
+        r"rename|implement|add|remove|delete)\b", request.strip(), re.IGNORECASE,
+    ):
+        return False
+    if re.search(r"\b(?:not|never|no|cancel|cancelled|canceled|stop)\b|\bdon['’]t\b",
+                 request, re.IGNORECASE):
+        return False
+    return bool(re.search(
+        r"\b(?:code|function|method|class)\b|"
+        r"[\w./\\-]+\.(?:py|js|ts|jsx|tsx|java|c|cpp|h|go|rs|rb)\b",
+        request, re.IGNORECASE,
+    ))
+
+
 def _routing_request(user_input: str, history: list) -> str:
-    """Resolve bare retries against the last real request, never internal nudges."""
-    if not _RETRY_REQUEST.fullmatch(user_input.strip()):
+    """Resolve retries and narrow return-value followups from real user context."""
+    retry = bool(_RETRY_REQUEST.fullmatch(user_input.strip()))
+    followup = bool(_CONTEXTUAL_RETURN_EDIT.match(function_request_prose(user_input).strip()))
+    if not retry and not followup:
         return user_input
     for message in reversed(history):
         if is_genuine_user_message(message):
             previous = message.get("content", "")
-            if isinstance(previous, str) and not _RETRY_REQUEST.fullmatch(previous.strip()):
-                return previous
+            if not isinstance(previous, str):
+                return user_input
+            if retry:
+                if not _RETRY_REQUEST.fullmatch(previous.strip()):
+                    return previous
+                continue
+            # Only the nearest genuine request can supply the antecedent. Strip
+            # quoted examples and attached source before inspecting that request.
+            prior_request = function_request_prose(previous)
+            if _affirmative_code_edit(prior_request):
+                # Carry intent, not old requirements or source text. The provider
+                # still sees the original short prompt and its actual history.
+                return "Modify the previously requested code. " + user_input
+            return user_input
     return user_input
 
 
