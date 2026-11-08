@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - experiment/terminate-confirm-proof-20261108-0956
+      - experiment/terminate-confirm-proof-20261108-1039
 
 permissions: {}
 
@@ -66,7 +66,8 @@ jobs:
           # Bounded 15s observational delay: survivors are intentionally left alive for this
           # window to distinguish in-flight runner handling from abandoned processes. This is
           # acceptable ONLY because this job runs on a disposable GitHub-hosted VM used for nothing else.
-          python proof_runner_probe.py --mode check-survivors --nonce "$env:PROBE_NONCE" --log probe_timeout.log
+          python proof_runner_probe.py --mode check-survivors --nonce "$env:PROBE_NONCE" --log probe_timeout.log | Tee-Object -FilePath survivor_check_step.log
+          exit $LASTEXITCODE
 
       - name: Verify demonstrated timeout gating
         if: always()
@@ -92,6 +93,7 @@ jobs:
           path: |
             probe_timeout.log
             probe_timeout_verification.json
+            survivor_check_step.log
 
   probe-account:
     runs-on: windows-latest
@@ -128,6 +130,7 @@ jobs:
 
   proof-p1-p3:
     needs: [probe-timeout, probe-account]
+    if: always()
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -138,6 +141,35 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Download timeout probe evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: probe-timeout-evidence
+          path: probe_evidence/timeout
+
+      - name: Download account probe evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: probe-account-evidence
+          path: probe_evidence/account
+
+      - name: Evaluate explicit prerequisites (fail-closed)
+        shell: powershell
+        run: |
+          $expected_sha256 = "e10b703658f3f417a816003d54232bb4fe614a03b38762775a9b1fc61551ed62"
+          $eval_path = "proof_gate_evaluate.py"
+          if (-not (Test-Path $eval_path)) {
+            Write-Error "ABORT: proof_gate_evaluate.py missing"
+            exit 1
+          }
+          $actual_sha256 = (Get-FileHash -Path $eval_path -Algorithm SHA256).Hash.ToLower()
+          if ($actual_sha256 -ne $expected_sha256.ToLower()) {
+            Write-Error "ABORT: SHA-256 mismatch for proof_gate_evaluate.py: want $expected_sha256, got $actual_sha256"
+            exit 1
+          }
+          python proof_gate_evaluate.py --evidence-root probe_evidence --out proof_gate_eval.json
+          exit $LASTEXITCODE
 
       - name: P1-P3 narrow proof (hash-verified entrypoint)
         id: proof_step
@@ -161,3 +193,4 @@ jobs:
             proof_scope_evidence.json
             proof_principal_receipt.json
             proof_cleanup_evidence.json
+            proof_gate_eval.json
