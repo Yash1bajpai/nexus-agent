@@ -650,6 +650,14 @@ def execute_run_code(code: str, language: str = "python") -> str:
         out = res.stdout.strip()
         err = res.stderr.strip()
         output = ""
+        if res.returncode != 0:
+            output = f"ERROR: Process exited with return code {res.returncode}.\n"
+            if out:
+                output += f"STDOUT:\n{out}\n"
+            if err:
+                output += f"STDERR:\n{err}\n"
+            return output.strip()
+
         if out:
             output += f"STDOUT:\n{out}\n"
         if err:
@@ -661,6 +669,7 @@ def execute_run_code(code: str, language: str = "python") -> str:
         return f"ERROR: Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds."
     except Exception as e:
         return f"ERROR: Code execution failed: {str(e)}"
+
 
 def execute_search_web(query: str) -> str:
     """Return formatted results (ok), or an ERROR with a stable search category.
