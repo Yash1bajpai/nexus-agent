@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - experiment/terminate-confirm-proof-20261108-1112
+      - experiment/terminate-confirm-proof-20261108-1233
 
 permissions: {}
 
@@ -180,6 +180,24 @@ jobs:
           python proof_gate_evaluate.py --evidence-root probe_evidence --out proof_gate_eval.json
           exit $LASTEXITCODE
 
+      - name: Diagnose CreateProcessWithLogonW cwd context (bounded)
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          $expected_sha256 = "5e6dd1615591ee3f3db2a42a45529d8ffe70183498ecf665a0f02b76441d9238"
+          $diag_path = "proof_cplw_diag.py"
+          if (-not (Test-Path $diag_path)) {
+            Write-Error "ABORT: proof_cplw_diag.py missing"
+            exit 1
+          }
+          $actual_sha256 = (Get-FileHash -Path $diag_path -Algorithm SHA256).Hash.ToLower()
+          if ($actual_sha256 -ne $expected_sha256.ToLower()) {
+            Write-Error "ABORT: SHA-256 mismatch for proof_cplw_diag.py: want $expected_sha256, got $actual_sha256"
+            exit 1
+          }
+          python proof_cplw_diag.py --gate proof_gate_eval.json --evidence cplw_diag_evidence.json
+          exit $LASTEXITCODE
+
       - name: P1-P3 narrow proof (hash-verified entrypoint)
         id: proof_step
         timeout-minutes: 15
@@ -251,3 +269,6 @@ jobs:
             proof_principal_receipt.json
             proof_cleanup_evidence.json
             proof_gate_eval.json
+            cplw_diag_evidence.json
+            diag_principal_receipt.json
+            diag_cleanup_evidence.json
