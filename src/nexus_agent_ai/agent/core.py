@@ -405,6 +405,26 @@ class Agent:
                         "the endpoint's documented capacity, or use fewer tools."
                     )
                 fitted, stats = context.fit_messages(messages, budget)
+                starts = [i for i, m in enumerate(messages) if is_genuine_user_message(m)]
+                if len(starts) >= 2 and starts[-2] < stats["dropped_messages"]:
+                    current = messages[starts[-1]].get("content", "")
+                    prior = messages[starts[-2]].get("content", "")
+                    if (isinstance(current, str) and isinstance(prior, str)
+                            and _CONTEXTUAL_RETURN_EDIT.match(function_request_prose(current).strip())
+                            and _affirmative_code_edit(function_request_prose(prior))):
+                        # Preserve only the genuine request, never its attached
+                        # source or intervening model/tool/internal instructions.
+                        antecedent = function_request_prose(prior).strip()
+                        retained = [{"role": "user", "content": antecedent}, *fitted]
+                        if len(antecedent) > 512 or context.history_tokens(retained) > budget:
+                            raise context.ContextBudgetError(
+                                "Insufficient context: the prior code-edit request needed for this "
+                                "followup cannot fit safely in the configured budget. Restate the "
+                                "target and requested change explicitly; no model request was sent."
+                            )
+                        fitted = retained
+                        stats["preserved_request_prefix"] = 1
+                        stats["tokens"] = context.history_tokens(fitted)
                 break
             except context.ContextBudgetError:
                 if not adaptive or reserve <= minimum_output:
@@ -419,6 +439,9 @@ class Agent:
                     "so input plus reserved output fits the context window."
                 )
         self.last_trim = stats
+        if stats.get("preserved_request_prefix"):
+            display.print_warn("Kept the prior genuine edit-request prefix for this contextual followup; "
+                               "attached source and older tool history were not carried forward.")
         if stats["dropped_messages"] or stats["truncated_messages"]:
             display.print_warn(
                 f"Context is full: left out {stats['dropped_messages']} older message(s) and cut "

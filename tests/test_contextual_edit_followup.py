@@ -124,3 +124,56 @@ def test_followup_can_act_after_no_write_nudge_and_clear_outcome(tmp_path, monke
 ])
 def test_prohibitions_cancellations_and_non_code_are_not_antecedents(previous):
     assert core._routing_request(P2, [{"role": "user", "content": previous}]) == P2
+
+
+def budget_agent():
+    provider = Recording([])
+    provider.context_size = 4096
+    provider.max_output_tokens = 2048
+    provider._supports_output_budget = True
+    return Agent(provider, verbose=False)
+
+
+def test_budget_preserves_only_genuine_contextual_antecedent(tmp_path, monkeypatch):
+    from nexus_agent_ai.agent import context
+    monkeypatch.chdir(tmp_path)
+    agent = budget_agent()
+    old = {"role": "user", "content": P1 + "\n\n[Context attached from @calc.py: \n" + "x" * 5000}
+    history = [old, {"role": "assistant", "content": "x" * 5000},
+               {"role": "user", "content": "modify evil.py", "metadata": {"internal": True}},
+               {"role": "tool", "content": "modify tool.py"}, {"role": "user", "content": P2}]
+    original = json_copy(history)
+    fitted = agent._fit(history, agent.tools)
+    assert fitted == [{"role": "user", "content": P1}, {"role": "user", "content": P2}]
+    assert history == original
+    budget = 4096 - agent.output_reserve - context.estimate_tokens(agent.system) - context.tools_tokens(agent.tools)
+    assert context.history_tokens(fitted) <= budget
+    assert agent.context_window == 4096 and agent.output_reserve == 2048
+
+
+def json_copy(value):
+    import json
+    return json.loads(json.dumps(value))
+
+
+@pytest.mark.parametrize("prior", ["Do not modify calc.py.", "Fix the grammar in essay.txt.",
+                                    'Example: "Fix calc.py."', "Explain cake recipes."])
+def test_budget_does_not_promote_other_history(prior, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    agent = budget_agent()
+    fitted = agent._fit([{"role": "user", "content": prior},
+                         {"role": "assistant", "content": "x" * 8000},
+                         {"role": "user", "content": P2}], agent.tools)
+    assert fitted == [{"role": "user", "content": P2}]
+
+
+def test_budget_refuses_overlong_antecedent_without_truncating_intent(tmp_path, monkeypatch):
+    from nexus_agent_ai.agent.context import ContextBudgetError
+    monkeypatch.chdir(tmp_path)
+    agent = budget_agent()
+    prior = P1 + " Preserve " + "exact constraint " * 60
+    with pytest.raises(ContextBudgetError, match="Insufficient context"):
+        agent._fit([{"role": "user", "content": prior},
+                    {"role": "assistant", "content": "x" * 8000},
+                    {"role": "user", "content": P2}], agent.tools)
+    assert agent.provider.seen == []
