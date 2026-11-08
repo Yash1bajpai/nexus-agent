@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - experiment/terminate-confirm-proof-20261108-1039
+      - experiment/terminate-confirm-proof-20261108-1112
 
 permissions: {}
 
@@ -66,8 +66,17 @@ jobs:
           # Bounded 15s observational delay: survivors are intentionally left alive for this
           # window to distinguish in-flight runner handling from abandoned processes. This is
           # acceptable ONLY because this job runs on a disposable GitHub-hosted VM used for nothing else.
-          python proof_runner_probe.py --mode check-survivors --nonce "$env:PROBE_NONCE" --log probe_timeout.log | Tee-Object -FilePath survivor_check_step.log
-          exit $LASTEXITCODE
+          # R-A: Tee-Object -FilePath writes UTF-16LE+BOM on Windows PowerShell 5.1, which the
+          # pinned gate evaluator (utf-8, startswith) cannot parse. Capture via -Variable and
+          # write BOM-less UTF-8 explicitly; preserve the probe's native exit code immediately.
+          python proof_runner_probe.py --mode check-survivors --nonce "$env:PROBE_NONCE" --log probe_timeout.log | Tee-Object -Variable _survCapture
+          $rc = $LASTEXITCODE
+          [System.IO.File]::WriteAllLines("$PWD\survivor_check_step.log", [string[]]$_survCapture, (New-Object System.Text.UTF8Encoding($false)))
+          # Byte-level regression guard: the capture must be BOM-less UTF-8 for the gate's startswith match.
+          $_b = [System.IO.File]::ReadAllBytes("$PWD\survivor_check_step.log")
+          if ($_b.Length -ge 2 -and $_b[0] -eq 0xFF -and $_b[1] -eq 0xFE) { Write-Error "ABORT: survivor_check_step.log written UTF-16LE; gate evidence would be unreadable"; exit 1 }
+          if ($_b.Length -ge 3 -and $_b[0] -eq 0xEF -and $_b[1] -eq 0xBB -and $_b[2] -eq 0xBF) { Write-Error "ABORT: survivor_check_step.log has a UTF-8 BOM; gate startswith match would fail"; exit 1 }
+          exit $rc
 
       - name: Verify demonstrated timeout gating
         if: always()
@@ -176,13 +185,60 @@ jobs:
         timeout-minutes: 15
         shell: powershell
         run: |
+          # R-B marker: written BEFORE the python entry. Terminating guard - if the marker
+          # cannot be written, the proof entry is NEVER invoked (no marker-less execution).
+          # The marker proves this run block started (execution reached this step); it is written
+          # before python is invoked so that no marker-less entrypoint invocation can occur.
+          try {
+            [System.IO.File]::WriteAllText("$PWD\proof_invoked.marker", "run_block_started $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))", (New-Object System.Text.UTF8Encoding($false)))
+          } catch { Write-Error "ABORT: proof invocation marker write failed; refusing to start proof: $_"; exit 1 }
+          if (-not (Test-Path "proof_invoked.marker")) { Write-Error "ABORT: proof invocation marker absent after write; refusing to start proof"; exit 1 }
           python proof_terminate_scope.py proof_scope_evidence.json
+          exit $LASTEXITCODE
 
       - name: Post-timeout cleanup and sweep
         if: always()
         shell: powershell
         run: |
+          # R-B: cleanup honesty when the proof never started (bounded marker design).
+          # not_applicable requires ALL THREE:
+          #   (1) proof_invoked.marker ABSENT (proof run block never started - written before python entry
+          #       with a terminating guard; marker presence proves the run block started);
+          #   (2) proof_principal_receipt.json ABSENT;
+          #   (3) proof_gate_eval.json parses AND overall_pass IS the exact JSON bool false.
+          # A missing marker alone is NOT positive proof; the failed gate plus control flow is the
+          # corroboration. Receipt present => ALWAYS the existing fail-closed cleanup. Any parse
+          # failure, missing key, or non-bool value => existing fail-closed cleanup. No
+          # steps.*.outcome empty/skipped inference. Paths are $PWD-bound on a fresh disposable VM.
+          $markerPresent = (Test-Path "proof_invoked.marker")
+          $receiptPresent = (Test-Path "proof_principal_receipt.json")
+          $gateFalse = $false
+          if (Test-Path "proof_gate_eval.json") {
+            try {
+              $_ge = Get-Content -Raw -Path "proof_gate_eval.json" | ConvertFrom-Json
+              if (($_ge.PSObject.Properties.Name -contains "overall_pass") -and ($_ge.overall_pass -is [bool]) -and (-not $_ge.overall_pass)) { $gateFalse = $true }
+            } catch { $gateFalse = $false }
+          }
+          if ((-not $markerPresent) -and (-not $receiptPresent) -and $gateFalse) {
+            $_ev = [ordered]@{
+              ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+              verdict = "not_applicable_no_principal_created"
+              reason = "gate overall_pass=false; proof_invoked.marker absent (run block never started); receipt absent"
+              marker_present = $false
+              receipt_path = "$PWD\proof_principal_receipt.json"
+              receipt_read = $false
+              target_sid = $null
+              terminate_results = @()
+              account_existed = $false
+              account_deleted = $false
+              post_sweep = @{}
+            }
+            [System.IO.File]::WriteAllText("$PWD\proof_cleanup_evidence.json", ($_ev | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+            Write-Output "CLEANUP_NOT_APPLICABLE: gate false, marker absent, receipt absent; run block never started"
+            exit 0
+          }
           python proof_runner_probe.py --mode cleanup --receipt proof_principal_receipt.json --cleanup-evidence proof_cleanup_evidence.json
+          exit $LASTEXITCODE
 
       - name: Upload P1-P3 proof evidence
         if: always()
@@ -191,6 +247,7 @@ jobs:
           name: p1-p3-proof-evidence
           path: |
             proof_scope_evidence.json
+            proof_invoked.marker
             proof_principal_receipt.json
             proof_cleanup_evidence.json
             proof_gate_eval.json
