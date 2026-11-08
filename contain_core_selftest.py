@@ -25,6 +25,7 @@ from ctypes import wintypes
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -260,10 +261,36 @@ def run_tier_w_windows_observed_tests(created_sid: str, expected_env: dict, crea
     Real Windows behavior; labeled WINDOWS-OBSERVED.
     Every item is marked NOT RUN until actually executed on a Windows runneradmin.
     """
+    import shutil
+
     w_items = []
-    workdir = Path(temp_dir) / "work"
-    workdir.mkdir(parents=True, exist_ok=True)
     cmd_exe = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "cmd.exe")
+
+    # W-tier neutral cwd and environment directory under %SystemRoot%\Temp
+    system_root = os.environ.get("SystemRoot", "C:\\Windows")
+    system_temp = os.path.join(system_root, "Temp")
+    neutral_dir = tempfile.mkdtemp(prefix="nexus_contain_w_", dir=system_temp)
+    try:
+        w_env = contain_core.build_child_env(neutral_dir)
+    except Exception as env_err:
+        cleanup_err = None
+        try:
+            shutil.rmtree(neutral_dir, ignore_errors=False)
+            try:
+                remains = Path(neutral_dir).exists()
+            except Exception as exists_err:
+                cleanup_err = f"Path.exists uncertainty: {type(exists_err).__name__}: {exists_err}"
+            else:
+                if remains:
+                    cleanup_err = "directory remains after rmtree"
+        except Exception as rm_err:
+            cleanup_err = f"rmtree error: {type(rm_err).__name__}: {rm_err}"
+
+        if cleanup_err is not None:
+            raise contain_core.ContainmentError(
+                f"build_child_env failed for neutral_dir {neutral_dir!r} ({env_err}) and cleanup failed ({cleanup_err})"
+            ) from env_err
+        raise
 
     # W1: Direct contract test with pre-kill OS parent-chain metadata verification (FIX-W1a, FIX-W1b, FIX-W1c, L2)
     w1 = {
@@ -274,136 +301,6 @@ def run_tier_w_windows_observed_tests(created_sid: str, expected_env: dict, crea
         "integration_path": "NOT EXERCISED — spawn_in_job timeout->cleanup leg deferred to full Comp 1 W scaffold",
         "observation": {"attempted": False, "status": "NOT RUN"},
     }
-    h_job_probe = None
-    h_process_child = None
-    h_thread_child = None
-    try:
-        advapi32, kernel32, _ = contain_core._WIN32
-        cmd = [cmd_exe, "/c", "start /b ping -n 60 127.0.0.1 > nul && ping -n 60 127.0.0.1 > nul"]
-
-        h_job_probe = kernel32.CreateJobObjectW(None, None)
-        if not h_job_probe:
-            raise contain_core.ContainmentError(f"CreateJobObjectW failed (err={ctypes.get_last_error()})")
-
-        job_info = contain_core.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        job_info.BasicLimitInformation.LimitFlags = contain_core.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(
-            h_job_probe, contain_core.JobObjectExtendedLimitInformation, ctypes.byref(job_info), ctypes.sizeof(job_info)
-        ):
-            raise contain_core.ContainmentError(f"SetInformationJobObject failed (err={ctypes.get_last_error()})")
-
-        si = contain_core.STARTUPINFOW()
-        si.cb = ctypes.sizeof(contain_core.STARTUPINFOW)
-        pi = contain_core.PROCESS_INFORMATION()
-        env_block = contain_core._format_unicode_env_block(expected_env)
-        full_cmd = subprocess.list2cmdline(cmd)
-
-        spawned = advapi32.CreateProcessWithLogonW(
-            contain_core.DEFAULT_PRINCIPAL_NAME, None, created_password, contain_core.LOGON_WITH_PROFILE,
-            None, full_cmd, contain_core.CREATE_SUSPENDED | contain_core.CREATE_UNICODE_ENVIRONMENT,
-            ctypes.cast(env_block, ctypes.c_void_p), str(workdir), ctypes.byref(si), ctypes.byref(pi),
-        )
-        if not spawned:
-            raise contain_core.ContainmentError(f"CreateProcessWithLogonW failed (err={ctypes.get_last_error()})")
-
-        h_process_child = pi.hProcess
-        h_thread_child = pi.hThread
-        known_child_pid = int(pi.dwProcessId)
-
-        if not kernel32.AssignProcessToJobObject(h_job_probe, h_process_child):
-            gle = ctypes.get_last_error()
-            kernel32.TerminateProcess(h_process_child, 1)
-            raise contain_core.ContainmentError(f"AssignProcessToJobObject failed (err={gle})")
-
-        if kernel32.ResumeThread(h_thread_child) == 0xFFFFFFFF:
-            gle = ctypes.get_last_error()
-            kernel32.TerminateProcess(h_process_child, 1)
-            raise contain_core.ContainmentError(f"ResumeThread failed (err={gle})")
-
-        if not kernel32.CloseHandle(h_thread_child):
-            raise contain_core.ContainmentError(f"CloseHandle(hThread) failed (err={ctypes.get_last_error()})")
-        h_thread_child = None
-
-        time.sleep(1.0)  # Allow grandchild process to spawn
-
-        # FIX-W1a: Pre-kill inspection: job PID list + OS parent-chain metadata
-        pre_pid_list = contain_core.JOBOBJECT_BASIC_PROCESS_ID_LIST_256()
-        ret_len = wintypes.DWORD(0)
-        if not kernel32.QueryInformationJobObject(
-            h_job_probe, contain_core.JobObjectBasicProcessIdList, ctypes.byref(pre_pid_list), ctypes.sizeof(pre_pid_list), ctypes.byref(ret_len)
-        ):
-            raise contain_core.ContainmentError(f"QueryInformationJobObject pre-kill query failed (err={ctypes.get_last_error()})")
-
-        pre_kill_count = int(pre_pid_list.NumberOfProcessIdsInList)
-        pre_kill_pids = [int(pre_pid_list.ProcessIdList[i]) for i in range(pre_kill_count)]
-        parent_map = _get_process_parent_map()
-
-        child_present = known_child_pid in pre_kill_pids
-        child_sid = _query_process_sid_independent(known_child_pid) if child_present else None
-        child_sid_verified = (child_sid == created_sid)
-
-        # A GRANDCHILD is any distinct PID in job PIDs whose OS parent equals the known child PID
-        grandchildren = [pid for pid in pre_kill_pids if pid != known_child_pid and parent_map.get(pid) == known_child_pid]
-        grandchildren_sids = {gc_pid: _query_process_sid_independent(gc_pid) for gc_pid in grandchildren}
-        grandchildren_verified = len(grandchildren) >= 1 and all(sid == created_sid for sid in grandchildren_sids.values())
-
-        tree_verified = child_present and child_sid_verified and grandchildren_verified
-
-        # Execute terminate_and_confirm via borrowed h_job_probe
-        term_res = contain_core.terminate_and_confirm(h_job_probe, created_sid, deadline_s=5.0)
-        post_sweep = contain_core.sweep_processes_by_sid(created_sid)
-
-        w1_pass = bool(tree_verified and (term_res.status == "CONFIRMED") and post_sweep.clean)
-        w1["expected"] = {"tree_verified_pre_kill": True, "status": "CONFIRMED", "post_sweep_clean": True}
-        w1["actual"] = {
-            "known_child_pid": known_child_pid,
-            "child_present": child_present,
-            "child_sid_verified": child_sid_verified,
-            "grandchildren": grandchildren,
-            "grandchildren_verified": grandchildren_verified,
-            "tree_verified": tree_verified,
-            "parent_map_sample": {pid: parent_map.get(pid) for pid in pre_kill_pids},
-            "cleanup_status": term_res.status,
-            "cleanup_stage": term_res.stage,
-            "cleanup_evidence": term_res.evidence,
-            "post_sweep_clean": post_sweep.clean,
-            "child_pids": post_sweep.child_pids,
-            "indeterminate_pids": post_sweep.indeterminate_pids,
-        }
-        w1["pass"] = w1_pass
-        # FIX-STATUS: Dynamic attempt record
-        w1["observation"] = {
-            "attempted": True,
-            "outcome": "pass" if w1_pass else "fail",
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "detail": term_res.stage,
-        }
-    except Exception as e:
-        w1["actual"] = {"error": f"{type(e).__name__}: {e}"}
-        w1["pass"] = False
-        w1["observation"] = {
-            "attempted": True,
-            "outcome": "error",
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "detail": f"{type(e).__name__}: {e}",
-        }
-    finally:
-        # L2: Checked handle cleanup with annotation-not-raise pattern
-        close_errors = []
-        if h_thread_child and not kernel32.CloseHandle(h_thread_child):
-            close_errors.append({"handle": "h_thread_child", "gle": ctypes.get_last_error()})
-        if h_process_child and not kernel32.CloseHandle(h_process_child):
-            close_errors.append({"handle": "h_process_child", "gle": ctypes.get_last_error()})
-        if h_job_probe and not kernel32.CloseHandle(h_job_probe):
-            close_errors.append({"handle": "h_job_probe", "gle": ctypes.get_last_error()})
-        if close_errors:
-            w1.setdefault("actual", {})["cleanup_close_errors"] = close_errors
-            w1["pass"] = False
-            obs = w1.get("observation", {"attempted": True})
-            obs["outcome"] = "fail"
-            obs["detail"] = (obs.get("detail") or "") + f"; cleanup close failures: {close_errors}"
-            w1["observation"] = obs
-    w_items.append(w1)
 
     # W2: Fault injection via deliberate handle invalidation (FIX-W1b, FIX-W2a, FIX-STATUS, L1)
     w2 = {
@@ -415,117 +312,275 @@ def run_tier_w_windows_observed_tests(created_sid: str, expected_env: dict, crea
         "integration_path": "NOT EXERCISED — spawn_in_job WAIT_FAILED->cleanup leg deferred to full Comp 1 W scaffold",
         "observation": {"attempted": False, "status": "NOT RUN"},
     }
-    h_job = None
-    h_process_owned = None
-    h_thread = None
+
     try:
-        advapi32, kernel32, _ = contain_core._WIN32
-        h_job = kernel32.CreateJobObjectW(None, None)
-        if not h_job:
-            raise contain_core.ContainmentError(f"CreateJobObjectW failed (err={ctypes.get_last_error()})")
+        h_job_probe = None
+        h_process_child = None
+        h_thread_child = None
+        try:
+            advapi32, kernel32, _ = contain_core._WIN32
+            cmd = [cmd_exe, "/c", "start /b ping -n 60 127.0.0.1 > nul && ping -n 60 127.0.0.1 > nul"]
 
-        job_info = contain_core.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        job_info.BasicLimitInformation.LimitFlags = contain_core.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(
-            h_job, contain_core.JobObjectExtendedLimitInformation, ctypes.byref(job_info), ctypes.sizeof(job_info)
-        ):
-            raise contain_core.ContainmentError(f"SetInformationJobObject failed (err={ctypes.get_last_error()})")
+            h_job_probe = kernel32.CreateJobObjectW(None, None)
+            if not h_job_probe:
+                raise contain_core.ContainmentError(f"CreateJobObjectW failed (err={ctypes.get_last_error()})")
 
-        si = contain_core.STARTUPINFOW()
-        si.cb = ctypes.sizeof(contain_core.STARTUPINFOW)
-        pi = contain_core.PROCESS_INFORMATION()
-        env_block = contain_core._format_unicode_env_block(expected_env)
+            job_info = contain_core.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            job_info.BasicLimitInformation.LimitFlags = contain_core.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(
+                h_job_probe, contain_core.JobObjectExtendedLimitInformation, ctypes.byref(job_info), ctypes.sizeof(job_info)
+            ):
+                raise contain_core.ContainmentError(f"SetInformationJobObject failed (err={ctypes.get_last_error()})")
 
-        cmd_str = f'"{cmd_exe}" /c ping -n 30 127.0.0.1 > nul'
-        spawned = advapi32.CreateProcessWithLogonW(
-            contain_core.DEFAULT_PRINCIPAL_NAME,
-            None,
-            created_password,
-            contain_core.LOGON_WITH_PROFILE,
-            None,
-            cmd_str,
-            contain_core.CREATE_SUSPENDED | contain_core.CREATE_UNICODE_ENVIRONMENT,
-            ctypes.cast(env_block, ctypes.c_void_p),
-            str(workdir),
-            ctypes.byref(si),
-            ctypes.byref(pi),
-        )
-        if not spawned:
-            raise contain_core.ContainmentError(f"CreateProcessWithLogonW failed (err={ctypes.get_last_error()})")
+            si = contain_core.STARTUPINFOW()
+            si.cb = ctypes.sizeof(contain_core.STARTUPINFOW)
+            pi = contain_core.PROCESS_INFORMATION()
+            env_block = contain_core._format_unicode_env_block(w_env)
+            full_cmd = subprocess.list2cmdline(cmd)
 
-        h_process_owned = pi.hProcess
-        h_thread = pi.hThread
+            spawned = advapi32.CreateProcessWithLogonW(
+                contain_core.DEFAULT_PRINCIPAL_NAME, None, created_password, contain_core.LOGON_WITH_PROFILE,
+                None, full_cmd, contain_core.CREATE_SUSPENDED | contain_core.CREATE_UNICODE_ENVIRONMENT,
+                ctypes.cast(env_block, ctypes.c_void_p), str(neutral_dir), ctypes.byref(si), ctypes.byref(pi),
+            )
+            if not spawned:
+                raise contain_core.ContainmentError(f"CreateProcessWithLogonW failed (err={ctypes.get_last_error()})")
 
-        if not kernel32.AssignProcessToJobObject(h_job, h_process_owned):
-            gle = ctypes.get_last_error()
-            kernel32.TerminateProcess(h_process_owned, 1)
-            raise contain_core.ContainmentError(f"AssignProcessToJobObject failed (err={gle})")
+            h_process_child = pi.hProcess
+            h_thread_child = pi.hThread
+            known_child_pid = int(pi.dwProcessId)
 
-        if kernel32.ResumeThread(h_thread) == 0xFFFFFFFF:
-            gle = ctypes.get_last_error()
-            kernel32.TerminateProcess(h_process_owned, 1)
-            raise contain_core.ContainmentError(f"ResumeThread failed (err={gle})")
+            if not kernel32.AssignProcessToJobObject(h_job_probe, h_process_child):
+                gle = ctypes.get_last_error()
+                kernel32.TerminateProcess(h_process_child, 1)
+                raise contain_core.ContainmentError(f"AssignProcessToJobObject failed (err={gle})")
 
-        if not kernel32.CloseHandle(h_thread):
-            raise contain_core.ContainmentError(f"CloseHandle(hThread) failed (err={ctypes.get_last_error()})")
-        h_thread = None
+            if kernel32.ResumeThread(h_thread_child) == 0xFFFFFFFF:
+                gle = ctypes.get_last_error()
+                kernel32.TerminateProcess(h_process_child, 1)
+                raise contain_core.ContainmentError(f"ResumeThread failed (err={gle})")
 
-        # Deliberately invalidate process handle before wait; immediately set to None
-        invalidated_handle = h_process_owned
+            if not kernel32.CloseHandle(h_thread_child):
+                raise contain_core.ContainmentError(f"CloseHandle(hThread) failed (err={ctypes.get_last_error()})")
+            h_thread_child = None
+
+            time.sleep(1.0)  # Allow grandchild process to spawn
+
+            # FIX-W1a: Pre-kill inspection: job PID list + OS parent-chain metadata
+            pre_pid_list = contain_core.JOBOBJECT_BASIC_PROCESS_ID_LIST_256()
+            ret_len = wintypes.DWORD(0)
+            if not kernel32.QueryInformationJobObject(
+                h_job_probe, contain_core.JobObjectBasicProcessIdList, ctypes.byref(pre_pid_list), ctypes.sizeof(pre_pid_list), ctypes.byref(ret_len)
+            ):
+                raise contain_core.ContainmentError(f"QueryInformationJobObject pre-kill query failed (err={ctypes.get_last_error()})")
+
+            pre_kill_count = int(pre_pid_list.NumberOfProcessIdsInList)
+            pre_kill_pids = [int(pre_pid_list.ProcessIdList[i]) for i in range(pre_kill_count)]
+            parent_map = _get_process_parent_map()
+
+            child_present = known_child_pid in pre_kill_pids
+            child_sid = _query_process_sid_independent(known_child_pid) if child_present else None
+            child_sid_verified = (child_sid == created_sid)
+
+            # A GRANDCHILD is any distinct PID in job PIDs whose OS parent equals the known child PID
+            grandchildren = [pid for pid in pre_kill_pids if pid != known_child_pid and parent_map.get(pid) == known_child_pid]
+            grandchildren_sids = {gc_pid: _query_process_sid_independent(gc_pid) for gc_pid in grandchildren}
+            grandchildren_verified = len(grandchildren) >= 1 and all(sid == created_sid for sid in grandchildren_sids.values())
+
+            tree_verified = child_present and child_sid_verified and grandchildren_verified
+
+            # Execute terminate_and_confirm via borrowed h_job_probe
+            term_res = contain_core.terminate_and_confirm(h_job_probe, created_sid, deadline_s=5.0)
+            post_sweep = contain_core.sweep_processes_by_sid(created_sid)
+
+            w1_pass = bool(tree_verified and (term_res.status == "CONFIRMED") and post_sweep.clean)
+            w1["expected"] = {"tree_verified_pre_kill": True, "status": "CONFIRMED", "post_sweep_clean": True}
+            w1["actual"] = {
+                "known_child_pid": known_child_pid,
+                "child_present": child_present,
+                "child_sid_verified": child_sid_verified,
+                "grandchildren": grandchildren,
+                "grandchildren_verified": grandchildren_verified,
+                "tree_verified": tree_verified,
+                "parent_map_sample": {pid: parent_map.get(pid) for pid in pre_kill_pids},
+                "cleanup_status": term_res.status,
+                "cleanup_stage": term_res.stage,
+                "cleanup_evidence": term_res.evidence,
+                "post_sweep_clean": post_sweep.clean,
+                "child_pids": post_sweep.child_pids,
+                "indeterminate_pids": post_sweep.indeterminate_pids,
+                "cwd": str(neutral_dir),
+            }
+            w1["pass"] = w1_pass
+            # FIX-STATUS: Dynamic attempt record
+            w1["observation"] = {
+                "attempted": True,
+                "outcome": "pass" if w1_pass else "fail",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "detail": term_res.stage,
+            }
+        except Exception as e:
+            w1["actual"] = {"error": f"{type(e).__name__}: {e}", "cwd": str(neutral_dir)}
+            w1["pass"] = False
+            w1["observation"] = {
+                "attempted": True,
+                "outcome": "error",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "detail": f"{type(e).__name__}: {e}",
+            }
+        finally:
+            # L2: Checked handle cleanup with annotation-not-raise pattern
+            close_errors = []
+            if h_thread_child and not kernel32.CloseHandle(h_thread_child):
+                close_errors.append({"handle": "h_thread_child", "gle": ctypes.get_last_error()})
+            if h_process_child and not kernel32.CloseHandle(h_process_child):
+                close_errors.append({"handle": "h_process_child", "gle": ctypes.get_last_error()})
+            if h_job_probe and not kernel32.CloseHandle(h_job_probe):
+                close_errors.append({"handle": "h_job_probe", "gle": ctypes.get_last_error()})
+            if close_errors:
+                w1.setdefault("actual", {})["cleanup_close_errors"] = close_errors
+                w1["pass"] = False
+                obs = w1.get("observation", {"attempted": True})
+                obs["outcome"] = "fail"
+                obs["detail"] = (obs.get("detail") or "") + f"; cleanup close failures: {close_errors}"
+                w1["observation"] = obs
+        w_items.append(w1)
+
+        # W2: Fault injection via deliberate handle invalidation (FIX-W1b, FIX-W2a, FIX-STATUS, L1)
+        h_job = None
         h_process_owned = None
-        if not kernel32.CloseHandle(invalidated_handle):
-            raise contain_core.ContainmentError(f"CloseHandle(invalidated_handle) failed (err={ctypes.get_last_error()})")
+        h_thread = None
+        try:
+            advapi32, kernel32, _ = contain_core._WIN32
+            h_job = kernel32.CreateJobObjectW(None, None)
+            if not h_job:
+                raise contain_core.ContainmentError(f"CreateJobObjectW failed (err={ctypes.get_last_error()})")
 
-        wait_res = kernel32.WaitForSingleObject(invalidated_handle, 1000)
-        wait_gle = ctypes.get_last_error()
-        is_wait_failed = (wait_res == contain_core.WAIT_FAILED) and (wait_gle == 6)  # ERROR_INVALID_HANDLE = 6
+            job_info = contain_core.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            job_info.BasicLimitInformation.LimitFlags = contain_core.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(
+                h_job, contain_core.JobObjectExtendedLimitInformation, ctypes.byref(job_info), ctypes.sizeof(job_info)
+            ):
+                raise contain_core.ContainmentError(f"SetInformationJobObject failed (err={ctypes.get_last_error()})")
 
-        # Now execute terminate_and_confirm with the still-valid borrowed h_job
-        term_res = contain_core.terminate_and_confirm(h_job, created_sid, deadline_s=5.0)
+            si = contain_core.STARTUPINFOW()
+            si.cb = ctypes.sizeof(contain_core.STARTUPINFOW)
+            pi = contain_core.PROCESS_INFORMATION()
+            env_block = contain_core._format_unicode_env_block(w_env)
 
-        w2_pass = bool(is_wait_failed and term_res.status == "CONFIRMED")
-        w2["expected"] = {"is_wait_failed": True, "wait_gle": 6, "cleanup_status": "CONFIRMED"}
-        w2["actual"] = {
-            "is_wait_failed": is_wait_failed,
-            "wait_gle": wait_gle,
-            "cleanup_status": term_res.status,
-            "cleanup_stage": term_res.stage,
-            "cleanup_evidence": term_res.evidence,
-        }
-        w2["pass"] = w2_pass
-        # FIX-STATUS: Dynamic attempt record
-        w2["observation"] = {
-            "attempted": True,
-            "outcome": "pass" if w2_pass else "fail",
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "detail": term_res.stage,
-        }
-    except Exception as e:
-        w2["actual"] = {"error": f"{type(e).__name__}: {e}"}
-        w2["pass"] = False
-        w2["observation"] = {
-            "attempted": True,
-            "outcome": "error",
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "detail": f"{type(e).__name__}: {e}",
-        }
-    finally:
-        # L1: Checked handle cleanup with annotation-not-raise pattern
-        close_errors = []
-        if h_thread and not kernel32.CloseHandle(h_thread):
-            close_errors.append({"handle": "h_thread", "gle": ctypes.get_last_error()})
-        if h_process_owned and not kernel32.CloseHandle(h_process_owned):
-            close_errors.append({"handle": "h_process_owned", "gle": ctypes.get_last_error()})
-        if h_job and not kernel32.CloseHandle(h_job):
-            close_errors.append({"handle": "h_job", "gle": ctypes.get_last_error()})
-        if close_errors:
-            w2.setdefault("actual", {})["cleanup_close_errors"] = close_errors
+            cmd_str = f'"{cmd_exe}" /c ping -n 30 127.0.0.1 > nul'
+            spawned = advapi32.CreateProcessWithLogonW(
+                contain_core.DEFAULT_PRINCIPAL_NAME,
+                None,
+                created_password,
+                contain_core.LOGON_WITH_PROFILE,
+                None,
+                cmd_str,
+                contain_core.CREATE_SUSPENDED | contain_core.CREATE_UNICODE_ENVIRONMENT,
+                ctypes.cast(env_block, ctypes.c_void_p),
+                str(neutral_dir),
+                ctypes.byref(si),
+                ctypes.byref(pi),
+            )
+            if not spawned:
+                raise contain_core.ContainmentError(f"CreateProcessWithLogonW failed (err={ctypes.get_last_error()})")
+
+            h_process_owned = pi.hProcess
+            h_thread = pi.hThread
+
+            if not kernel32.AssignProcessToJobObject(h_job, h_process_owned):
+                gle = ctypes.get_last_error()
+                kernel32.TerminateProcess(h_process_owned, 1)
+                raise contain_core.ContainmentError(f"AssignProcessToJobObject failed (err={gle})")
+
+            if kernel32.ResumeThread(h_thread) == 0xFFFFFFFF:
+                gle = ctypes.get_last_error()
+                kernel32.TerminateProcess(h_process_owned, 1)
+                raise contain_core.ContainmentError(f"ResumeThread failed (err={gle})")
+
+            if not kernel32.CloseHandle(h_thread):
+                raise contain_core.ContainmentError(f"CloseHandle(hThread) failed (err={ctypes.get_last_error()})")
+            h_thread = None
+
+            # Deliberately invalidate process handle before wait; immediately set to None
+            invalidated_handle = h_process_owned
+            h_process_owned = None
+            if not kernel32.CloseHandle(invalidated_handle):
+                raise contain_core.ContainmentError(f"CloseHandle(invalidated_handle) failed (err={ctypes.get_last_error()})")
+
+            wait_res = kernel32.WaitForSingleObject(invalidated_handle, 1000)
+            wait_gle = ctypes.get_last_error()
+            is_wait_failed = (wait_res == contain_core.WAIT_FAILED) and (wait_gle == 6)  # ERROR_INVALID_HANDLE = 6
+
+            # Now execute terminate_and_confirm with the still-valid borrowed h_job
+            term_res = contain_core.terminate_and_confirm(h_job, created_sid, deadline_s=5.0)
+
+            w2_pass = bool(is_wait_failed and term_res.status == "CONFIRMED")
+            w2["expected"] = {"is_wait_failed": True, "wait_gle": 6, "cleanup_status": "CONFIRMED"}
+            w2["actual"] = {
+                "is_wait_failed": is_wait_failed,
+                "wait_gle": wait_gle,
+                "cleanup_status": term_res.status,
+                "cleanup_stage": term_res.stage,
+                "cleanup_evidence": term_res.evidence,
+                "cwd": str(neutral_dir),
+            }
+            w2["pass"] = w2_pass
+            # FIX-STATUS: Dynamic attempt record
+            w2["observation"] = {
+                "attempted": True,
+                "outcome": "pass" if w2_pass else "fail",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "detail": term_res.stage,
+            }
+        except Exception as e:
+            w2["actual"] = {"error": f"{type(e).__name__}: {e}", "cwd": str(neutral_dir)}
             w2["pass"] = False
-            obs = w2.get("observation", {"attempted": True})
-            obs["outcome"] = "fail"
-            obs["detail"] = (obs.get("detail") or "") + f"; cleanup close failures: {close_errors}"
-            w2["observation"] = obs
-    w_items.append(w2)
+            w2["observation"] = {
+                "attempted": True,
+                "outcome": "error",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "detail": f"{type(e).__name__}: {e}",
+            }
+        finally:
+            # L1: Checked handle cleanup with annotation-not-raise pattern
+            close_errors = []
+            if h_thread and not kernel32.CloseHandle(h_thread):
+                close_errors.append({"handle": "h_thread", "gle": ctypes.get_last_error()})
+            if h_process_owned and not kernel32.CloseHandle(h_process_owned):
+                close_errors.append({"handle": "h_process_owned", "gle": ctypes.get_last_error()})
+            if h_job and not kernel32.CloseHandle(h_job):
+                close_errors.append({"handle": "h_job", "gle": ctypes.get_last_error()})
+            if close_errors:
+                w2.setdefault("actual", {})["cleanup_close_errors"] = close_errors
+                w2["pass"] = False
+                obs = w2.get("observation", {"attempted": True})
+                obs["outcome"] = "fail"
+                obs["detail"] = (obs.get("detail") or "") + f"; cleanup close failures: {close_errors}"
+                w2["observation"] = obs
+        w_items.append(w2)
+
+    finally:
+        # Neutral W-tier directory cleanup with truthful recording of removal failure
+        if neutral_dir and Path(neutral_dir).exists():
+            removal_error = None
+            try:
+                shutil.rmtree(neutral_dir, ignore_errors=False)
+            except Exception as e:
+                removal_error = f"{type(e).__name__}: {e}"
+
+            if removal_error or Path(neutral_dir).exists():
+                err_detail = removal_error or "directory still exists after rmtree"
+                for item in (w1, w2):
+                    item.setdefault("actual", {})["neutral_dir_teardown_error"] = err_detail
+                    item["pass"] = False
+                    obs = item.get("observation", {"attempted": True})
+                    obs["outcome"] = "fail"
+                    obs["detail"] = (obs.get("detail") or "") + f"; neutral dir teardown error: {err_detail}"
+                    item["observation"] = obs
+            else:
+                w1.setdefault("actual", {})["neutral_dir_removed"] = True
+                w2.setdefault("actual", {})["neutral_dir_removed"] = True
 
     # W3: Explicit omission notice
     w3 = {
@@ -961,10 +1016,38 @@ def run_component1_selftest() -> dict:
                 contain_core.delete_principal(captured_sid=created_sid, username=contain_core.DEFAULT_PRINCIPAL_NAME)
             except Exception:
                 pass
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        if temp_dir:
+            teardown_error = None
+            try:
+                if Path(temp_dir).exists():
+                    shutil.rmtree(temp_dir, ignore_errors=False)
+                try:
+                    remains = Path(temp_dir).exists()
+                except Exception as exists_err:
+                    teardown_error = f"Path.exists uncertainty: {type(exists_err).__name__}: {exists_err}"
+                else:
+                    if remains:
+                        teardown_error = "directory remains after rmtree"
+            except Exception as rm_err:
+                teardown_error = f"rmtree error: {type(rm_err).__name__}: {rm_err}"
+
+            if teardown_error is not None:
+                items.append({
+                    "item": "component_temp_teardown",
+                    "name": "component_temp_teardown",
+                    "description": "Verify component temp directory removal and absence",
+                    "pass": False,
+                    "actual": {
+                        "temp_dir": str(temp_dir),
+                        "teardown_error": teardown_error,
+                    },
+                    "observation": {
+                        "attempted": True,
+                        "outcome": "fail",
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "detail": f"temp_dir teardown failed: {teardown_error}",
+                    },
+                })
 
     evidence["items"] = items
     all_passed = all(item.get("pass") is True for item in items if item.get("status") != "OMITTED")

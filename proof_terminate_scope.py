@@ -41,7 +41,7 @@ if str(SELF_DIR) not in sys.path:
 
 EXPECTED_SHA256 = {
     "contain_core.py": "41ad522dbe3366d30e611a179ab176459af685fe2858ea9524e2f9d7a3cb53cd",
-    "contain_core_selftest.py": "b0fb0fa27d119f90599cc1ba496d57553ed0caabcd23ab4a5686131caa3016c4",
+    "contain_core_selftest.py": "fbcdb4ea002d90568d1f391fbd65afceeb7246cf9ee064196e6c72d98beb676c",
 }
 
 OUT_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else SELF_DIR / "proof_scope_evidence.json"
