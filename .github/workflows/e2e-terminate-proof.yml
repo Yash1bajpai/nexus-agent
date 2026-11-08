@@ -1,0 +1,160 @@
+# .github/workflows/e2e-terminate-proof.yml
+# Nexus e2e — terminate_and_confirm P1-P3 proof + runner-envelope probes.
+#
+# Status: SOURCE PREPARED, NOT PUSHED, NOT DISPATCHED, NOT RUN.
+# Authorization: Pushing this workflow to an experiment branch and dispatching it
+# requires explicit owner authorization.
+#
+# Route truth:
+#   Main branch carries NO e2e workflow. Dispatched exclusively on an isolated
+#   experiment branch (pattern: experiment/terminate-confirm-proof-<date>).
+#
+# Envelope design:
+#   - permissions: {} (scopeless GITHUB_TOKEN).
+#   - persist-credentials: false on all checkouts; no repository secrets.
+#   - probe-timeout: Demonstrates real runner step-timeout kill latency, checks
+#     hazard process tree survivors (R1, R2, R4, C2, C9), and verifies timeout via
+#     exact check_run_url suffix mapping (C3, C8) and full coverage (C4).
+#   - probe-account: Demonstrates leftover account creation with atomic receipt
+#     and unconditional post-sweep cleanup within a single VM lifecycle (R3, C7).
+#   - proof-p1-p3: Gated on needs: [probe-timeout, probe-account]. Runs hash-verified
+#     entrypoint with 15m step timeout under a 30m job reserve budget, followed
+#     by an observed post-timeout cleanup and sweep step with if: always() (C1, C7).
+
+name: terminate_and_confirm P1-P3 proof (narrow scope, not qualification)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/terminate-confirm-proof-20261108-0804
+
+permissions: {}
+
+jobs:
+  probe-timeout:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate probe nonce
+        shell: powershell
+        run: |
+          $nonce = "probe_nonce_" + [System.Guid]::NewGuid().ToString("N")
+          echo "PROBE_NONCE=$nonce" >> $env:GITHUB_ENV
+          echo "Generated PROBE_NONCE: $nonce"
+
+      - name: Deliberately stuck process (step timeout must kill it)
+        id: stuck_step
+        timeout-minutes: 2
+        continue-on-error: true
+        shell: powershell
+        run: |
+          python proof_runner_probe.py --mode timeout --nonce "$env:PROBE_NONCE" --log probe_timeout.log
+
+      - name: Check process survivors in same VM
+        if: always()
+        shell: powershell
+        run: |
+          python proof_runner_probe.py --mode check-survivors --nonce "$env:PROBE_NONCE" --log probe_timeout.log
+
+      - name: Verify demonstrated timeout gating
+        if: always()
+        shell: powershell
+        run: |
+          python proof_runner_probe.py --mode verify-timeout `
+            --nonce "$env:PROBE_NONCE" `
+            --log probe_timeout.log `
+            --timeout-seconds 120 `
+            --run-id "${{ github.run_id }}" `
+            --check-run-id "${{ job.check_run_id }}" `
+            --run-attempt "${{ github.run_attempt }}" `
+            --job-name "probe-timeout" `
+            --owner "${{ github.repository_owner }}" `
+            --repo "${{ github.event.repository.name }}" `
+            --stuck-step-outcome "${{ steps.stuck_step.outcome }}"
+
+      - name: Upload probe timeout evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-timeout-evidence
+          path: |
+            probe_timeout.log
+            probe_timeout_verification.json
+
+  probe-account:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Simulate killed-run leftover account
+        shell: powershell
+        run: |
+          python proof_runner_probe.py --mode leave --receipt probe_account_receipt.json | Out-File -FilePath probe_account.log -Encoding utf8
+
+      - name: Detect and remove leftover on same runner lifecycle
+        if: always()
+        shell: powershell
+        run: |
+          python proof_runner_probe.py --mode cleanup --receipt probe_account_receipt.json --cleanup-evidence probe_account_cleanup.json | Out-File -FilePath probe_account.log -Append -Encoding utf8
+
+      - name: Upload probe account evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-account-evidence
+          path: |
+            probe_account.log
+            probe_account_receipt.json
+            probe_account_cleanup.json
+
+  proof-p1-p3:
+    needs: [probe-timeout, probe-account]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: P1-P3 narrow proof (hash-verified entrypoint)
+        id: proof_step
+        timeout-minutes: 15
+        shell: powershell
+        run: |
+          python proof_terminate_scope.py proof_scope_evidence.json
+
+      - name: Post-timeout cleanup and sweep
+        if: always()
+        shell: powershell
+        run: |
+          python proof_runner_probe.py --mode cleanup --receipt proof_principal_receipt.json --cleanup-evidence proof_cleanup_evidence.json
+
+      - name: Upload P1-P3 proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p1-p3-proof-evidence
+          path: |
+            proof_scope_evidence.json
+            proof_principal_receipt.json
+            proof_cleanup_evidence.json
