@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - experiment/terminate-confirm-proof-20261108-0804
+      - experiment/terminate-confirm-proof-20261108-0956
 
 permissions: {}
 
@@ -63,6 +63,9 @@ jobs:
         if: always()
         shell: powershell
         run: |
+          # Bounded 15s observational delay: survivors are intentionally left alive for this
+          # window to distinguish in-flight runner handling from abandoned processes. This is
+          # acceptable ONLY because this job runs on a disposable GitHub-hosted VM used for nothing else.
           python proof_runner_probe.py --mode check-survivors --nonce "$env:PROBE_NONCE" --log probe_timeout.log
 
       - name: Verify demonstrated timeout gating

@@ -5,19 +5,26 @@ Demonstrates outer-bound runner mechanics before any proof execution:
   --mode timeout:
       Spawns cmd.exe child + ping.exe grandchild with detached process flags
       (CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS). Bounded polling (up to 10s)
-      establishes grandchild creation (C9, C11) before continuous heartbeats begin.
-      Exits nonzero (exit 3) if hazard shape is not established.
+      establishes grandchild creation (C9, C11) and process creation timestamps (C13)
+      before continuous heartbeats begin. Exits nonzero (exit 3) if hazard shape
+      is not established.
   --mode check-survivors:
-      Executes post-kill in the same job (same VM) via if: always(). Scans all
-      active system processes for the tracked tree PIDs and any late descendants
-      (th32ParentProcessID). Tree identity rests on logged captured PIDs and
-      Toolhelp32 parent-PID chains (C2), not on unobservable command-line tokens.
-      Fails closed (exit 1) on any survivor, issuing emergency termination across
-      the full tracked set.
+      Executes post-kill in the same job (same VM) via if: always(). Two-phase
+      observation: Phase A (immediate, record-only) and Phase B (after a bounded
+      15s delay to observe whether the runner reaped the tree). Four-state tracking:
+      confirmed / reused / unknown / exited. Kill-eligibility strictly limited to
+      captured creation-pinned members verified on a single held handle (K1, K2).
+      Observation closure preserves partial mid-scan tables observation-only (rev 8b)
+      and seeds from all historical tracked PIDs plus accumulated discovered descendants.
+      All late descendants classify unknown (never confirmed, never killed).
+      Phase A never feeds the verdict (D2). Full-tree containment is never proven or claimed.
+      Any survivor, unowned, reused, or inconclusive scan in Phase B/C fails closed.
   --mode verify-timeout:
       Polls GitHub Actions REST API with pagination and exact check_run_url suffix
       matching (C3). Empty check_run_id or name mismatch fails closed without fallback.
-      Enforces heartbeat coverage reaching or exceeding timeout duration (C4).
+      Enforces heartbeat coverage reaching within one cadence of timeout duration (C4, C12);
+      provides observational evidence of beats up to the boundary, not absolute proof
+      of uninterrupted liveness.
   --mode leave:
       Creates local principal and atomically writes receipt (C7), intentionally
       leaving account active.
@@ -42,6 +49,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -59,6 +67,27 @@ EXPECTED_SHA256 = {
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 DETACHED_PROCESS = 0x00000008
+ERROR_NO_MORE_FILES = 18
+DEFAULT_HEARTBEAT_INTERVAL = 5.0
+
+
+class FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", wintypes.DWORD),
+        ("dwHighDateTime", wintypes.DWORD),
+    ]
+
+
+def _bind_probe_win32_apis(kernel32) -> None:
+    """Declare probe-local Win32 API signatures not present in the frozen core."""
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
 
 
 def _sha256(path: Path) -> str:
@@ -87,6 +116,427 @@ def _persist_atomic_receipt(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
+def _filetime_to_int(ft: FILETIME) -> int:
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
+def _query_process_identity_on_handle(
+    kernel32, h_proc: wintypes.HANDLE
+) -> tuple[int | None, bool | None, int]:
+    """Queries (creation_time_int, is_still_active, gle) on an already-opened handle.
+
+    Returns (None, None, gle) if GetProcessTimes or GetExitCodeProcess fails.
+    Never guesses still_active on query failure.
+    """
+    ft_creation = FILETIME()
+    ft_exit = FILETIME()
+    ft_kernel = FILETIME()
+    ft_user = FILETIME()
+    if not kernel32.GetProcessTimes(
+        h_proc,
+        ctypes.byref(ft_creation),
+        ctypes.byref(ft_exit),
+        ctypes.byref(ft_kernel),
+        ctypes.byref(ft_user),
+    ):
+        return None, None, ctypes.GetLastError()
+
+    exit_code = wintypes.DWORD()
+    if not kernel32.GetExitCodeProcess(h_proc, ctypes.byref(exit_code)):
+        return None, None, ctypes.GetLastError()
+
+    still_active = exit_code.value == 259  # STILL_ACTIVE
+    return _filetime_to_int(ft_creation), still_active, 0
+
+
+def _query_process_identity_by_pid(
+    kernel32, pid: int
+) -> tuple[int | None, bool | None, int]:
+    """Opens PROCESS_QUERY_LIMITED_INFORMATION and queries identity and liveness."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h_proc:
+        return None, None, ctypes.GetLastError()
+    try:
+        return _query_process_identity_on_handle(kernel32, h_proc)
+    finally:
+        kernel32.CloseHandle(h_proc)
+
+
+def _is_pid_in_fresh_snapshot(kernel32, pid: int) -> tuple[bool | None, int]:
+    """Cross-checks ONE fresh snapshot to distinguish absent/exited from present-but-denied (G4).
+
+    Returns (is_present: bool | None, gle: int).
+    """
+    import contain_core
+
+    h_snap = kernel32.CreateToolhelp32Snapshot(contain_core.TH32CS_SNAPPROCESS, 0)
+    if h_snap == contain_core.INVALID_HANDLE_VALUE or not h_snap:
+        return None, ctypes.GetLastError()
+
+    try:
+        pe = contain_core.PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
+        more = kernel32.Process32FirstW(h_snap, ctypes.byref(pe))
+        if not more:
+            gle = ctypes.GetLastError()
+            if gle != ERROR_NO_MORE_FILES:
+                return None, gle
+            return False, 0
+
+        while more:
+            if int(pe.th32ProcessID) == pid:
+                return True, 0
+            pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
+            more = kernel32.Process32NextW(h_snap, ctypes.byref(pe))
+            if not more:
+                gle = ctypes.GetLastError()
+                if gle != ERROR_NO_MORE_FILES:
+                    return None, gle
+                break
+        return False, 0
+    finally:
+        kernel32.CloseHandle(h_snap)
+
+
+def _read_snapshot_processes(
+    kernel32,
+) -> tuple[bool, dict[int, dict], dict[int, list[int]], int]:
+    """Enumerates all processes from a fresh Toolhelp32 snapshot.
+
+    Returns (conclusive: bool, proc_table: dict, children_map: dict, gle: int).
+    Delta 1 (rev 8b): Mid-scan Process32NextW failure preserves partial tables observation-only
+    (conclusive=False, proc_table, children_map, scan_gle). Snapshot creation or first failure
+    returns conclusive=False with empty tables.
+    """
+    import contain_core
+
+    h_snap = kernel32.CreateToolhelp32Snapshot(contain_core.TH32CS_SNAPPROCESS, 0)
+    if h_snap == contain_core.INVALID_HANDLE_VALUE or not h_snap:
+        return False, {}, {}, ctypes.GetLastError()
+
+    proc_table: dict[int, dict] = {}
+    children_map: dict[int, list[int]] = {}
+    scan_gle = 0
+
+    try:
+        pe = contain_core.PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
+        more = kernel32.Process32FirstW(h_snap, ctypes.byref(pe))
+        if not more:
+            gle = ctypes.GetLastError()
+            return False, {}, {}, gle
+
+        while more:
+            pid = int(pe.th32ProcessID)
+            ppid = int(pe.th32ParentProcessID)
+            exe = pe.szExeFile
+            proc_table[pid] = {"pid": pid, "ppid": ppid, "exe": exe}
+            children_map.setdefault(ppid, []).append(pid)
+
+            pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
+            more = kernel32.Process32NextW(h_snap, ctypes.byref(pe))
+            if not more:
+                gle = ctypes.GetLastError()
+                if gle != ERROR_NO_MORE_FILES:
+                    scan_gle = gle
+                break
+    finally:
+        kernel32.CloseHandle(h_snap)
+
+    if scan_gle != 0:
+        return False, proc_table, children_map, scan_gle
+
+    return True, proc_table, children_map, 0
+
+
+def _scan_process_tree(
+    kernel32,
+    tracked_info: dict[int, dict],
+    tracked_pids: set[int],
+    observation_seed_pids: set[int] | None = None,
+) -> tuple[bool, dict, str | None]:
+    """Snapshot enumeration with four-state classification and read-only observation closure.
+
+    States: confirmed / reused / unknown / exited.
+    Delta 2 (rev 8b): On mid-scan failure, preserves partial tables and runs observation closure;
+    every partial discovery is unknown (never kill-eligible) and scan remains conclusive=False.
+    Returns (conclusive: bool, scan_result: dict, error_str: str | None).
+    """
+    conclusive, proc_table, children_map, gle = _read_snapshot_processes(kernel32)
+    if not conclusive and not proc_table:
+        return False, {}, f"Snapshot enumeration failed (gle={gle})"
+
+    scan_error = f"Mid-scan snapshot enumeration failed (gle={gle})" if not conclusive else None
+    classified: dict[int, dict] = {}
+
+    # 1. Classify initial tracked PIDs strictly against pinned creation time (D1)
+    for pid in sorted(tracked_pids):
+        exp_ctime = tracked_info.get(pid, {}).get("create_time")
+
+        # Unpinned tracked member (D1): no captured create_time -> state unknown
+        if exp_ctime is None:
+            if pid not in proc_table:
+                classified[pid] = {
+                    "pid": pid,
+                    "state": "unknown" if not conclusive else "exited",
+                    "exe": tracked_info.get(pid, {}).get("exe", "unknown"),
+                    "create_time": None,
+                    "gle": gle if not conclusive else 0,
+                    "error": (
+                        "Mid-scan enumeration incomplete; absence unverified"
+                        if not conclusive
+                        else "Unpinned tracked member: no captured creation time"
+                    ),
+                }
+            else:
+                classified[pid] = {
+                    "pid": pid,
+                    "state": "unknown",
+                    "exe": proc_table[pid]["exe"],
+                    "ppid": proc_table[pid]["ppid"],
+                    "create_time": None,
+                    "gle": 0,
+                    "error": "Unpinned tracked PID: no captured creation time",
+                }
+            continue
+
+        if pid not in proc_table:
+            classified[pid] = {
+                "pid": pid,
+                "state": "unknown" if not conclusive else "exited",
+                "exe": tracked_info.get(pid, {}).get("exe", "unknown"),
+                "create_time": exp_ctime,
+                "gle": gle if not conclusive else 0,
+                "error": (
+                    "Mid-scan enumeration incomplete; absence unverified"
+                    if not conclusive
+                    else None
+                ),
+            }
+            continue
+
+        ctime, is_act, q_gle = _query_process_identity_by_pid(kernel32, pid)
+        if ctime is None or is_act is None:
+            # Query failed: cross-check fresh snapshot to separate exited from present-unknown
+            present, snap_gle = _is_pid_in_fresh_snapshot(kernel32, pid)
+            if present is False and conclusive:
+                classified[pid] = {
+                    "pid": pid,
+                    "state": "exited",
+                    "exe": proc_table[pid]["exe"],
+                    "create_time": None,
+                    "gle": q_gle,
+                }
+            else:
+                classified[pid] = {
+                    "pid": pid,
+                    "state": "unknown",
+                    "exe": proc_table[pid]["exe"],
+                    "create_time": None,
+                    "gle": q_gle,
+                    "error": f"Identity query failed on present process (gle={q_gle})",
+                }
+        elif not is_act:
+            classified[pid] = {
+                "pid": pid,
+                "state": "exited",
+                "exe": proc_table[pid]["exe"],
+                "create_time": ctime,
+                "gle": 0,
+            }
+        else:
+            # Pinned + active: compare creation time
+            if ctime != exp_ctime:
+                classified[pid] = {
+                    "pid": pid,
+                    "state": "reused",
+                    "exe": proc_table[pid]["exe"],
+                    "ppid": proc_table[pid]["ppid"],
+                    "create_time": ctime,
+                    "expected_create_time": exp_ctime,
+                    "gle": 0,
+                }
+            else:
+                classified[pid] = {
+                    "pid": pid,
+                    "state": "confirmed",
+                    "exe": proc_table[pid]["exe"],
+                    "ppid": proc_table[pid]["ppid"],
+                    "create_time": exp_ctime,
+                    "gle": 0,
+                    "match": "tracked_tree_pid",
+                }
+
+    # 2. Observation closure (read-only): seed from ALL historical observation seed PIDs (rev 8a/8b).
+    # Recurse the full children_map; EVERY discovered PID classifies unknown.
+    # Discovered PIDs never become kill candidates and never change any tracked member's state (D3).
+    seeds = set(observation_seed_pids) if observation_seed_pids is not None else set(tracked_pids)
+    queue = list(sorted(seeds))
+    visited_pids = set(classified.keys())
+
+    while queue:
+        curr_pid = queue.pop(0)
+        for child_pid in children_map.get(curr_pid, []):
+            if child_pid in visited_pids:
+                continue
+            visited_pids.add(child_pid)
+
+            if child_pid not in proc_table:
+                classified[child_pid] = {
+                    "pid": child_pid,
+                    "state": "unknown" if not conclusive else "exited",
+                    "ppid": curr_pid,
+                    "create_time": None,
+                    "gle": gle if not conclusive else 0,
+                    "error": (
+                        "Mid-scan enumeration incomplete; absence unverified"
+                        if not conclusive
+                        else None
+                    ),
+                }
+                continue
+
+            c_ctime, c_act, c_gle = _query_process_identity_by_pid(kernel32, child_pid)
+            if not c_act and c_ctime is not None and conclusive:
+                classified[child_pid] = {
+                    "pid": child_pid,
+                    "state": "exited",
+                    "ppid": curr_pid,
+                    "exe": proc_table[child_pid]["exe"],
+                    "create_time": c_ctime,
+                    "gle": 0,
+                }
+            else:
+                # ALL discovered late descendants classify UNKNOWN (never confirmed, never killed)
+                classified[child_pid] = {
+                    "pid": child_pid,
+                    "state": "unknown",
+                    "ppid": curr_pid,
+                    "exe": proc_table[child_pid]["exe"],
+                    "create_time": c_ctime,
+                    "gle": c_gle,
+                    "error": (
+                        "Late descendant: observed, unpinned, kill refused"
+                        if c_ctime is not None
+                        else f"Late descendant: query failed (gle={c_gle})"
+                    ),
+                }
+            # Continue recursing children map through all discovered descendants for full observation
+            queue.append(child_pid)
+
+    confirmed_survivors = [c for c in classified.values() if c["state"] == "confirmed"]
+    reused_survivors = [c for c in classified.values() if c["state"] == "reused"]
+    unknown_survivors = [c for c in classified.values() if c["state"] == "unknown"]
+    exited_entries = [c for c in classified.values() if c["state"] == "exited"]
+
+    all_survivors = confirmed_survivors + reused_survivors + unknown_survivors
+    clean = len(all_survivors) == 0 and conclusive
+
+    scan_result = {
+        "conclusive": conclusive,
+        "clean": clean,
+        "confirmed": confirmed_survivors,
+        "reused": reused_survivors,
+        "unknown": unknown_survivors,
+        "exited": exited_entries,
+        "survivors": all_survivors,
+        "observation_seeds_count": len(seeds),
+        "ownership_scope_limit": (
+            "Containment claimed ONLY over captured pinned members with verified handle-identity. "
+            "All late descendants and unpinned members classify unknown and are never killed. "
+            "Observation closure seeded from all historical tracked PIDs; stranger trees "
+            "reached via reused seeds classify unknown and force red, never kill."
+        ),
+        "fixture_evidence_note": (
+            "CONTROLLED loopback fixture evidence NOT general hostile parentage spoof proof."
+        ),
+    }
+
+    return conclusive, scan_result, scan_error
+
+
+def _kill_confirmed_candidate(kernel32, pid: int, expected_ctime: int) -> dict:
+    """K1, K2: Single-handle identity-verified kill invariant.
+
+    Opens ONE handle with PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE.
+    Verifies creation time on THAT handle before TerminateProcess on THAT SAME handle.
+    Never falls through to a PID-only kill.
+    """
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_TERMINATE = 0x0001
+    DESIRED_ACCESS = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
+
+    h_proc = kernel32.OpenProcess(DESIRED_ACCESS, False, pid)
+    if not h_proc:
+        open_gle = ctypes.GetLastError()
+        present, snap_gle = _is_pid_in_fresh_snapshot(kernel32, pid)
+        if present is False:
+            return {
+                "pid": pid,
+                "state": "exited",
+                "opened": False,
+                "terminated": False,
+                "gle": open_gle,
+                "status": "already_exited",
+            }
+        else:
+            return {
+                "pid": pid,
+                "state": "unknown",
+                "opened": False,
+                "terminated": False,
+                "gle": open_gle,
+                "status": "open_failed_unknown",
+            }
+
+    try:
+        ft_creation = FILETIME()
+        ft_exit = FILETIME()
+        ft_kernel = FILETIME()
+        ft_user = FILETIME()
+        if not kernel32.GetProcessTimes(
+            h_proc,
+            ctypes.byref(ft_creation),
+            ctypes.byref(ft_exit),
+            ctypes.byref(ft_kernel),
+            ctypes.byref(ft_user),
+        ):
+            q_gle = ctypes.GetLastError()
+            return {
+                "pid": pid,
+                "state": "unknown",
+                "opened": True,
+                "terminated": False,
+                "gle": q_gle,
+                "status": "query_failed_unknown",
+            }
+
+        live_ctime = _filetime_to_int(ft_creation)
+        if live_ctime != expected_ctime:
+            return {
+                "pid": pid,
+                "state": "reused",
+                "opened": True,
+                "terminated": False,
+                "gle": 0,
+                "status": "reused_pid_refused_kill",
+            }
+
+        term_ok = bool(kernel32.TerminateProcess(h_proc, 1))
+        t_gle = 0 if term_ok else ctypes.GetLastError()
+        return {
+            "pid": pid,
+            "state": "confirmed",
+            "opened": True,
+            "terminated": term_ok,
+            "gle": t_gle,
+            "status": "terminated" if term_ok else "terminate_failed",
+        }
+    finally:
+        kernel32.CloseHandle(h_proc)
+
+
 def mode_timeout(nonce: str, log_path: Path, interval: float) -> int:
     """Spawns detached process tree, establishes hazard tree, and emits heartbeats."""
     _verify_hashes_or_abort()
@@ -95,6 +545,9 @@ def mode_timeout(nonce: str, log_path: Path, interval: float) -> int:
         return 2
 
     import contain_core
+
+    advapi32, kernel32, _ = contain_core._WIN32
+    _bind_probe_win32_apis(kernel32)
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start_ts = _utcnow()
@@ -126,43 +579,47 @@ def mode_timeout(nonce: str, log_path: Path, interval: float) -> int:
         f.write(spawn_msg)
         f.flush()
 
-    # C9, C11: Bounded polling (up to 10s at 0.5s cadence) to establish grandchild existence
-    advapi32, kernel32, _ = contain_core._WIN32
+    # C9, C11, C13: Bounded polling (up to 10s at 0.5s cadence) to establish grandchild existence
+    # and record process creation timestamps
     poll_deadline = time.monotonic() + 10.0
     attempts = 0
     tree_members: list[dict] = []
 
     while time.monotonic() < poll_deadline:
         attempts += 1
-        h_snap = kernel32.CreateToolhelp32Snapshot(contain_core.TH32CS_SNAPPROCESS, 0)
-        if h_snap != contain_core.INVALID_HANDLE_VALUE and h_snap:
-            try:
-                pe = contain_core.PROCESSENTRY32W()
-                pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
-                more = kernel32.Process32FirstW(h_snap, ctypes.byref(pe))
-                parent_map: dict[int, tuple[int, str]] = {}
-                while more:
-                    pid = int(pe.th32ProcessID)
-                    ppid = int(pe.th32ParentProcessID)
-                    exe = pe.szExeFile
-                    parent_map[pid] = (ppid, exe)
-                    pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
-                    more = kernel32.Process32NextW(h_snap, ctypes.byref(pe))
+        conclusive, proc_table, children_map, _ = _read_snapshot_processes(kernel32)
+        if conclusive:
+            # Recursive closure over child_pid
+            descendants: list[dict] = []
+            queue = list(children_map.get(child_pid, []))
+            visited = set(queue)
+            while queue:
+                curr = queue.pop(0)
+                if curr in proc_table:
+                    descendants.append(proc_table[curr])
+                for ch in children_map.get(curr, []):
+                    if ch not in visited:
+                        visited.add(ch)
+                        queue.append(ch)
 
-                # Direct descendants of child_pid
-                descendants = [
-                    (pid, parent_map[pid][1])
-                    for pid in parent_map
-                    if parent_map[pid][0] == child_pid
-                ]
-                # MUST require actual captured member exe.lower() == 'ping.exe' BEFORE shape accepted
-                if any(exe.lower() == "ping.exe" for _, exe in descendants):
-                    tree_members = [{"pid": child_pid, "exe": "cmd.exe", "ppid": my_pid}]
-                    for d_pid, d_exe in descendants:
-                        tree_members.append({"pid": d_pid, "exe": d_exe, "ppid": child_pid})
+            # MUST require actual captured member exe.lower() == 'ping.exe' BEFORE shape accepted
+            if any(d["exe"].lower() == "ping.exe" for d in descendants):
+                members = [{"pid": child_pid, "exe": "cmd.exe", "ppid": my_pid}]
+                for d in descendants:
+                    members.append({"pid": d["pid"], "exe": d["exe"], "ppid": d["ppid"]})
+
+                # Query creation times for all tree members (C13)
+                all_times_ok = True
+                for m in members:
+                    ctime, is_act, _ = _query_process_identity_by_pid(kernel32, m["pid"])
+                    if ctime is None or not is_act:
+                        all_times_ok = False
+                        break
+                    m["create_time"] = ctime
+
+                if all_times_ok:
+                    tree_members = members
                     break
-            finally:
-                kernel32.CloseHandle(h_snap)
         time.sleep(0.5)
 
     if not tree_members or len(tree_members) < 2:
@@ -181,7 +638,7 @@ def mode_timeout(nonce: str, log_path: Path, interval: float) -> int:
     tree_pids_str = ",".join(str(m["pid"]) for m in tree_members)
     tree_msg = (
         f"SPAWNED_HAZARD_TREE pids={tree_pids_str} child_pid={child_pid} nonce={nonce} "
-        f"attempts={attempts} members={json.dumps(tree_members)} ts={_utcnow()} "
+        f"attempts={attempts} members={json.dumps(tree_members, separators=(',', ':'))} ts={_utcnow()} "
         f"note=point_in_time_tree_capture_before_timeout\n"
     )
     print(tree_msg, end="", flush=True)
@@ -204,7 +661,7 @@ def mode_timeout(nonce: str, log_path: Path, interval: float) -> int:
 
 
 def mode_check_survivors(nonce: str, log_path: Path) -> int:
-    """R2, R4, C2: Check whether any detached child or grandchild process survived step kill."""
+    """R2, R4, C2, C13: Two-phase observation, honest cleanup, recursive closure, and fail-closed verdict."""
     _verify_hashes_or_abort()
     if sys.platform != "win32":
         print("check-survivors requires Windows host", flush=True)
@@ -212,12 +669,27 @@ def mode_check_survivors(nonce: str, log_path: Path) -> int:
 
     import contain_core
 
+    advapi32, kernel32, _ = contain_core._WIN32
+    _bind_probe_win32_apis(kernel32)
+
+    tracked_info: dict[int, dict] = {}
     tracked_pids: set[int] = set()
+
     if log_path.exists():
         for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
             if f"nonce={nonce}" not in line:
                 continue
             if line.startswith("SPAWNED_HAZARD_TREE "):
+                m_match = re.search(r"members=(\[.*?\])(?:\s+ts=|\s*$)", line)
+                if m_match:
+                    try:
+                        members_list = json.loads(m_match.group(1))
+                        for m in members_list:
+                            pid = int(m["pid"])
+                            tracked_info[pid] = m
+                            tracked_pids.add(pid)
+                    except Exception:
+                        pass
                 for token in line.split():
                     if token.startswith("pids="):
                         pids_raw = token.split("=")[1]
@@ -234,54 +706,212 @@ def mode_check_survivors(nonce: str, log_path: Path) -> int:
                         except ValueError:
                             pass
 
-    survivors: list[dict] = []
-    advapi32, kernel32, _ = contain_core._WIN32
-    h_snap = kernel32.CreateToolhelp32Snapshot(contain_core.TH32CS_SNAPPROCESS, 0)
-    if h_snap != contain_core.INVALID_HANDLE_VALUE and h_snap:
-        try:
-            pe = contain_core.PROCESSENTRY32W()
-            pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
-            more = kernel32.Process32FirstW(h_snap, ctypes.byref(pe))
-            while more:
-                pid = int(pe.th32ProcessID)
-                ppid = int(pe.th32ParentProcessID)
-                exe = pe.szExeFile
+    if not tracked_pids:
+        err_record = {
+            "nonce": nonce,
+            "error": "No tracked PIDs found in log for nonce; cannot conduct survivor check",
+            "clean": False,
+            "ts": _utcnow(),
+        }
+        print(f"SURVIVOR_CHECK: {json.dumps(err_record)}", flush=True)
+        return 1
 
-                if pid in tracked_pids:
-                    survivors.append({"pid": pid, "exe": exe, "ppid": ppid, "match": "tracked_tree_pid"})
-                elif ppid in tracked_pids and pid != 0:
-                    survivors.append({"pid": pid, "exe": exe, "ppid": ppid, "match": "late_descendant"})
+    # Rev 8a/8b: Maintain accumulated historical seed set across all observation phases
+    historical_pids: set[int] = set(tracked_pids)
 
-                pe.dwSize = ctypes.sizeof(contain_core.PROCESSENTRY32W)
-                more = kernel32.Process32NextW(h_snap, ctypes.byref(pe))
-        finally:
-            kernel32.CloseHandle(h_snap)
+    # Phase A: Immediate scan (record-only; races step interruption; evidence only, never verdict)
+    phase_a_ok, phase_a_res, phase_a_err = _scan_process_tree(
+        kernel32,
+        tracked_info,
+        tracked_pids,
+        observation_seed_pids=historical_pids,
+    )
+    # Delta 3 (rev 8b): accumulate historical observations even from an inconclusive A
+    if phase_a_res:
+        for key in ("confirmed", "reused", "unknown", "exited"):
+            for entry in phase_a_res.get(key, []):
+                historical_pids.add(entry["pid"])
+
+    phase_a_clean = bool(phase_a_ok and phase_a_res.get("clean", False))
+    phase_a_record = {
+        "conclusive": phase_a_ok,
+        "error": phase_a_err,
+        "scan": phase_a_res,
+        "observed_snapshot_clean": phase_a_clean,
+        "ts": _utcnow(),
+        "note": "Phase A immediate scan (record-only; races runner step interruption)",
+    }
+
+    # Bounded settle: 15s observational window to observe whether the runner reaped the tree
+    SETTLE_DELAY_SECONDS = 15.0
+    time.sleep(SETTLE_DELAY_SECONDS)
+
+    # Phase B: Post-settle observation (conclusive Phase B with zero observed survivors including unknown discoveries)
+    phase_b_ok, phase_b_res, phase_b_err = _scan_process_tree(
+        kernel32,
+        tracked_info,
+        tracked_pids,
+        observation_seed_pids=historical_pids,
+    )
+    # Accumulate discovered observations from Phase B
+    if phase_b_res:
+        for key in ("confirmed", "reused", "unknown", "exited"):
+            for entry in phase_b_res.get(key, []):
+                historical_pids.add(entry["pid"])
+
+    phase_b_clean = bool(phase_b_ok and phase_b_res.get("clean", False))
+    observed_phase_b_no_survivors = bool(
+        phase_b_ok and len(phase_b_res.get("survivors", [])) == 0
+    )
+    phase_b_record = {
+        "conclusive": phase_b_ok,
+        "error": phase_b_err,
+        "scan": phase_b_res,
+        "observed_snapshot_clean": phase_b_clean,
+        "observed_phase_b_no_survivors": observed_phase_b_no_survivors,
+        "ts": _utcnow(),
+        "settle_delay_seconds": SETTLE_DELAY_SECONDS,
+        "note": "Phase B post-settle observation (conclusive Phase B with zero observed survivors including unknown discoveries)",
+    }
+
+    # Cleanup after Phase B: target ONLY candidates whose state is confirmed (K1-K4).
+    # Expected ctime taken strictly from captured record. Reused and unknown are reported, never killed.
+    kill_log: list[dict] = []
+    unowned_refused: list[dict] = []
+    cleanup_attempted = False
+
+    # Execute emergency cleanup if Phase B found survivors OR if scans were inconclusive
+    if not observed_phase_b_no_survivors or not phase_b_ok:
+        cleanup_attempted = True
+        kill_candidates: list[tuple[int, int]] = []
+
+        if phase_b_ok and phase_b_res:
+            for c in phase_b_res.get("confirmed", []):
+                pid = c["pid"]
+                exp_ctime = tracked_info.get(pid, {}).get("create_time")
+                if exp_ctime is not None:
+                    kill_candidates.append((pid, exp_ctime))
+                else:
+                    unowned_refused.append({
+                        "pid": pid,
+                        "state": "unknown",
+                        "reason": "Unpinned tracked member: kill refused",
+                    })
+            for r in phase_b_res.get("reused", []):
+                unowned_refused.append({
+                    "pid": r["pid"],
+                    "state": "reused",
+                    "reason": "PID reused; kill refused",
+                })
+            for u in phase_b_res.get("unknown", []):
+                unowned_refused.append({
+                    "pid": u["pid"],
+                    "state": "unknown",
+                    "reason": "Lineage/identity unknown or late descendant: kill refused",
+                })
+        else:
+            # Inconclusive fallback: attempt kill ONLY on tracked PIDs with recorded creation time
+            for pid in sorted(tracked_pids):
+                exp_ctime = tracked_info.get(pid, {}).get("create_time")
+                if exp_ctime is not None:
+                    kill_candidates.append((pid, exp_ctime))
+                else:
+                    unowned_refused.append({
+                        "pid": pid,
+                        "state": "unknown",
+                        "reason": "No captured creation time; kill refused",
+                    })
+
+        for pid, exp_ctime in kill_candidates:
+            res = _kill_confirmed_candidate(kernel32, pid, exp_ctime)
+            kill_log.append(res)
+
+    # Phase C: Bounded 2.0s post-kill settle + confirmation scan (G5)
+    PHASE_C_SETTLE_SECONDS = 2.0
+    if cleanup_attempted:
+        time.sleep(PHASE_C_SETTLE_SECONDS)
+
+    phase_c_ok, phase_c_res, phase_c_err = _scan_process_tree(
+        kernel32,
+        tracked_info,
+        tracked_pids,
+        observation_seed_pids=historical_pids,
+    )
+    if phase_c_res:
+        for key in ("confirmed", "reused", "unknown", "exited"):
+            for entry in phase_c_res.get(key, []):
+                historical_pids.add(entry["pid"])
+
+    phase_c_clean = bool(phase_c_ok and phase_c_res.get("clean", False))
+    phase_c_record = {
+        "conclusive": phase_c_ok,
+        "error": phase_c_err,
+        "scan": phase_c_res,
+        "observed_snapshot_clean": phase_c_clean,
+        "ts": _utcnow(),
+        "settle_delay_seconds": PHASE_C_SETTLE_SECONDS if cleanup_attempted else 0.0,
+        "note": "Phase C post-cleanup confirmation scan",
+    }
+
+    # Coverage classification (Delta 4 / Rev 9)
+    inconclusive_phases: list[str] = []
+    if not phase_a_ok:
+        inconclusive_phases.append("Phase A")
+    if not phase_b_ok:
+        inconclusive_phases.append("Phase B")
+    if not phase_c_ok:
+        inconclusive_phases.append("Phase C")
+
+    coverage_label = "blind_window" if inconclusive_phases else "known_lineage_observed"
+
+    # Verdict fail-closed: exit nonzero if Phase B found any survivor, OR any unowned/unknown candidate
+    # was encountered, OR any kill failed/unknown, OR Phase B or C scan was inconclusive, OR Phase C finds anything.
+    # Phase A is evidence-only and NEVER feeds the verdict (D2).
+    kills_clean = (
+        all(k.get("status") in ("terminated", "already_exited") for k in kill_log)
+        and len(unowned_refused) == 0
+    ) if cleanup_attempted else True
+
+    all_clean = bool(
+        phase_b_ok
+        and observed_phase_b_no_survivors
+        and phase_c_ok
+        and phase_c_clean
+        and kills_clean
+    )
 
     record = {
         "nonce": nonce,
         "tracked_pids": sorted(tracked_pids),
-        "survivors": survivors,
-        "clean": len(survivors) == 0,
+        "historical_observation_seeds": sorted(historical_pids),
+        "phase_a": phase_a_record,
+        "settle_delay_seconds": SETTLE_DELAY_SECONDS,
+        "phase_b": phase_b_record,
+        "cleanup_attempted": cleanup_attempted,
+        "cleanup_kills": kill_log,
+        "cleanup_unowned_refused": unowned_refused,
+        "phase_c": phase_c_record,
+        "observed_phase_b_no_survivors": observed_phase_b_no_survivors,
+        "observed_snapshot_clean": {
+            "phase_a": phase_a_clean,
+            "phase_b": phase_b_clean,
+            "phase_c": phase_c_clean,
+        },
+        "coverage": coverage_label,
+        "coverage_phases": inconclusive_phases,
+        "full_tree_containment_proven": False,
+        "unobserved_residual": (
+            "Descendants whose connecting link was born and died between snapshots or "
+            "inside a blind window are inherently unobserved; this record claims nothing "
+            "about them. No rederivation from tracked seeds is made."
+        ),
+        "clean": all_clean,
         "pid_reuse_audit": "PID matching cannot rule out OS PID reuse; recorded fail-closed for audit",
         "ts": _utcnow(),
     }
     print(f"SURVIVOR_CHECK: {json.dumps(record)}", flush=True)
 
-    if not record["clean"]:
-        # C2, C6: Emergency kill covering full captured tree and any late descendants
-        for s in survivors:
-            h = kernel32.OpenProcess(contain_core.PROCESS_TERMINATE, False, s["pid"])
-            if h:
-                kernel32.TerminateProcess(h, 1)
-                kernel32.CloseHandle(h)
-        for tp in tracked_pids:
-            h = kernel32.OpenProcess(contain_core.PROCESS_TERMINATE, False, tp)
-            if h:
-                kernel32.TerminateProcess(h, 1)
-                kernel32.CloseHandle(h)
-        return 1
-
-    return 0
+    return 0 if all_clean else 1
 
 
 def _parse_iso(ts_str: str) -> datetime.datetime:
@@ -302,12 +932,14 @@ def mode_verify_timeout(
     stuck_outcome: str,
     step_name: str = "Deliberately stuck process (step timeout must kill it)",
     poll_seconds: int = 60,
+    interval: float = DEFAULT_HEARTBEAT_INTERVAL,
 ) -> int:
-    """R1 / F1, C3, C4, C8: Verifies timeout via exact check_run_url mapping and coverage."""
+    """R1 / F1, C3, C4, C8, C12: Verifies timeout via exact check_run_url mapping and cadence-aware coverage."""
     verification: dict = {
         "nonce": nonce,
         "stuck_step_outcome": stuck_outcome,
         "timeout_seconds": timeout_seconds,
+        "interval_seconds": interval,
         "check_run_id": check_run_id,
         "run_attempt": run_attempt,
         "checks": {},
@@ -332,7 +964,7 @@ def mode_verify_timeout(
         "pass": outcome_ok,
     }
 
-    # 2. Parse client-side log for nonce continuity and beat coverage (C4: >= timeout_seconds)
+    # 2. Parse client-side log for nonce continuity and cadence-aware beat coverage (C4, C12)
     if not log_path.exists():
         verification["checks"]["log_exists"] = {"pass": False, "error": f"file not found: {log_path}"}
         print(f"VERIFY_TIMEOUT_FAIL: {json.dumps(verification, indent=2)}", flush=True)
@@ -365,32 +997,48 @@ def mode_verify_timeout(
     coverage_ok = False
     max_gap = 0.0
     max_beat_elapsed = beats[-1]["elapsed"] if beats else 0.0
+    coverage_threshold = float(timeout_seconds) - float(interval)
+    max_allowed_gap = float(interval) * 3.0
 
     if len(beats) >= 2:
-        # C4: Coverage requires beats to have reached or exceeded timeout_seconds
-        coverage_ok = max_beat_elapsed >= float(timeout_seconds)
+        # C4, C12: Coverage requires beats to reach within one cadence of timeout boundary
+        coverage_ok = max_beat_elapsed >= coverage_threshold
         for i in range(1, len(beats)):
             gap = beats[i]["elapsed"] - beats[i - 1]["elapsed"]
             if gap > max_gap:
                 max_gap = gap
-        gap_ok = max_gap <= 15.0
+        gap_ok = max_gap <= max_allowed_gap
     else:
         gap_ok = False
 
+    uncovered_window = max(0.0, float(timeout_seconds) - max_beat_elapsed)
+    if coverage_ok:
+        coverage_detail = (
+            f"heartbeats reached {max_beat_elapsed:.2f}s (>= threshold {coverage_threshold:.2f}s = "
+            f"timeout {timeout_seconds}s - interval {interval}s); uncovered window is {uncovered_window:.2f}s "
+            "(only a crash inside final sub-cadence window is indistinguishable; observational evidence of "
+            "beats reaching boundary within cadence, not absolute proof of uninterrupted liveness)"
+        )
+    else:
+        coverage_detail = (
+            f"heartbeats stopped at {max_beat_elapsed:.2f}s (< threshold {coverage_threshold:.2f}s = "
+            f"timeout {timeout_seconds}s - interval {interval}s); uncovered window is {uncovered_window:.2f}s; "
+            "early crash cannot be ruled out"
+        )
+
     verification["checks"]["beat_coverage"] = {
-        "required_seconds": timeout_seconds,
+        "timeout_seconds": timeout_seconds,
+        "interval_seconds": interval,
+        "coverage_threshold_seconds": coverage_threshold,
         "max_beat_elapsed": max_beat_elapsed,
+        "uncovered_window_seconds": round(uncovered_window, 2),
         "pass": coverage_ok,
-        "early_crash_window_closed": True,
-        "detail": (
-            "heartbeats covered full timeout duration"
-            if coverage_ok
-            else f"heartbeats stopped at {max_beat_elapsed:.2f}s (< {timeout_seconds}s); early crash cannot be ruled out"
-        ),
+        "final_subcadence_window_unobservable": coverage_ok,
+        "detail": coverage_detail,
     }
     verification["checks"]["beat_gap_bounded"] = {
         "max_observed_gap": max_gap,
-        "max_allowed_gap": 15.0,
+        "max_allowed_gap": max_allowed_gap,
         "pass": gap_ok,
     }
 
@@ -612,7 +1260,7 @@ def main() -> int:
     ap.add_argument("--log", default="probe_timeout.log")
     ap.add_argument("--receipt", default="proof_principal_receipt.json")
     ap.add_argument("--cleanup-evidence", default="")
-    ap.add_argument("--interval", type=float, default=5.0)
+    ap.add_argument("--interval", type=float, default=DEFAULT_HEARTBEAT_INTERVAL)
     ap.add_argument("--timeout-seconds", type=int, default=120)
     ap.add_argument("--run-id", default="")
     ap.add_argument("--check-run-id", default="")
@@ -645,6 +1293,7 @@ def main() -> int:
             repo=args.repo,
             stuck_outcome=args.stuck_step_outcome,
             step_name=args.step_name,
+            interval=args.interval,
         )
     elif args.mode == "leave":
         return mode_leave(receipt_path)
