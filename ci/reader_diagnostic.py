@@ -22,10 +22,14 @@ def values(st):
 
 def trace(path):
     print("PATH", str(path), flush=True)
-    print("LSTAT_BEFORE", json.dumps(values(path.lstat())), flush=True)
+    lst = path.lstat()
+    print("LSTAT_BEFORE", json.dumps(values(lst)), flush=True)
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
-        print("FSTAT_BEFORE", json.dumps(values(os.fstat(fd))), flush=True)
+        fst = os.fstat(fd)
+        print("FSTAT_BEFORE", json.dumps(values(fst)), flush=True)
+        print("DIFFERING_FIELDS", json.dumps({k: [values(lst)[k], values(fst)[k]]
+              for k in values(lst) if values(lst)[k] != values(fst)[k]}), flush=True)
         print("FIXED_READ_BYTES", len(os.read(fd, 64)), flush=True)
         print("FSTAT_AFTER", json.dumps(values(os.fstat(fd))), flush=True)
     finally:
@@ -111,6 +115,67 @@ with tempfile.TemporaryDirectory(prefix="nexus-reader-fixed-") as directory:
         if not rejected("metadata mutation during read", race):
             failures.append("race accepted")
 
+# Root/lifecycle controls: no product or model. The open/flushed reader may
+# reject stale metadata; record it, close the SAME file, and compare again.
+roots = [("DEFAULT_TEMP", None), ("RUNNER_TEMP", os.environ.get("RUNNER_TEMP"))]
+for label, base in roots:
+    if label == "RUNNER_TEMP" and not base:
+        print("ROOT RUNNER_TEMP UNVERIFIED environment absent", flush=True)
+        continue
+    with tempfile.TemporaryDirectory(prefix="reader-lifecycle-", dir=base) as directory:
+        root = Path(directory)
+        print("ROOT", label, str(root), flush=True)
+        for state in ["closed_writer", "open_flushed_writer"]:
+            path = root / (state + ".txt")
+            writer = open(path, "wb")
+            writer.write(b"fixed lifecycle bytes\n")
+            writer.flush()
+            if state == "closed_writer":
+                writer.close()
+            print("LIFECYCLE", label, state, "writer_closed", writer.closed, flush=True)
+            trace(path)
+            try:
+                print("LIFECYCLE_READER", label, state, "ACCEPTED",
+                      len(reader.read_regular_bytes(path, 65536)), flush=True)
+            except Exception as e:
+                print("LIFECYCLE_READER", label, state, "REJECTED", str(e), flush=True)
+                if state == "closed_writer":
+                    failures.append(label + ": closed writer rejected")
+            finally:
+                writer.close()
+            print("SAME_FILE_AFTER_CLOSE", label, state, "writer_closed", writer.closed, flush=True)
+            trace(path)
+            try:
+                print("AFTER_CLOSE_READER", label, state, "ACCEPTED",
+                      len(reader.read_regular_bytes(path, 65536)), flush=True)
+            except Exception as e:
+                print("AFTER_CLOSE_READER", label, state, "REJECTED", str(e), flush=True)
+                failures.append(label + ": after close rejected")
+
+        # Fixed, harmless producer only. Existing observer callsite, no generated code.
+        producer = root / "fixed_producer.py"
+        producer.write_text("import sys\nfrom pathlib import Path\n"
+                            "sys.stdout.write('fixed stdout\\n')\n"
+                            "sys.stderr.write('fixed stderr\\n')\n"
+                            "Path('calc.py').write_bytes(b'def multiply(a,b):\\n    return a+b\\n')\n",
+                            encoding="utf-8")
+        stdout_path = root / "producer_stdout.log"
+        stderr_path = root / "producer_stderr.log"
+        info = reader.run_observed_turn([sys.executable, str(producer)], root,
+                                        stdout_path, stderr_path, timeout=5.0)
+        print("PRODUCER_EXISTING_OBSERVER", label, json.dumps(info), flush=True)
+        print("PRODUCER_PARENT_EXITED", info.get("parent_exited"),
+              "observer returned after capture context closure; descendants UNKNOWN", flush=True)
+        for path in [stdout_path, stderr_path, root / "calc.py"]:
+            trace(path)
+            try:
+                print("PRODUCER_READER", label, path.name, "ACCEPTED",
+                      len(reader.read_regular_bytes(path, 65536)), flush=True)
+            except Exception as e:
+                print("PRODUCER_READER", label, path.name, "REJECTED", str(e), flush=True)
+        if info.get("exit_code") != 0:
+            failures.append(label + ": harmless producer nonzero")
+
 print("DIAGNOSTIC_FAILURES", json.dumps(failures), flush=True)
-print("No model/product commands, credentials, artifact uploads or generated module execution.", flush=True)
+print("No model/product commands, credentials or artifact uploads. Fixed harmless fixture producer only; no model-generated module execution.", flush=True)
 sys.exit(1 if failures else 0)
