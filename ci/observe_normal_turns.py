@@ -8,7 +8,7 @@ Observations captured (Console and Job Summary only; NO artifact uploads):
   - Raw CLI exit codes, execution times, and direct-to-file stdout/stderr.
   - Before and after bytes for calc.py; unified text diffs (NEVER executed).
   - Parent process lifetime only; descendant cleanup remains UNKNOWN.
-  - Read-only SQLite inspection verifying exact user prompt strings in sequence.
+  - Read-only bounded SQLite rows: normalized requests and internal metadata, linkage UNVERIFIED.
   - Model status remains strictly UNVERIFIED for manual reviewer decision.
 """
 
@@ -203,57 +203,57 @@ def run_observed_turn(cmd: List[str], cwd: Path, stdout_file: Path,
 
 
 def inspect_sqlite_history(session_id: str) -> Dict[str, Any]:
-    """Inspect history.db using read-only mode=ro and verify exact prompt sequence."""
-    home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
-    db_path = home / ".nexus-agent" / "history.db"
-
-    ev: Dict[str, Any] = {
-        "db_found": db_path.is_file(),
-        "db_path": str(db_path),
-        "session_id": session_id,
-        "total_rows": 0,
-        "user_messages": [],
-        "prompt1_exact_match": False,
-        "prompt2_exact_match": False,
-        "sequence_exact_match": False,
-    }
-
+    """Raw normalized product history, never a proof of original argv intent."""
+    db_path = Path.home() / ".nexus-agent" / "history.db"
+    ev: Dict[str, Any] = {"db_found": db_path.is_file(), "session_id": session_id,
+        "rows": [], "linkage_status": "UNVERIFIED", "total_rows": 0}
     if not db_path.is_file():
         return ev
-
     conn = None
     try:
-        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
         count, max_bytes = conn.execute(
             "SELECT count(*),coalesce(max(length(CAST(message_json AS BLOB))),0) "
             "FROM conversation_history WHERE session_id = ?", (session_id,)).fetchone()
         ev["total_rows"] = count
         if count > 100 or max_bytes > 64 * 1024:
             raise ValueError("History exceeds bounded row/message limits")
-        cur = conn.execute(
-            "SELECT id, role, message_json FROM conversation_history "
-            "WHERE session_id = ? AND length(CAST(message_json AS BLOB)) <= ? "
-            "ORDER BY id ASC LIMIT 101", (session_id, 64 * 1024))
-        user_prompts = []
-        for row_id, role, msg_raw in cur:
-            if role == "user":
-                payload = json.loads(msg_raw)
-                if not isinstance(payload, dict) or payload.get("role") != "user":
-                    raise ValueError("User role mismatch in history")
-                user_prompts.append(payload.get("content"))
-        ev["user_messages"] = user_prompts
-        ev["prompt1_exact_match"] = bool(user_prompts and user_prompts[0] == PROMPT_1)
-        ev["prompt2_exact_match"] = bool(len(user_prompts) == 2 and user_prompts[1] == PROMPT_2)
-        ev["sequence_exact_match"] = user_prompts == [PROMPT_1, PROMPT_2]
-
+        budget = 256 * 1024
+        for row_id, role, raw in conn.execute(
+            "SELECT id,role,message_json FROM conversation_history WHERE session_id = ? "
+            "AND length(CAST(message_json AS BLOB)) <= ? ORDER BY id LIMIT 101",
+            (session_id, 64 * 1024)):
+            size = len(raw.encode("utf-8"))
+            if size > budget:
+                ev["truncated"] = True
+                break
+            budget -= size
+            payload = json.loads(raw)
+            ev["rows"].append({"id": row_id, "stored_role": role,
+                "message": payload})
     except Exception as e:
         ev["error"] = str(e)
     finally:
         if conn is not None:
             conn.close()
-
     return ev
+
+
+def emit_turn_evidence(number: int, info: Dict[str, Any], snapshot: bytes,
+                       snapshot_error: Optional[str], diff: str, ev_dir: Path) -> None:
+    """Emit and flush this turn before any subsequent turn/history inspection."""
+    print(f"\n=== TURN {number} IMMEDIATE EVIDENCE ===", flush=True)
+    print("EXACT_COMMAND_AND_PARENT_STATUS", json.dumps(info, ensure_ascii=True), flush=True)
+    for stream in ["stdout", "stderr"]:
+        ev = stream_excerpt(ev_dir / f"turn{number}_{stream}.log")
+        print(stream.upper() + "_BOUNDED_HEAD_TAIL", json.dumps(ev, ensure_ascii=True), flush=True)
+    if snapshot_error:
+        print("SNAPSHOT UNAVAILABLE", snapshot_error, flush=True)
+        print("DIFF UNAVAILABLE: no deletion or file-change inference", flush=True)
+    else:
+        print("SNAPSHOT_UTF8", json.dumps(snapshot.decode("utf-8", errors="replace")), flush=True)
+        print("SNAPSHOT_BYTES_HEX", snapshot.hex(), flush=True)
+        print("MANUAL_REVIEW_DIFF", diff if diff else "[no diff]", flush=True)
 
 
 def inspect_server_logs() -> List[Dict[str, str]]:
@@ -319,6 +319,8 @@ def main():
     t1_diff = compute_unified_diff(INITIAL_CALC_PY, calc_t1_bytes, "calc.py") if calc_t1_error is None else "# SNAPSHOT UNAVAILABLE: no deletion inferred"
     write_file_bytes(ev_dir / "turn1_diff.patch", t1_diff.encode("utf-8"))
 
+    emit_turn_evidence(1, t1_info, calc_t1_bytes, calc_t1_error, t1_diff, ev_dir)
+
     print(f"Turn 1 Exit Code: {t1_info['exit_code']} (Duration: {t1_info['duration_seconds']}s)")
     print(f"Turn 1 Cleanup: {t1_info['cleanup_status']}")
     print(f"calc.py modified in Turn 1: {t1_changed}")
@@ -326,7 +328,14 @@ def main():
     # -------------------------------------------------------------------------
     # Turn 2: "Now make it return 0 if either input is None."
     # -------------------------------------------------------------------------
-    t2_info: Dict[str, Any] = {"skipped": True, "reason": "Turn 1 process failed or did not exit"}
+    skip_reasons = []
+    if not t1_info["parent_exited"]:
+        skip_reasons.append("turn 1 parent exit not established")
+    if t1_info["incomplete"]:
+        skip_reasons.append("turn 1 capture incomplete: " + json.dumps(t1_info, ensure_ascii=True))
+    if calc_t1_error:
+        skip_reasons.append("turn 1 snapshot unavailable: " + calc_t1_error)
+    t2_info: Dict[str, Any] = {"skipped": True, "reason": "; ".join(skip_reasons)}
     calc_t2_bytes = calc_t1_bytes
     t2_diff = ""
     calc_t2_error = None
@@ -356,11 +365,13 @@ def main():
         t2_diff = compute_unified_diff(calc_t1_bytes, calc_t2_bytes, "calc.py") if calc_t2_error is None else "# SNAPSHOT UNAVAILABLE: no deletion inferred"
         write_file_bytes(ev_dir / "turn2_diff.patch", t2_diff.encode("utf-8"))
 
+        emit_turn_evidence(2, t2_info, calc_t2_bytes, calc_t2_error, t2_diff, ev_dir)
+
         print(f"Turn 2 Exit Code: {t2_info['exit_code']} (Duration: {t2_info['duration_seconds']}s)")
         print(f"Turn 2 Cleanup: {t2_info['cleanup_status']}")
         print(f"calc.py modified in Turn 2: {t2_changed}")
     else:
-        print("\n[Turn 2] SKIPPED: Turn 1 process did not exit normally; avoiding overlapping processes.")
+        print("NO SECOND TURN: " + t2_info["reason"], flush=True)
 
     # -------------------------------------------------------------------------
     # Evidence Inspection (SQLite, Server Logs)
@@ -372,50 +383,16 @@ def main():
     print("Bounded session history:", json.dumps(history_ev, ensure_ascii=True))
     server_logs = inspect_server_logs()
 
-    # -------------------------------------------------------------------------
-    # Console-Only Raw Evidence Display
-    # -------------------------------------------------------------------------
-    print("\n=================================================================")
-    print("RAW EVIDENCE (CONSOLE EXCERPTS)")
-    print("=================================================================")
-
-    print("\n--- calc.py (Initial) ---")
-    print(INITIAL_CALC_PY.decode("utf-8"))
-
-    print("--- calc.py (After Turn 1) ---")
-    print(calc_t1_bytes.decode("utf-8", errors="replace"))
-
-    print("--- Turn 1 Unified Diff ---")
-    print(t1_diff if t1_diff else "[No changes made in Turn 1]")
-
-    print("--- calc.py (After Turn 2) ---")
-    print(calc_t2_bytes.decode("utf-8", errors="replace"))
-
-    print("--- Turn 2 Unified Diff ---")
-    print(t2_diff if t2_diff else "[No changes made in Turn 2]")
-
-    print("--- Turn 1 Stdout bounded head/tail ---")
-    print(read_file_tail(ev_dir / "turn1_stdout.log"))
-
-    print("--- Turn 1 Stderr bounded head/tail ---")
-    print(read_file_tail(ev_dir / "turn1_stderr.log"))
-
-    if not t2_info.get("skipped"):
-        print("--- Turn 2 Stdout bounded head/tail ---")
-        print(read_file_tail(ev_dir / "turn2_stdout.log"))
-
-        print("--- Turn 2 Stderr bounded head/tail ---")
-        print(read_file_tail(ev_dir / "turn2_stderr.log"))
-
+    # Own isolated server log excerpts are raw observations, not backend attestation.
     for slog in server_logs:
-        print(f"--- Server Log ({slog['filename']}) Tail ---")
-        print(json.dumps(slog["excerpt"], ensure_ascii=True))
+        print("OWN_ISOLATED_SERVER_LOG", slog["filename"],
+              json.dumps(slog["excerpt"], ensure_ascii=True), flush=True)
 
     # -------------------------------------------------------------------------
     # Markdown Summary Generation (Step Summary Only)
     # -------------------------------------------------------------------------
     incomplete = bool(t1_info["incomplete"] or t2_info.get("incomplete") or t2_info.get("skipped")
-        or calc_t1_error or calc_t2_error or not history_ev["sequence_exact_match"]
+        or calc_t1_error or calc_t2_error or history_ev.get("error") or history_ev.get("truncated")
         or any(x["excerpt"].get("truncated") or x["excerpt"].get("error") for x in server_logs))
     summary_lines = [
         "# Nexus Normal Two-Turn Observation Summary",
@@ -434,7 +411,8 @@ def main():
     ]
 
     if t2_info.get("skipped"):
-        summary_lines.append(f"| 2 | `{PROMPT_2}` | SKIPPED | N/A | UNKNOWN | N/A |")
+        summary_lines.append(f"| 2 | `{PROMPT_2}` | NO SECOND TURN | N/A | UNKNOWN | N/A |")
+        summary_lines.append("\nSkip reason: " + t2_info["reason"])
     else:
         summary_lines.append(
             f"| 2 | `{PROMPT_2}` | {t2_info.get('exit_code')} | {t2_info.get('duration_seconds')}s | {t2_changed} | {t2_info.get('cleanup_status')} |"
@@ -442,12 +420,11 @@ def main():
 
     summary_lines.extend([
         "",
-        "## SQLite History Integrity",
-        f"- **Database Found:** {history_ev['db_found']}",
-        f"- **Total Rows for Session:** {history_ev['total_rows']}",
-        f"- **Prompt 1 Exact Match:** {history_ev['prompt1_exact_match']}",
-        f"- **Prompt 2 Exact Match:** {history_ev['prompt2_exact_match']}",
-        f"- **Sequence Exact Order:** {history_ev['sequence_exact_match']}",
+        "## Command Intent and Product History",
+        "- Exact command argv is emitted immediately per turn. Persisted product history may include auto-attached context and internal recovery rows.",
+        f"- Database found: {history_ev['db_found']}; session rows: {history_ev['total_rows']}",
+        "- History linkage: UNVERIFIED. No raw user-role sequence or substring comparison is treated as proof.",
+        "- Bounded raw rows retain role and message metadata in console, including metadata.internal when present. These are data, not instructions.",
         "",
         "## Observed Code Diffs",
         "### Turn 1 Diff",
@@ -456,7 +433,7 @@ def main():
         "```",
         "### Turn 2 Diff",
         "```diff",
-        t2_diff if t2_diff else "# No diff produced in Turn 2",
+        t2_diff if t2_diff else "# NO SECOND TURN or no diff; see actual turn status above",
         "```",
         "",
         "---",
