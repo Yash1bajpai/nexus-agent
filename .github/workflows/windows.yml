@@ -670,7 +670,7 @@ jobs:
       # ---------------------------------------------------------------------
       # 9. POST the two requests; save RAW response bytes
       # ---------------------------------------------------------------------
-      - name: Run greeting and tool-call requests (D3: liveness evidence first)
+      - name: Run greeting and tool-call requests (D3 liveness evidence first)
         id: requests
         timeout-minutes: 8
         shell: pwsh
@@ -754,7 +754,7 @@ jobs:
       # ---------------------------------------------------------------------
       # 12. Stop llama-server
       # ---------------------------------------------------------------------
-      - name: Stop llama-server (D4: dump evidence first)
+      - name: Stop llama-server (D4 dump evidence first)
         id: cleanup
         if: always()
         timeout-minutes: 2
