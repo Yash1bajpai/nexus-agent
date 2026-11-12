@@ -401,7 +401,7 @@ def main():
         "- **Capture Limits:** Disk quota monitoring is best-effort, not a hard storage bound. Printed streams are bounded; TRUNCATED means INCOMPLETE.",
         "- **Engine Evidence:** Pull-model exit 0 is not engine-load proof. Server log tails and CLI output are raw observations only; fallback/readiness are not inferred.",
         "- **Model Status:** `UNVERIFIED` (Evidence observation only; not a qualification verdict)",
-        "- **Model Target:** `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` (Baseline small model)",
+        "- **Model Target:** `" + os.environ.get("NEXUS_AGENT_MODEL_REPO", "see job env") + "/" + os.environ.get("NEXUS_AGENT_MODEL_FILENAME", "see job env") + "`",
         "- **Persistence Session:** `" + args.session_id + "`",
         "",
         "## Turn Executions",
@@ -446,3 +446,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
