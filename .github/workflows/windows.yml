@@ -254,3 +254,428 @@ jobs:
             ) -join "`n"
             $md | Add-Content $env:GITHUB_STEP_SUMMARY
           }
+
+  # -------------------------------------------------------------------------
+  # TEST 0 (raw engine smoke) for the high-spec tier evaluation, appended as a
+  # second job on this experimental ref only. Reviewed candidate; runs only on
+  # manual dispatch. No artifacts/uploads/cache; raw evidence to console and
+  # step summary. PASS criteria: parsed tool_calls with valid JSON args, no
+  # special-token or thinking leaks in content. FAIL prints raw bytes.
+  # -------------------------------------------------------------------------
+  test0-engine-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. Initialize isolated environment (runner context invalid in job env)
+      # ---------------------------------------------------------------------
+      - name: Initialize isolated environment
+        id: init
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $isoHome = "$env:RUNNER_TEMP\isolated_home"
+          New-Item -ItemType Directory -Force $isoHome | Out-Null
+
+          "USERPROFILE=$isoHome" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HOME=$isoHome" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONPATH=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONUNBUFFERED=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MODEL_REPO=LiquidAI/LFM2.5-8B-A1B-GGUF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MODEL_FILE=LFM2.5-8B-A1B-Q4_K_M.gguf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SERVER_PORT=18080" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $env:USERPROFILE = $isoHome
+          $env:HOME = $isoHome
+          $env:PYTHONPATH = ""
+
+          $drive = (Get-PSDrive -Name ($env:RUNNER_TEMP.Split(':')[0]))
+          Write-Host ("Free disk on {0}: {1:N1} GB" -f $drive.Name, ($drive.Free/1GB))
+          Write-Host "Isolated profile initialized under $isoHome"
+
+      # ---------------------------------------------------------------------
+      # 2. Checkout repository (tool schemas are extracted from exact source)
+      # ---------------------------------------------------------------------
+      - name: Checkout repository
+        id: checkout
+        timeout-minutes: 2
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # 3. Setup Python 3.12 (stdlib only: schema extraction + evaluation)
+      # ---------------------------------------------------------------------
+      - name: Setup Python 3.12
+        id: setup_python
+        timeout-minutes: 2
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # ---------------------------------------------------------------------
+      # 4. Record provenance and write helper scripts
+      # ---------------------------------------------------------------------
+      - name: Record provenance and write helper scripts
+        id: helpers
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $gitHead = ([string]::Join("`n", @(git rev-parse HEAD))).Trim()
+          Write-Host "Git HEAD Commit: $gitHead"
+          $gitTree = ([string]::Join("`n", @(git rev-parse 'HEAD^{tree}'))).Trim()
+          Write-Host "Git Tree: $gitTree"
+          $gitStatus = ([string]::Join("`n", @(git status --porcelain))).Trim()
+          Write-Host "Git Status Porcelain: $gitStatus"
+          if ($gitStatus) { throw "Dirty worktree is not an exact committed source run" }
+
+          $toolsHash = (Get-FileHash -Algorithm SHA256 "src\nexus_agent_ai\agent\tools.py").Hash.ToLower()
+          Write-Host "Checked-out tools.py SHA256: $toolsHash"
+
+          $extractor = @'
+          """Extract tool schemas from nexus_agent_ai/agent/tools.py without importing it.
+
+          Emits exactly what LocalProvider._convert_tools emits:
+          [{"type":"function","function":{"name","description","parameters"}}]
+          Stdlib-only AST literal evaluation; no product code is executed.
+          """
+          import ast, json, sys
+
+          ORDER = ["read_file", "write_file", "patch_file", "list_directory",
+                   "run_code", "search_web", "git_status", "git_diff", "run_tests"]
+
+          def main(path):
+              tree = ast.parse(open(path, encoding="utf-8").read())
+              found = {}
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                      f = node.value.func
+                      if (isinstance(f, ast.Name) and f.id == "Tool") or (isinstance(f, ast.Attribute) and f.attr == "Tool"):
+                          kw = {k.arg: ast.literal_eval(k.value) for k in node.value.keywords
+                                if k.arg in ("name", "description", "input_schema")}
+                          if len(kw) == 3:
+                              found[kw["name"]] = kw
+              missing = [n for n in ORDER if n not in found]
+              if missing:
+                  raise SystemExit("MISSING TOOLS: " + ",".join(missing))
+              payload = [{"type": "function", "function": {"name": n,
+                          "description": found[n]["description"],
+                          "parameters": found[n]["input_schema"]}} for n in ORDER]
+              json.dump(payload, sys.stdout, indent=1)
+              print()
+
+          main(sys.argv[1])
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\extract_tools.py" -Value $extractor -Encoding utf8
+
+          $builder = @'
+          """Build the two raw request bodies for Test 0 from the extracted payload."""
+          import json, sys
+
+          tools = json.load(open(sys.argv[1], encoding="utf-8"))
+          req_a = {
+              "model": sys.argv[2],
+              "messages": [{"role": "user", "content": "Hello, reply with a short friendly greeting."}],
+              "max_tokens": 256,
+              "stream": False,
+          }
+          req_b = {
+              "model": sys.argv[2],
+              "messages": [{"role": "user", "content": "Fix multiply in calc.py so it multiplies."}],
+              "tools": tools,
+              "max_tokens": 2048,
+              "stream": False,
+          }
+          json.dump(req_a, open("req_a.json", "w", encoding="utf-8"))
+          json.dump(req_b, open("req_b.json", "w", encoding="utf-8"))
+          print("req_b tools:", [t["function"]["name"] for t in tools])
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\build_requests.py" -Value $builder -Encoding utf8
+
+          $evaluator = @'
+          """Test 0 verdict evaluator. Reads resp_a.json and resp_b.json raw bytes.
+
+          PASS iff all of:
+            A1. resp_a parses as JSON and has non-empty message content.
+            B1. resp_b parses as JSON.
+            B2. choices[0].message.tool_calls is a non-empty list.
+            B3. every tool call name is one of the emitted schemas and its
+                function.arguments string parses as a JSON object.
+            B4. message content contains no "<|tool_call" and no "<|im_" leak.
+            B5. message content contains no "<think" leak (thinking confined to
+                reasoning_content or absent).
+          FAIL otherwise; raw bytes are the evidence.
+          """
+          import json, sys
+
+          failures = []
+
+          raw_a = open("resp_a.json", "rb").read()
+          raw_b = open("resp_b.json", "rb").read()
+          print("=== RAW RESPONSE A BYTES ===")
+          sys.stdout.write(raw_a.decode("utf-8", errors="replace")[:20000])
+          print("\n=== RAW RESPONSE B BYTES ===")
+          sys.stdout.write(raw_b.decode("utf-8", errors="replace")[:20000])
+          print("\n=== END RAW BYTES ===")
+
+          try:
+              a = json.loads(raw_a)
+              content_a = (a["choices"][0]["message"].get("content") or "").strip()
+              if not content_a:
+                  failures.append("A1: greeting response has empty content")
+          except Exception as e:
+              failures.append(f"A1: resp_a JSON parse/content failed: {e}")
+
+          tool_names = set()
+          try:
+              tool_names = {t["function"]["name"] for t in json.load(open("tools-payload.json", encoding="utf-8"))}
+          except Exception as e:
+              failures.append(f"B0: tools payload unreadable: {e}")
+
+          try:
+              b = json.loads(raw_b)
+          except Exception as e:
+              failures.append(f"B1: resp_b JSON parse failed: {e}")
+              b = None
+
+          if b is not None:
+              try:
+                  msg = b["choices"][0]["message"]
+              except Exception as e:
+                  failures.append(f"B1: resp_b missing choices[0].message: {e}")
+                  msg = {}
+              tcs = msg.get("tool_calls")
+              if not tcs or not isinstance(tcs, list):
+                  failures.append("B2: no parsed tool_calls in response")
+              else:
+                  for i, tc in enumerate(tcs):
+                      fn = (tc or {}).get("function") or {}
+                      name = fn.get("name")
+                      if name not in tool_names:
+                          failures.append(f"B3: tool_calls[{i}] name {name!r} not in emitted schemas")
+                      args = fn.get("arguments")
+                      try:
+                          parsed = json.loads(args) if isinstance(args, str) else args
+                          if not isinstance(parsed, dict):
+                              failures.append(f"B3: tool_calls[{i}] arguments not a JSON object")
+                      except Exception as e:
+                          failures.append(f"B3: tool_calls[{i}] arguments invalid JSON: {e}")
+              content_b = msg.get("content") or ""
+              if "<|tool_call" in content_b or "<|im_" in content_b:
+                  failures.append("B4: special-token leak in message content")
+              if "<think" in content_b:
+                  failures.append("B5: thinking leaked into content (not confined to reasoning_content)")
+              reasoning = msg.get("reasoning_content")
+              print(f"reasoning_content present: {reasoning is not None}, length: {len(reasoning) if isinstance(reasoning, str) else 0}")
+              print(f"finish_reason: {b['choices'][0].get('finish_reason')}")
+
+          verdict = "PASS" if not failures else "FAIL"
+          print(f"TEST0 VERDICT: {verdict}")
+          for f in failures:
+              print("FAIL-ITEM:", f)
+
+          lines = [
+              "# Nexus Test 0 LFM2.5-8B Engine Smoke Summary",
+              "",
+              f"- **Verdict:** {verdict}",
+              "- **Model:** `LiquidAI/LFM2.5-8B-A1B-GGUF` / `LFM2.5-8B-A1B-Q4_K_M.gguf`",
+              "- **Evidence:** raw response bytes printed to the job console above; no artifact uploads by design",
+              "",
+              "## Criteria",
+          ]
+          for f in failures:
+              lines.append(f"- FAIL: {f}")
+          if not failures:
+              lines.append("- All PASS criteria met (A1, B1-B5); see console for raw bytes")
+          open("summary.md", "w", encoding="utf-8").write("\n".join(lines) + "\n")
+          sys.exit(0 if verdict == "PASS" else 1)
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\evaluate_test0.py" -Value $evaluator -Encoding utf8
+          Write-Host "Helper scripts written"
+
+      # ---------------------------------------------------------------------
+      # 5. Extract exact tool payload from checked-out source
+      # ---------------------------------------------------------------------
+      - name: Extract exact tool payload
+        id: tool_payload
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          python "$env:RUNNER_TEMP\extract_tools.py" "src\nexus_agent_ai\agent\tools.py" | Out-File -FilePath tools-payload.json -Encoding utf8
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (extract_tools): $rc"
+          if ($rc -ne 0) { throw "schema extraction failed with exit code $rc" }
+          Write-Host "--- tools-payload.json (exact _convert_tools output) ---"
+          Get-Content tools-payload.json
+
+      # ---------------------------------------------------------------------
+      # 6. Download and verify the pinned b7075 engine (fail-closed SHA256)
+      # ---------------------------------------------------------------------
+      - name: Download and verify llama-server b7075
+        id: engine
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $zip = "$env:RUNNER_TEMP\llama-b7075-bin-win-cpu-x64.zip"
+          $url = "https://github.com/ggml-org/llama.cpp/releases/download/b7075/llama-b7075-bin-win-cpu-x64.zip"
+          curl.exe -L --fail --silent --show-error -o $zip $url
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (engine download): $rc"
+          if ($rc -ne 0) { throw "engine download failed with exit code $rc" }
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          Write-Host "Engine ZIP SHA256: $hash"
+          $expected = "ee57177a13347b386e8c097908fbb7f37c814f8a9c2948aef64f843a93221f13"
+          if ($hash -ne $expected) { throw "Engine SHA256 mismatch: got $hash expected $expected" }
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\llama-server" -Force
+          $exe = Get-ChildItem -Recurse -Filter llama-server.exe "$env:RUNNER_TEMP\llama-server" | Select-Object -First 1
+          if (-not $exe) { throw "llama-server.exe not found after extraction" }
+          "ENGINE_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Engine extracted: $($exe.FullName)"
+
+      # ---------------------------------------------------------------------
+      # 7. Download the 5.16 GB model; record SHA256 and download time
+      # ---------------------------------------------------------------------
+      - name: Download LFM2.5-8B-A1B Q4_K_M GGUF
+        id: model
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $model = "$env:RUNNER_TEMP\$env:MODEL_FILE"
+          $url = "https://huggingface.co/$env:MODEL_REPO/resolve/main/$env:MODEL_FILE"
+          Write-Host "Downloading $url"
+          $start = Get-Date
+          curl.exe -L --fail --silent --show-error -o $model $url
+          $rc = $LASTEXITCODE
+          $elapsed = [int]((Get-Date) - $start).TotalSeconds
+          Write-Host "Raw Exit Code (model download): $rc ; download_seconds=$elapsed"
+          if ($rc -ne 0) { throw "model download failed with exit code $rc" }
+          $size = (Get-Item $model).Length
+          $hash = (Get-FileHash -Algorithm SHA256 $model).Hash.ToLower()
+          Write-Host "MODEL_SIZE_BYTES=$size"
+          Write-Host "MODEL_SHA256=$hash  (no pinned digest exists for model GGUFs; recorded for the review log)"
+          "MODEL_PATH=$model" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # ---------------------------------------------------------------------
+      # 8. Launch llama-server with product-parity flags; wait for readiness
+      # ---------------------------------------------------------------------
+      - name: Launch llama-server and wait for readiness
+        id: server
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $logPath = "$env:RUNNER_TEMP\test0-server.log"
+          $srvArgs = @(
+            "-m", $env:MODEL_PATH,
+            "--alias", "test0-lfm8b",
+            "-c", "4096",
+            "--parallel", "1",
+            "--port", $env:SERVER_PORT,
+            "--host", "127.0.0.1",
+            "-t", "4",
+            "--jinja",
+            "--temp", "0.1",
+            "--top-k", "50",
+            "--repeat-penalty", "1.1"
+          )
+          Write-Host "Launch: $($env:ENGINE_EXE) $($srvArgs -join ' ')"
+          $proc = Start-Process -FilePath $env:ENGINE_EXE -ArgumentList $srvArgs `
+            -RedirectStandardOutput $logPath -RedirectStandardError "$env:RUNNER_TEMP\test0-server.err.log" `
+            -PassThru -NoNewWindow
+          "SERVER_PID=$($proc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "llama-server PID: $($proc.Id)"
+
+          $deadline = (Get-Date).AddSeconds(300)
+          $ready = $false
+          $models = $null
+          while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) { break }
+            try {
+              $models = Invoke-RestMethod -Uri "http://127.0.0.1:$env:SERVER_PORT/v1/models" -TimeoutSec 3
+              if ($models) { $ready = $true; break }
+            } catch { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ready) {
+            Write-Host "--- server log tail on readiness failure ---"
+            if (Test-Path $logPath) { Get-Content $logPath -Tail 80 }
+            throw "llama-server did not become ready within 300s"
+          }
+          Write-Host "Server ready. /v1/models:"
+          $models | ConvertTo-Json -Depth 5
+          Write-Host "--- server log head (version lines) ---"
+          Get-Content $logPath -TotalCount 30
+
+      # ---------------------------------------------------------------------
+      # 9. POST the two requests; save RAW response bytes
+      # ---------------------------------------------------------------------
+      - name: Run greeting and tool-call requests
+        id: requests
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          python "$env:RUNNER_TEMP\build_requests.py" tools-payload.json "test0-lfm8b"
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (build_requests): $rc"
+          if ($rc -ne 0) { throw "request build failed with exit code $rc" }
+          Write-Host "--- req_b.json (full request body) ---"
+          Get-Content req_b.json
+
+          $base = "http://127.0.0.1:$env:SERVER_PORT/v1/chat/completions"
+          curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_a.json" -o resp_a.json $base
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request A): $rc"
+          if ($rc -ne 0) { throw "request A failed with exit code $rc" }
+          curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_b.json" -o resp_b.json $base
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request B): $rc"
+          if ($rc -ne 0) { throw "request B failed with exit code $rc" }
+          Write-Host "resp_a bytes: $((Get-Item resp_a.json).Length) ; resp_b bytes: $((Get-Item resp_b.json).Length)"
+
+      # ---------------------------------------------------------------------
+      # 10. Evaluate PASS/FAIL against the accepted criteria
+      # ---------------------------------------------------------------------
+      - name: Evaluate Test 0 verdict
+        id: verdict
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          python "$env:RUNNER_TEMP\evaluate_test0.py"
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (evaluate_test0): $rc"
+          if ($rc -ne 0) { throw "TEST 0 FAILED (see FAIL-ITEM lines and raw bytes above)" }
+
+      # ---------------------------------------------------------------------
+      # 11. Publish step summary
+      # ---------------------------------------------------------------------
+      - name: Publish step summary
+        id: summary
+        if: always()
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (Test-Path summary.md) {
+            Get-Content summary.md | Add-Content $env:GITHUB_STEP_SUMMARY
+          } else {
+            @(
+              "# Nexus Test 0 LFM2.5-8B Engine Smoke Summary",
+              "",
+              "- **Execution Status:** INCOMPLETE (terminated before verdict generation)",
+              "- **Model Qualification:** UNVERIFIED"
+            ) -join "`n" | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+
+      # ---------------------------------------------------------------------
+      # 12. Stop llama-server
+      # ---------------------------------------------------------------------
+      - name: Stop llama-server
+        id: cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          Get-Process -Name "llama-server" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "Stopping llama-server PID $($_.Id)"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+          }
