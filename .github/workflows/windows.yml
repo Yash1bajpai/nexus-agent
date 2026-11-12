@@ -574,35 +574,36 @@ jobs:
           Remove-Item $pidFile,$exitFile -Force -ErrorAction SilentlyContinue
 
           # D2: wrapper records child PID at start, and exit code + UTC time when the server exits
-          @'
-param(
-  [string]$Exe,
-  [string]$LogOut,
-  [string]$LogErr,
-  [string]$PidFile,
-  [string]$ExitFile,
-  [string]$Port,
-  [string]$ModelPath
-)
-$srvArgs = @(
-  "-m", $ModelPath,
-  "--alias", "test0-lfm8b",
-  "-c", "4096",
-  "--parallel", "1",
-  "--port", $Port,
-  "--host", "127.0.0.1",
-  "-t", "4",
-  "--jinja",
-  "--temp", "0.1",
-  "--top-k", "50",
-  "--repeat-penalty", "1.1"
-)
-$p = Start-Process -FilePath $Exe -ArgumentList $srvArgs -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr -PassThru -NoNewWindow
-"SERVER_PID=$($p.Id)" | Out-File -FilePath $PidFile -Encoding utf8
-$p.WaitForExit()
-"EXIT_CODE=$($p.ExitCode)" | Out-File -FilePath $ExitFile -Encoding utf8
-"EXIT_UTC=$((Get-Date).ToUniversalTime().ToString('o'))" | Out-File -FilePath $ExitFile -Encoding utf8 -Append
-'@ | Out-File -FilePath $wrapperPath -Encoding utf8
+          $wrapperLines = @(
+            'param(',
+            '  [string]$Exe,',
+            '  [string]$LogOut,',
+            '  [string]$LogErr,',
+            '  [string]$PidFile,',
+            '  [string]$ExitFile,',
+            '  [string]$Port,',
+            '  [string]$ModelPath',
+            ')',
+            '$srvArgs = @(',
+            '  "-m", $ModelPath,',
+            '  "--alias", "test0-lfm8b",',
+            '  "-c", "4096",',
+            '  "--parallel", "1",',
+            '  "--port", $Port,',
+            '  "--host", "127.0.0.1",',
+            '  "-t", "4",',
+            '  "--jinja",',
+            '  "--temp", "0.1",',
+            '  "--top-k", "50",',
+            '  "--repeat-penalty", "1.1"',
+            ')',
+            '$p = Start-Process -FilePath $Exe -ArgumentList $srvArgs -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr -PassThru -NoNewWindow',
+            '"SERVER_PID=$($p.Id)" | Out-File -FilePath $PidFile -Encoding utf8',
+            '$p.WaitForExit()',
+            '"EXIT_CODE=$($p.ExitCode)" | Out-File -FilePath $ExitFile -Encoding utf8',
+            '"EXIT_UTC=$((Get-Date).ToUniversalTime().ToString(''o''))" | Out-File -FilePath $ExitFile -Encoding utf8 -Append'
+          )
+          ($wrapperLines -join "`n") + "`n" | Out-File -FilePath $wrapperPath -Encoding utf8
 
           Write-Host "Launch (via wrapper, -NoNewWindow kept): $($env:ENGINE_EXE) -m $($env:MODEL_PATH) --alias test0-lfm8b -c 4096 --parallel 1 --port $($env:SERVER_PORT) --host 127.0.0.1 -t 4 --jinja --temp 0.1 --top-k 50 --repeat-penalty 1.1"
           $wproc = Start-Process -FilePath "pwsh" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$wrapperPath,"-Exe",$env:ENGINE_EXE,"-LogOut",$logPath,"-LogErr",$errPath,"-PidFile",$pidFile,"-ExitFile",$exitFile,"-Port",$env:SERVER_PORT,"-ModelPath",$env:MODEL_PATH) -PassThru -NoNewWindow
