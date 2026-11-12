@@ -560,9 +560,16 @@ jobs:
       # ---------------------------------------------------------------------
       # 8. Launch via exit-recording wrapper (D2); readiness; greeting in-step (D1)
       # ---------------------------------------------------------------------
-      - name: Launch llama-server and wait for readiness
-        id: server
-        timeout-minutes: 8
+      # ---------------------------------------------------------------------
+      # 8-10 (S1 merged): launch + loaded-model readiness + requests + verdict
+      # in ONE step - removes the cross-step process-lifetime boundary.
+      # S2: readiness is GET /health until HTTP 200 (503 while loading), 300s
+      # cap, every poll logged; curl --fail-with-body so HTTP error bodies
+      # fail instead of passing. S3: wrapper exit diagnostics + D4 dumps kept.
+      # ---------------------------------------------------------------------
+      - name: Launch, readiness, requests, verdict (single combined step)
+        id: smoke
+        timeout-minutes: 25
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
@@ -573,7 +580,7 @@ jobs:
           $wrapperPath = "$env:RUNNER_TEMP\server-wrapper.ps1"
           Remove-Item $pidFile,$exitFile -Force -ErrorAction SilentlyContinue
 
-          # D2: wrapper records child PID at start, and exit code + UTC time when the server exits
+          # D2 (kept): wrapper records child PID at start, and exit code + UTC time when the server exits
           $wrapperLines = @(
             'param(',
             '  [string]$Exe,',
@@ -618,69 +625,6 @@ jobs:
           "SERVER_PID=$serverPid" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "llama-server PID: $serverPid"
 
-          $deadline = (Get-Date).AddSeconds(300)
-          $ready = $false
-          $models = $null
-          while ((Get-Date) -lt $deadline) {
-            if (Test-Path $exitFile) { break }
-            $alive = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
-            if (-not $alive) { break }
-            try {
-              $models = Invoke-RestMethod -Uri "http://127.0.0.1:$env:SERVER_PORT/v1/models" -TimeoutSec 3
-              if ($models) { $ready = $true; break }
-            } catch { Start-Sleep -Seconds 2 }
-          }
-          if (-not $ready) {
-            Write-Host "--- server log tail on readiness failure ---"
-            if (Test-Path $logPath) { Get-Content $logPath -Tail 80 }
-            Write-Host "--- server-exit.txt ---"
-            if (Test-Path $exitFile) { Get-Content $exitFile } else { Write-Host "absent" }
-            throw "llama-server did not become ready within 300s"
-          }
-          Write-Host "Server ready. /v1/models:"
-          $models | ConvertTo-Json -Depth 5
-          Write-Host "--- server log head (version lines) ---"
-          Get-Content $logPath -TotalCount 30
-
-          # D1: greeting request executed in-step immediately after readiness
-          python "$env:RUNNER_TEMP\build_requests.py" tools-payload.json "test0-lfm8b"
-          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (build_requests in launch step): $rc"
-          if ($rc -ne 0) { throw "request build failed with exit code $rc" }
-          $base = "http://127.0.0.1:$env:SERVER_PORT/v1/chat/completions"
-          curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_a.json" -o resp_a.json $base
-          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request A, in-step): $rc"
-          if ($rc -ne 0) {
-            Write-Host "=== evidence on in-step request A failure ==="
-            $alive = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
-            Write-Host ("server process {0}: {1}" -f $serverPid, $(if ($alive) {'ALIVE'} else {'DEAD'}))
-            $conn = Get-NetTCPConnection -LocalPort ([int]$env:SERVER_PORT) -State Listen -ErrorAction SilentlyContinue
-            Write-Host ("listener on {0}: {1}" -f $env:SERVER_PORT, $(if ($conn) {'LISTENING'} else {'NONE'}))
-            Write-Host "--- server-exit.txt ---"
-            if (Test-Path $exitFile) { Get-Content $exitFile } else { Write-Host "absent" }
-            Write-Host "--- server log tail ---"
-            if (Test-Path $logPath) { Get-Content $logPath -Tail 60 }
-            Write-Host "--- server err tail ---"
-            if (Test-Path $errPath) { Get-Content $errPath -Tail 60 }
-            throw "request A failed in-step with exit code $rc"
-          }
-          Write-Host "resp_a bytes (in-step): $((Get-Item resp_a.json).Length)"
-          Write-Host "--- resp_a.json (greeting raw response, in-step) ---"
-          Get-Content resp_a.json
-
-      # ---------------------------------------------------------------------
-      # 9. POST the two requests; save RAW response bytes
-      # ---------------------------------------------------------------------
-      - name: Run greeting and tool-call requests (D3 liveness evidence first)
-        id: requests
-        timeout-minutes: 8
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          $logPath = "$env:RUNNER_TEMP\test0-server.log"
-          $errPath = "$env:RUNNER_TEMP\test0-server.err.log"
-          $exitFile = "$env:RUNNER_TEMP\server-exit.txt"
-          $serverPid = [int]$env:SERVER_PID
-
           function Dump-Evidence {
             param([string]$phase)
             Write-Host "=== liveness evidence ($phase) ==="
@@ -696,36 +640,58 @@ jobs:
             if (Test-Path $errPath) { Get-Content $errPath -Tail 60 }
           }
 
+          # S2: loaded-model readiness - /health until HTTP 200, 300s cap, log each poll
+          $deadline = (Get-Date).AddSeconds(300)
+          $ready = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $exitFile) { Write-Host "server-exit.txt appeared during readiness"; break }
+            $alive = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
+            if (-not $alive) { Write-Host "server process exited during readiness"; break }
+            $code = curl.exe -s -o NUL -w '%{http_code}' "http://127.0.0.1:$env:SERVER_PORT/health"
+            Write-Host ("readiness poll {0}: HTTP {1}" -f (Get-Date -Format o), $code)
+            if ($code -eq "200") { $ready = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ready) {
+            Dump-Evidence "readiness failure"
+            throw "llama-server /health did not return HTTP 200 within 300s"
+          }
+          Write-Host "Server ready (/health HTTP 200)."
+          Write-Host "--- server log head (version lines) ---"
+          Get-Content $logPath -TotalCount 30
+
           python "$env:RUNNER_TEMP\build_requests.py" tools-payload.json "test0-lfm8b"
           $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (build_requests): $rc"
           if ($rc -ne 0) { throw "request build failed with exit code $rc" }
           Write-Host "--- req_b.json (full request body) ---"
           Get-Content req_b.json
 
+          $base = "http://127.0.0.1:$env:SERVER_PORT/v1/chat/completions"
           Dump-Evidence "pre-request"
 
-          $base = "http://127.0.0.1:$env:SERVER_PORT/v1/chat/completions"
-          if (Test-Path resp_a.json) {
-            Write-Host "resp_a.json already produced in launch step (D1); not repeating request A"
-          } else {
-            curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_a.json" -o resp_a.json $base
-            $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request A): $rc"
-            if ($rc -ne 0) { Dump-Evidence "request A failure"; throw "request A failed with exit code $rc" }
+          curl.exe -s --fail-with-body -X POST -H "Content-Type: application/json" --data-binary "@req_a.json" -o resp_a.json $base
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request A): $rc"
+          if ($rc -ne 0) {
+            Write-Host "--- resp_a.json (error body if any) ---"
+            if (Test-Path resp_a.json) { Get-Content resp_a.json } else { Write-Host "absent" }
+            Dump-Evidence "request A failure"
+            throw "request A failed with exit code $rc"
           }
-          curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_b.json" -o resp_b.json $base
+          Write-Host "resp_a bytes: $((Get-Item resp_a.json).Length)"
+          Write-Host "--- resp_a.json (greeting raw response) ---"
+          Get-Content resp_a.json
+
+          curl.exe -s --fail-with-body -X POST -H "Content-Type: application/json" --data-binary "@req_b.json" -o resp_b.json $base
           $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request B): $rc"
-          if ($rc -ne 0) { Dump-Evidence "request B failure"; throw "request B failed with exit code $rc" }
+          if ($rc -ne 0) {
+            Write-Host "--- resp_b.json (error body if any) ---"
+            if (Test-Path resp_b.json) { Get-Content resp_b.json } else { Write-Host "absent" }
+            Dump-Evidence "request B failure"
+            throw "request B failed with exit code $rc"
+          }
           Write-Host "resp_a bytes: $((Get-Item resp_a.json).Length) ; resp_b bytes: $((Get-Item resp_b.json).Length)"
 
-      # ---------------------------------------------------------------------
-      # 10. Evaluate PASS/FAIL against the accepted criteria
-      # ---------------------------------------------------------------------
-      - name: Evaluate Test 0 verdict
-        id: verdict
-        timeout-minutes: 2
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
+          # S1: verdict in the same step
           python "$env:RUNNER_TEMP\evaluate_test0.py"
           $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (evaluate_test0): $rc"
           if ($rc -ne 0) { throw "TEST 0 FAILED (see FAIL-ITEM lines and raw bytes above)" }
@@ -771,4 +737,5 @@ jobs:
             Write-Host "Stopping llama-server PID $($_.Id)"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
           }
+
 
