@@ -37,6 +37,7 @@ jobs:
           "LOCALAPPDATA=$isoHome\AppData\Local" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PYTHONPATH=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PYTHONUNBUFFERED=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONIOENCODING=utf-8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "NEXUS_AGENT_MODEL_REPO=LiquidAI/LFM2.5-1.2B-Instruct-GGUF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "NEXUS_AGENT_MODEL_FILENAME=LFM2.5-1.2B-Instruct-Q4_0.gguf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "NEXUS_AGENT_ASSUME_YES=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -737,5 +738,6 @@ jobs:
             Write-Host "Stopping llama-server PID $($_.Id)"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
           }
+
 
 
