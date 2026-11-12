@@ -255,6 +255,283 @@ jobs:
             $md | Add-Content $env:GITHUB_STEP_SUMMARY
           }
 
+  observe-normal-lfm8b:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Initialize isolated environment (Runner context invalid in top/job env)
+      # -----------------------------------------------------------------------
+      - name: Initialize isolated environment
+        id: init
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $isoHome = "$env:RUNNER_TEMP\isolated_home"
+          New-Item -ItemType Directory -Force $isoHome | Out-Null
+          New-Item -ItemType Directory -Force "$isoHome\.nexus-agent" | Out-Null
+          New-Item -ItemType Directory -Force "$isoHome\AppData\Roaming" | Out-Null
+          New-Item -ItemType Directory -Force "$isoHome\AppData\Local" | Out-Null
+
+          "USERPROFILE=$isoHome" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HOME=$isoHome" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "APPDATA=$isoHome\AppData\Roaming" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LOCALAPPDATA=$isoHome\AppData\Local" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONPATH=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONUNBUFFERED=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONIOENCODING=utf-8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "NEXUS_AGENT_MODEL_REPO=LiquidAI/LFM2.5-8B-A1B-GGUF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "NEXUS_AGENT_MODEL_FILENAME=LFM2.5-8B-A1B-Q4_K_M.gguf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "NEXUS_AGENT_ASSUME_YES=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $env:USERPROFILE = $isoHome
+          $env:HOME = $isoHome
+          $env:APPDATA = "$isoHome\AppData\Roaming"
+          $env:LOCALAPPDATA = "$isoHome\AppData\Local"
+          $env:PYTHONPATH = ""
+
+          Write-Host "Isolated profile initialized under $isoHome"
+          $rc = $LASTEXITCODE; if ($null -eq $rc) { $rc = 0 }
+          Write-Host "Raw Exit Code (init): $rc"
+          if ($rc -ne 0) { throw "init failed with exit code $rc" }
+
+      # -----------------------------------------------------------------------
+      # 2. Checkout repository
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        id: checkout
+        timeout-minutes: 2
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 3. Setup Python 3.12
+      # -----------------------------------------------------------------------
+      - name: Setup Python 3.12
+        id: setup_python
+        timeout-minutes: 2
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # -----------------------------------------------------------------------
+      # 4. Verify source provenance and build single wheel
+      # -----------------------------------------------------------------------
+      - name: Build wheel from exact source
+        id: build_wheel
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          # Record exact Git provenance to console
+          $gitHeadRaw = git rev-parse HEAD
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (git rev-parse HEAD): $rc"
+          if ($rc -ne 0) { throw "git rev-parse HEAD failed with exit code $rc" }
+          $gitHead = [string]::Join("`n", @($gitHeadRaw)).Trim()
+          Write-Host "Git HEAD Commit: $gitHead"
+
+          $gitTreeRaw = git rev-parse 'HEAD^{tree}'
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (git rev-parse tree): $rc"
+          if ($rc -ne 0) { throw "git rev-parse tree failed with exit code $rc" }
+          $gitTree = [string]::Join("`n", @($gitTreeRaw)).Trim()
+          Write-Host "Git Tree: $gitTree"
+
+          $gitStatusRaw = git status --porcelain
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (git status --porcelain): $rc"
+          if ($rc -ne 0) { throw "git status failed with exit code $rc" }
+          $gitStatus = [string]::Join("`n", @($gitStatusRaw)).Trim()
+          Write-Host "Git Status Porcelain: $gitStatus"
+          if ($gitStatus) { throw "Dirty tracked/untracked worktree is not an exact committed source run" }
+
+          # Verify accepted source tools.py SHA256 before building
+          $sourceTools = "src\nexus_agent_ai\agent\tools.py"
+          if (-not (Test-Path $sourceTools)) { throw "Source file '$sourceTools' missing" }
+          $sourceToolsHash = (Get-FileHash -Algorithm SHA256 $sourceTools).Hash.ToLower()
+          Write-Host "Source tools.py SHA256: $sourceToolsHash"
+          $expectedToolsHash = "eb40f8aae3cad7c49d593cfea9a5bbd1ccebd0d13a2734177f1865a11f320e78"
+          if ($sourceToolsHash -ne $expectedToolsHash) {
+            throw "Source tools.py SHA256 ($sourceToolsHash) does not match accepted hash ($expectedToolsHash)"
+          }
+
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          python -m pip install --upgrade pip build
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (pip install build): $rc"
+          if ($rc -ne 0) { throw "pip install build failed with exit code $rc" }
+
+          python -m build --wheel
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (python -m build --wheel): $rc"
+          if ($rc -ne 0) { throw "build wheel failed with exit code $rc" }
+
+          $wheels = Get-ChildItem dist\*.whl
+          if ($wheels.Count -ne 1) { throw "Expected exactly 1 wheel in dist/, found $($wheels.Count)" }
+          $wheelPath = $wheels[0].FullName
+          $wheelHash = (Get-FileHash -Algorithm SHA256 $wheelPath).Hash.ToLower()
+          Write-Host "Built Wheel: $wheelPath"
+          Write-Host "Wheel SHA256: $wheelHash"
+
+      # -----------------------------------------------------------------------
+      # 5. Install wheel into clean isolated virtual environment
+      # -----------------------------------------------------------------------
+      - name: Install wheel into isolated venv
+        id: install_wheel
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $venvDir = "$env:RUNNER_TEMP\nx-obs-venv"
+          python -m venv $venvDir
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (python -m venv): $rc"
+          if ($rc -ne 0) { throw "venv creation failed with exit code $rc" }
+
+          $venvPython = "$venvDir\Scripts\python.exe"
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+
+          & $venvPython -m pip install --only-binary :all: $wheel
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (pip install wheel): $rc"
+          if ($rc -ne 0) { throw "pip install wheel failed with exit code $rc" }
+
+          & $venvPython -m pip install --only-binary :all: psutil
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (pip install psutil): $rc"
+          if ($rc -ne 0) { throw "pip install psutil failed with exit code $rc" }
+
+          Write-Host "Installed venv packages:"
+          & $venvPython -m pip list
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (pip list): $rc"
+          if ($rc -ne 0) { throw "pip list failed with exit code $rc" }
+
+      # -----------------------------------------------------------------------
+      # 6. Verify installed package identity and sysconfig purelib path
+      # -----------------------------------------------------------------------
+      - name: Verify installed tools.py identity
+        id: verify_identity
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $venvPython = "$env:RUNNER_TEMP\nx-obs-venv\Scripts\python.exe"
+
+          $verifyScript = @"
+          import hashlib, pathlib, sys, sysconfig
+          import nexus_agent_ai.agent.tools as t
+
+          tools_path = pathlib.Path(t.__file__).resolve()
+          purelib = pathlib.Path(sysconfig.get_path('purelib')).resolve()
+          print(f"Purelib Path: {purelib}")
+          print(f"Installed Tools Path: {tools_path}")
+
+          assert tools_path.is_relative_to(purelib), f"tools.py ({tools_path}) is not under purelib ({purelib})"
+
+          installed_hash = hashlib.sha256(tools_path.read_bytes()).hexdigest().lower()
+          print(f"Installed tools.py SHA256: {installed_hash}")
+          expected_hash = "eb40f8aae3cad7c49d593cfea9a5bbd1ccebd0d13a2734177f1865a11f320e78"
+          assert installed_hash == expected_hash, f"Hash mismatch: got {installed_hash}, expected {expected_hash}"
+          print("Installed tools.py identity and hash MATCH eb40f8aa")
+          "@
+
+          & $venvPython -c $verifyScript
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (verify_identity): $rc"
+          if ($rc -ne 0) { throw "verify_identity failed with exit code $rc" }
+
+      # -----------------------------------------------------------------------
+      # 7. Pull model weights & llama-server engine (bounded time)
+      # -----------------------------------------------------------------------
+      - name: Pull model weights and engine
+        id: pull_model
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $venvScripts = "$env:RUNNER_TEMP\nx-obs-venv\Scripts"
+
+          & "$venvScripts\nexus-agent.exe" pull-model `
+            --repo $env:NEXUS_AGENT_MODEL_REPO `
+            --file $env:NEXUS_AGENT_MODEL_FILENAME
+
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (pull-model): $rc"
+          if ($rc -ne 0) { throw "pull-model failed with exit code $rc" }
+
+      # -----------------------------------------------------------------------
+      # 8. Run two-turn normal-prompt observation driver
+      # -----------------------------------------------------------------------
+      - name: Observe normal two-turn CLI chat (5 independent iterations)
+        id: observe_turns
+        timeout-minutes: 33
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $venvDir = "$env:RUNNER_TEMP\nx-obs-venv"
+          $venvPython = "$venvDir\Scripts\python.exe"
+          $cliExe = "$venvDir\Scripts\nexus-agent.exe"
+
+          # TEST1: 5 bounded iterations, each fully independent: fresh scratch
+          # workspace (observer rewrites calc.py) AND fresh session id (product
+          # history is keyed by session in ~/.nexus-agent/history.db), so no
+          # conversational/history carryover. Model file reused from the job's
+          # isolated HOME (single download). Observer is graceful on turn
+          # failure; per-iteration evidence + RC are recorded, no throw here.
+          $applied = 0
+          $completed = 0
+          for ($k = 1; $k -le 5; $k++) {
+            Write-Host "=================== ITERATION $k START ==================="
+            $ws = "$env:RUNNER_TEMP\obs8b_workspace_k$k"
+            $ev = "$env:RUNNER_TEMP\obs8b_evidence_k$k"
+            $sess = "obs8b-session-k$k"
+
+            & $venvPython ci/observe_normal_turns.py `
+              --workspace $ws `
+              --evidence-dir $ev `
+              --cli-exe $cliExe `
+              --session-id $sess
+            $rc = $LASTEXITCODE
+            $completed++
+            Write-Host "Raw Exit Code (observe_normal_turns iteration $k): $rc"
+
+            # Bounded applied-evidence proxy (reviewer judges PASS from raw
+            # streams): RC0 + snapshot changed in BOTH turns + final calc.py
+            # contains a multiply operator.
+            $h0 = (Get-FileHash "$ev\calc_initial.py" -ErrorAction SilentlyContinue).Hash
+            $h1 = (Get-FileHash "$ev\calc_after_turn1.py" -ErrorAction SilentlyContinue).Hash
+            $h2 = (Get-FileHash "$ev\calc_after_turn2.py" -ErrorAction SilentlyContinue).Hash
+            $final = Get-Content "$ev\calc_after_turn2.py" -Raw -ErrorAction SilentlyContinue
+            $hasMul = ($null -ne $final) -and ($final -match "\*")
+            $iterApplied = ($rc -eq 0) -and ($null -ne $h0) -and ($null -ne $h1) -and ($null -ne $h2) -and ($h1 -ne $h0) -and ($h2 -ne $h1) -and $hasMul
+            if ($iterApplied) { $applied++ }
+            Write-Host "ITERATION $k APPLIED-EVIDENCE: $iterApplied (rc=$rc, mul=$hasMul)"
+            Write-Host "==================== ITERATION $k END ===================="
+          }
+          Write-Host "TEST1 ITERATIONS COMPLETED: $completed/5"
+          Write-Host "TEST1 ITERATIONS APPLIED-RC0: $applied/5 (hash+content proxy; reviewer judges from raw per-turn streams)"
+          $rc = $LASTEXITCODE; if ($null -eq $rc) { $rc = 0 }
+          Write-Host "Raw Exit Code (observe loop): $rc"
+
+      - name: Publish step summary
+        id: summary
+        if: always()
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $anyFound = $false
+          for ($k = 1; $k -le 5; $k++) {
+            $summaryFile = "$env:RUNNER_TEMP\obs8b_evidence_k$k\summary.md"
+            if (Test-Path $summaryFile) {
+              "## ITERATION $k" | Add-Content $env:GITHUB_STEP_SUMMARY
+              Get-Content $summaryFile | Add-Content $env:GITHUB_STEP_SUMMARY
+              $anyFound = $true
+            }
+          }
+          if (-not $anyFound) {
+            $md = @(
+              "# Nexus Normal Observation Summary",
+              "",
+              "- **Execution Status:** INCOMPLETE (Runner terminated before summary generation)",
+              "- **Model Qualification:** UNVERIFIED"
+            ) -join "`n"
+            $md | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+
   # -------------------------------------------------------------------------
   # TEST 0 (raw engine smoke) for the high-spec tier evaluation, appended as a
   # second job on this experimental ref only. Reviewed candidate; runs only on
