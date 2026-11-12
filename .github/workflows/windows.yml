@@ -558,7 +558,7 @@ jobs:
           "MODEL_PATH=$model" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ---------------------------------------------------------------------
-      # 8. Launch llama-server with product-parity flags; wait for readiness
+      # 8. Launch via exit-recording wrapper (D2); readiness; greeting in-step (D1)
       # ---------------------------------------------------------------------
       - name: Launch llama-server and wait for readiness
         id: server
@@ -567,31 +567,63 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           $logPath = "$env:RUNNER_TEMP\test0-server.log"
-          $srvArgs = @(
-            "-m", $env:MODEL_PATH,
-            "--alias", "test0-lfm8b",
-            "-c", "4096",
-            "--parallel", "1",
-            "--port", $env:SERVER_PORT,
-            "--host", "127.0.0.1",
-            "-t", "4",
-            "--jinja",
-            "--temp", "0.1",
-            "--top-k", "50",
-            "--repeat-penalty", "1.1"
-          )
-          Write-Host "Launch: $($env:ENGINE_EXE) $($srvArgs -join ' ')"
-          $proc = Start-Process -FilePath $env:ENGINE_EXE -ArgumentList $srvArgs `
-            -RedirectStandardOutput $logPath -RedirectStandardError "$env:RUNNER_TEMP\test0-server.err.log" `
-            -PassThru -NoNewWindow
-          "SERVER_PID=$($proc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "llama-server PID: $($proc.Id)"
+          $errPath = "$env:RUNNER_TEMP\test0-server.err.log"
+          $pidFile = "$env:RUNNER_TEMP\server-pid.txt"
+          $exitFile = "$env:RUNNER_TEMP\server-exit.txt"
+          $wrapperPath = "$env:RUNNER_TEMP\server-wrapper.ps1"
+          Remove-Item $pidFile,$exitFile -Force -ErrorAction SilentlyContinue
+
+          # D2: wrapper records child PID at start, and exit code + UTC time when the server exits
+          @'
+param(
+  [string]$Exe,
+  [string]$LogOut,
+  [string]$LogErr,
+  [string]$PidFile,
+  [string]$ExitFile,
+  [string]$Port,
+  [string]$ModelPath
+)
+$srvArgs = @(
+  "-m", $ModelPath,
+  "--alias", "test0-lfm8b",
+  "-c", "4096",
+  "--parallel", "1",
+  "--port", $Port,
+  "--host", "127.0.0.1",
+  "-t", "4",
+  "--jinja",
+  "--temp", "0.1",
+  "--top-k", "50",
+  "--repeat-penalty", "1.1"
+)
+$p = Start-Process -FilePath $Exe -ArgumentList $srvArgs -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr -PassThru -NoNewWindow
+"SERVER_PID=$($p.Id)" | Out-File -FilePath $PidFile -Encoding utf8
+$p.WaitForExit()
+"EXIT_CODE=$($p.ExitCode)" | Out-File -FilePath $ExitFile -Encoding utf8
+"EXIT_UTC=$((Get-Date).ToUniversalTime().ToString('o'))" | Out-File -FilePath $ExitFile -Encoding utf8 -Append
+'@ | Out-File -FilePath $wrapperPath -Encoding utf8
+
+          Write-Host "Launch (via wrapper, -NoNewWindow kept): $($env:ENGINE_EXE) -m $($env:MODEL_PATH) --alias test0-lfm8b -c 4096 --parallel 1 --port $($env:SERVER_PORT) --host 127.0.0.1 -t 4 --jinja --temp 0.1 --top-k 50 --repeat-penalty 1.1"
+          $wproc = Start-Process -FilePath "pwsh" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$wrapperPath,"-Exe",$env:ENGINE_EXE,"-LogOut",$logPath,"-LogErr",$errPath,"-PidFile",$pidFile,"-ExitFile",$exitFile,"-Port",$env:SERVER_PORT,"-ModelPath",$env:MODEL_PATH) -PassThru -NoNewWindow
+          Write-Host "wrapper PID: $($wproc.Id)"
+
+          $pidDeadline = (Get-Date).AddSeconds(60)
+          while (-not (Test-Path $pidFile)) {
+            if ((Get-Date) -gt $pidDeadline) { throw "wrapper did not write server-pid.txt within 60s" }
+            Start-Sleep -Seconds 1
+          }
+          $serverPid = [int]((Get-Content $pidFile -Raw).Trim() -replace 'SERVER_PID=','')
+          "SERVER_PID=$serverPid" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "llama-server PID: $serverPid"
 
           $deadline = (Get-Date).AddSeconds(300)
           $ready = $false
           $models = $null
           while ((Get-Date) -lt $deadline) {
-            if ($proc.HasExited) { break }
+            if (Test-Path $exitFile) { break }
+            $alive = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
+            if (-not $alive) { break }
             try {
               $models = Invoke-RestMethod -Uri "http://127.0.0.1:$env:SERVER_PORT/v1/models" -TimeoutSec 3
               if ($models) { $ready = $true; break }
@@ -600,6 +632,8 @@ jobs:
           if (-not $ready) {
             Write-Host "--- server log tail on readiness failure ---"
             if (Test-Path $logPath) { Get-Content $logPath -Tail 80 }
+            Write-Host "--- server-exit.txt ---"
+            if (Test-Path $exitFile) { Get-Content $exitFile } else { Write-Host "absent" }
             throw "llama-server did not become ready within 300s"
           }
           Write-Host "Server ready. /v1/models:"
@@ -607,28 +641,79 @@ jobs:
           Write-Host "--- server log head (version lines) ---"
           Get-Content $logPath -TotalCount 30
 
+          # D1: greeting request executed in-step immediately after readiness
+          python "$env:RUNNER_TEMP\build_requests.py" tools-payload.json "test0-lfm8b"
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (build_requests in launch step): $rc"
+          if ($rc -ne 0) { throw "request build failed with exit code $rc" }
+          $base = "http://127.0.0.1:$env:SERVER_PORT/v1/chat/completions"
+          curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_a.json" -o resp_a.json $base
+          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request A, in-step): $rc"
+          if ($rc -ne 0) {
+            Write-Host "=== evidence on in-step request A failure ==="
+            $alive = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
+            Write-Host ("server process {0}: {1}" -f $serverPid, $(if ($alive) {'ALIVE'} else {'DEAD'}))
+            $conn = Get-NetTCPConnection -LocalPort ([int]$env:SERVER_PORT) -State Listen -ErrorAction SilentlyContinue
+            Write-Host ("listener on {0}: {1}" -f $env:SERVER_PORT, $(if ($conn) {'LISTENING'} else {'NONE'}))
+            Write-Host "--- server-exit.txt ---"
+            if (Test-Path $exitFile) { Get-Content $exitFile } else { Write-Host "absent" }
+            Write-Host "--- server log tail ---"
+            if (Test-Path $logPath) { Get-Content $logPath -Tail 60 }
+            Write-Host "--- server err tail ---"
+            if (Test-Path $errPath) { Get-Content $errPath -Tail 60 }
+            throw "request A failed in-step with exit code $rc"
+          }
+          Write-Host "resp_a bytes (in-step): $((Get-Item resp_a.json).Length)"
+          Write-Host "--- resp_a.json (greeting raw response, in-step) ---"
+          Get-Content resp_a.json
+
       # ---------------------------------------------------------------------
       # 9. POST the two requests; save RAW response bytes
       # ---------------------------------------------------------------------
-      - name: Run greeting and tool-call requests
+      - name: Run greeting and tool-call requests (D3: liveness evidence first)
         id: requests
         timeout-minutes: 8
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
+          $logPath = "$env:RUNNER_TEMP\test0-server.log"
+          $errPath = "$env:RUNNER_TEMP\test0-server.err.log"
+          $exitFile = "$env:RUNNER_TEMP\server-exit.txt"
+          $serverPid = [int]$env:SERVER_PID
+
+          function Dump-Evidence {
+            param([string]$phase)
+            Write-Host "=== liveness evidence ($phase) ==="
+            $alive = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
+            Write-Host ("server process {0}: {1}" -f $serverPid, $(if ($alive) {'ALIVE'} else {'DEAD'}))
+            $conn = Get-NetTCPConnection -LocalPort ([int]$env:SERVER_PORT) -State Listen -ErrorAction SilentlyContinue
+            Write-Host ("listener on {0}: {1}" -f $env:SERVER_PORT, $(if ($conn) {'LISTENING'} else {'NONE'}))
+            Write-Host "--- server-exit.txt ---"
+            if (Test-Path $exitFile) { Get-Content $exitFile } else { Write-Host "absent" }
+            Write-Host "--- server log tail ---"
+            if (Test-Path $logPath) { Get-Content $logPath -Tail 60 }
+            Write-Host "--- server err tail ---"
+            if (Test-Path $errPath) { Get-Content $errPath -Tail 60 }
+          }
+
           python "$env:RUNNER_TEMP\build_requests.py" tools-payload.json "test0-lfm8b"
           $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (build_requests): $rc"
           if ($rc -ne 0) { throw "request build failed with exit code $rc" }
           Write-Host "--- req_b.json (full request body) ---"
           Get-Content req_b.json
 
+          Dump-Evidence "pre-request"
+
           $base = "http://127.0.0.1:$env:SERVER_PORT/v1/chat/completions"
-          curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_a.json" -o resp_a.json $base
-          $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request A): $rc"
-          if ($rc -ne 0) { throw "request A failed with exit code $rc" }
+          if (Test-Path resp_a.json) {
+            Write-Host "resp_a.json already produced in launch step (D1); not repeating request A"
+          } else {
+            curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_a.json" -o resp_a.json $base
+            $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request A): $rc"
+            if ($rc -ne 0) { Dump-Evidence "request A failure"; throw "request A failed with exit code $rc" }
+          }
           curl.exe -s -X POST -H "Content-Type: application/json" --data-binary "@req_b.json" -o resp_b.json $base
           $rc = $LASTEXITCODE; Write-Host "Raw Exit Code (request B): $rc"
-          if ($rc -ne 0) { throw "request B failed with exit code $rc" }
+          if ($rc -ne 0) { Dump-Evidence "request B failure"; throw "request B failed with exit code $rc" }
           Write-Host "resp_a bytes: $((Get-Item resp_a.json).Length) ; resp_b bytes: $((Get-Item resp_b.json).Length)"
 
       # ---------------------------------------------------------------------
@@ -668,14 +753,21 @@ jobs:
       # ---------------------------------------------------------------------
       # 12. Stop llama-server
       # ---------------------------------------------------------------------
-      - name: Stop llama-server
+      - name: Stop llama-server (D4: dump evidence first)
         id: cleanup
         if: always()
         timeout-minutes: 2
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
+          Write-Host "--- server log tail (cleanup) ---"
+          if (Test-Path "$env:RUNNER_TEMP\test0-server.log") { Get-Content "$env:RUNNER_TEMP\test0-server.log" -Tail 60 } else { Write-Host "absent" }
+          Write-Host "--- server err tail (cleanup) ---"
+          if (Test-Path "$env:RUNNER_TEMP\test0-server.err.log") { Get-Content "$env:RUNNER_TEMP\test0-server.err.log" -Tail 60 } else { Write-Host "absent" }
+          Write-Host "--- server-exit.txt (cleanup) ---"
+          if (Test-Path "$env:RUNNER_TEMP\server-exit.txt") { Get-Content "$env:RUNNER_TEMP\server-exit.txt" } else { Write-Host "absent" }
           Get-Process -Name "llama-server" -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host "Stopping llama-server PID $($_.Id)"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
           }
+
