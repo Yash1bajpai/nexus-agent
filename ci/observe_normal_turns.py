@@ -276,7 +276,11 @@ def main():
     parser.add_argument("--evidence-dir", required=True, type=Path, help="Directory to save raw observation logs")
     parser.add_argument("--cli-exe", required=True, help="Path to installed nexus-agent.exe")
     parser.add_argument("--session-id", default="obs-session-001", help="Persistent session ID")
+    parser.add_argument("--context-size", default=None, type=int,
+                        help="Optional explicit context budget passed to the product CLI (tier re-qualification)")
     args = parser.parse_args()
+
+    ctx_args = ["--context-size", str(args.context_size)] if args.context_size else []
 
     ws: Path = args.workspace.resolve()
     ev_dir: Path = args.evidence_dir.resolve()
@@ -289,6 +293,7 @@ def main():
 
     print("=================================================================")
     print("NEXUS NORMAL TWO-TURN OBSERVATION RUN")
+    print(f"Context size override: {args.context_size if args.context_size else 'product default'}")
     print(f"Workspace: {ws}")
     print(f"CLI Executable: {args.cli_exe}")
     print(f"Dedicated Session: {args.session_id}")
@@ -306,6 +311,7 @@ def main():
         "--no-stream",
         "--persist",
         "--session", args.session_id,
+        *ctx_args,
         PROMPT_1,
     ]
 
@@ -351,6 +357,7 @@ def main():
             "--no-stream",
             "--persist",
             "--session", args.session_id,
+            *ctx_args,
             PROMPT_2,
         ]
 
