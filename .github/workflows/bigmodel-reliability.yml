@@ -17,9 +17,12 @@ name: Nexus bigger-model reliability (Stages A/B/C)
 # pull-model under NEXUS_AGENT_MODEL_REPO/FILENAME overrides with the model
 # SHA256 recorded as evidence (no upstream GGUF digests exist to pin),
 # pinned llama.cpp b7075 engine (fail-closed ZIP SHA256), PYTHONIOENCODING
-# and NEXUS_AGENT_ASSUME_YES=1 in job init, network locked down (dead-proxy)
-# before any measured iteration, per-turn timeouts enforced inside the
+# and NEXUS_AGENT_ASSUME_YES=1 in job init, convention-level dead proxies
+# for proxy-aware clients before measured iterations (not socket enforcement),
+# per-turn timeouts enforced inside the
 # drivers, exact-count verdict lines only.
+# Load-bearing isolation: no secrets, no persisted checkout credentials,
+# public fixtures and ephemeral runner teardown. Raw sockets can bypass proxies.
 #
 # Model slate (dispatch one run per model, in this order):
 #   1. bartowski/Qwen2.5-7B-Instruct-GGUF        Qwen2.5-7B-Instruct-Q4_K_M.gguf        (~4.7 GB)
@@ -390,10 +393,10 @@ jobs:
         timeout-minutes: 1
         shell: pwsh
         run: |
-          # Process-level enforcement for all later steps: any accidental
-          # egress from test-step processes fails fast against a dead proxy;
-          # loopback (the product's local llama-server) stays reachable.
-          # The runner agent's own telemetry channel is unaffected.
+          # Convention-level only: proxy-aware clients fail fast against a dead
+          # proxy; raw sockets can bypass it. This is not egress enforcement.
+          # Isolation relies on no secrets/credentials and ephemeral teardown.
+          # Loopback and runner telemetry remain available.
           "HTTP_PROXY=http://127.0.0.1:9" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "HTTPS_PROXY=http://127.0.0.1:9" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ALL_PROXY=http://127.0.0.1:9" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
