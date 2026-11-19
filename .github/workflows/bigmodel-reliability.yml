@@ -195,6 +195,8 @@ jobs:
           "ENGINE_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Engine extracted: $($exe.FullName)"
 
+      # Convention-level only for proxy-aware clients, not socket enforcement.
+      # Isolation relies on no secrets/credentials and ephemeral teardown.
       - name: Lock down network for the measured step
         id: lockdown
         timeout-minutes: 1
