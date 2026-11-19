@@ -169,8 +169,15 @@ _RETRY_REQUEST = re.compile(
 )
 
 
-_CONTEXTUAL_RETURN_EDIT = re.compile(
-    r"^(?:now\s+)?(?:please\s+)?make\s+(?:it|this\s+function|that\s+function)\s+return\b",
+_CONTEXTUAL_EDIT_FOLLOWUP = re.compile(
+    r"^(?:now\s+)?(?:also\s+)?(?:please\s+)?(?:"
+    r"make\s+(?:it|this\s+function|that\s+function)\s+return\b|"
+    r"(?:add|remove|change|update|replace|rename|refactor|rewrite|fix|patch|"
+    r"handle|raise|return|round|use|convert|guard|log|print|sort|validate|"
+    r"clamp|default|simplify)\b[^.!?\n]*"
+    r"\b(?:it|this|that|the\s+(?:result|function|code|list|value|output|file|"
+    r"variable|method|class|case))\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -179,7 +186,7 @@ def _affirmative_code_edit(request: str) -> bool:
     """Conservative antecedent gate, not a general natural-language classifier."""
     if not re.match(
         r"^(?:please\s+)?(?:fix|change|edit|modify|update|replace|rewrite|refactor|patch|"
-        r"rename|implement|add|remove|delete)\b", request.strip(), re.IGNORECASE,
+        r"rename|implement|add|remove|delete|create|write|generate|build|make)\b", request.strip(), re.IGNORECASE,
     ):
         return False
     if re.search(r"\b(?:not|never|no|cancel|cancelled|canceled|stop)\b|\bdon['’]t\b",
@@ -195,7 +202,7 @@ def _affirmative_code_edit(request: str) -> bool:
 def _routing_request(user_input: str, history: list) -> str:
     """Resolve retries and narrow return-value followups from real user context."""
     retry = bool(_RETRY_REQUEST.fullmatch(user_input.strip()))
-    followup = bool(_CONTEXTUAL_RETURN_EDIT.match(function_request_prose(user_input).strip()))
+    followup = bool(_CONTEXTUAL_EDIT_FOLLOWUP.match(function_request_prose(user_input).strip()))
     if not retry and not followup:
         return user_input
     for message in reversed(history):
@@ -410,7 +417,7 @@ class Agent:
                     current = messages[starts[-1]].get("content", "")
                     prior = messages[starts[-2]].get("content", "")
                     if (isinstance(current, str) and isinstance(prior, str)
-                            and _CONTEXTUAL_RETURN_EDIT.match(function_request_prose(current).strip())
+                            and _CONTEXTUAL_EDIT_FOLLOWUP.match(function_request_prose(current).strip())
                             and _affirmative_code_edit(function_request_prose(prior))):
                         # Preserve only the genuine request, never its attached
                         # source or intervening model/tool/internal instructions.
