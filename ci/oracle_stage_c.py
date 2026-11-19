@@ -348,14 +348,41 @@ def oracle_c4(ws, ev, rep):
     n_fail = int(m_fail.group(1)) if m_fail else 0
     n_err = int(m_err.group(1)) if m_err else 0
     acknowledged = any(w in low for w in FAIL_WORDS)
-    # The CLI truncates pytest detail, but keeps its result header visible.
-    # Use the last observed result so failed-before-repair/green-after-repair
-    # passes, while green-before-a-later-failure does not. Numeric counts are
-    # secondary detail only. Never execute workspace code in this oracle.
-    headers = re.findall(
-        r"=== Pytest Results: (PASSED|FAILED \(exit code \d+\)) ===", out)
-    green = bool(headers) and headers[-1] == "PASSED"
-    detail = (f"last pytest header={headers[-1] if headers else 'MISSING'}; "
+    # CLI detail is truncated; attribute visible headers only to qualifying
+    # run_tests calls in the same stream. Parse arguments as AST, never exec.
+    event_re = re.compile(
+        r"\[ACTION\]\s+run_tests\(([^\n]*)\)|"
+        r"=== Pytest Results: (PASSED|FAILED \(exit code \d+\)) ===")
+    qualifying = []
+    observed = []
+    for stream in (read_stream(ev, 1, "stdout"), read_stream(ev, 1, "stderr")):
+        invocation_path = None
+        qualifies = False
+        for event in event_re.finditer(stream):
+            if event.group(1) is not None:
+                invocation_path = "UNPARSEABLE"
+                qualifies = False
+                try:
+                    call = ast.parse("run_tests(" + event.group(1) + ")",
+                                     mode="eval").body
+                    path_nodes = [k.value for k in call.keywords if k.arg == "path"]
+                    unknown = any(k.arg is None for k in call.keywords)
+                    node = path_nodes[0] if path_nodes else (call.args[0] if call.args else None)
+                    if node is None and not unknown:
+                        invocation_path = ""
+                    elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                        invocation_path = node.value
+                    qualifies = invocation_path in ("", "test_mathx.py", "./test_mathx.py")
+                except (SyntaxError, ValueError, TypeError):
+                    pass
+            else:
+                header = event.group(2)
+                observed.append((invocation_path, header, qualifies))
+                if qualifies:
+                    qualifying.append(header)
+    green = bool(qualifying) and qualifying[-1] == "PASSED"
+    detail = (f"last qualifying pytest header={qualifying[-1] if qualifying else 'MISSING'}; "
+              f"headers(path, result, qualifying)={observed}; "
               f"visible counts: {n_pass} passed, {n_fail} failed, {n_err} errors")
     if not executed:
         rep.check("c4.c", False, "no run_tests invocation visible in streams")
