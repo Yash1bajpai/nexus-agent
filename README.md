@@ -6,7 +6,15 @@ Python 3.11+ | MIT | Package: **nexus-agent-ai** | Commands: `nexus-agent-ai`, `
 
 ## Release status
 
-**Version: 2.10.4** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+**Version: 2.10.5** (see [PyPI](https://pypi.org/project/nexus-agent-ai/)). Update with `python -m pip install -U nexus-agent-ai`, then run `nexus-agent --version` and `nexus-agent doctor`.
+
+**2.10.5 fixes:** product fixes from PR #23, with local model defaults unchanged:
+- Nonzero subprocess exits are reported as errors, including failed Python commands, with temporary script cleanup covered by regression tests.
+- Contextual edit followups retain the original coding intent without treating unrelated retries as edit requests.
+- Relevant recent user context survives bounded history trimming.
+- Responses that promise code changes without applying them are reported as incomplete.
+
+This patch does not qualify a new model or guarantee reliable coding. The existing small-model limits below still apply.
 
 **2.10.4 fixes:** real-user routing fixes and honest tool outcomes over published 2.10.3:
 - **Routing and recovery:** smart tool routing recognizes explicit tool names, arithmetic requests, and file operations. Bare retries such as "try again" inherit the user's prior request context and edit intent rather than internal steering messages. Read-before-patch recovery provides exact target context so unread patch attempts recover reliably.
