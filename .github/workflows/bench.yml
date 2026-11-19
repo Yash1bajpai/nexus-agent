@@ -36,6 +36,11 @@ name: Nexus bigger-model reliability (Stages A/B/C)
 on:
   workflow_dispatch:
     inputs:
+      c4_only:
+        description: "Run only Stage C4 using the previously passed engine gate"
+        required: false
+        type: boolean
+        default: false
       model_repo:
         description: "HF GGUF repo (e.g. bartowski/Qwen2.5-7B-Instruct-GGUF)"
         required: true
@@ -65,6 +70,7 @@ jobs:
   # STAGE A: raw engine tool-call gate (single combined test step)
   # =========================================================================
   smoke_a:
+    if: ${{ !inputs.c4_only }}
     runs-on: windows-latest
     timeout-minutes: 45  # spec ~15 min; headroom for a 5.2 GB model download
     env:
@@ -269,6 +275,7 @@ jobs:
   # unconditionally. One fresh workspace + fresh session per iteration.
   # =========================================================================
   stage_b:
+    if: ${{ !inputs.c4_only }}
     needs: smoke_a
     runs-on: windows-latest
     timeout-minutes: 180
@@ -449,6 +456,7 @@ jobs:
   # STAGE C1-C4: held-out scenarios, one independent parallel job each.
   # =========================================================================
   stage_c1:
+    if: ${{ !inputs.c4_only }}
     needs: smoke_a
     runs-on: windows-latest
     timeout-minutes: 180
@@ -613,6 +621,7 @@ jobs:
           else { "- **Execution Status:** INCOMPLETE (terminated before final counts)" | Add-Content $env:GITHUB_STEP_SUMMARY }
 
   stage_c2:
+    if: ${{ !inputs.c4_only }}
     needs: smoke_a
     runs-on: windows-latest
     timeout-minutes: 180
@@ -777,6 +786,7 @@ jobs:
           else { "- **Execution Status:** INCOMPLETE (terminated before final counts)" | Add-Content $env:GITHUB_STEP_SUMMARY }
 
   stage_c3:
+    if: ${{ !inputs.c4_only }}
     needs: smoke_a
     runs-on: windows-latest
     timeout-minutes: 180
@@ -941,6 +951,7 @@ jobs:
           else { "- **Execution Status:** INCOMPLETE (terminated before final counts)" | Add-Content $env:GITHUB_STEP_SUMMARY }
 
   stage_c4:
+    if: ${{ always() && (inputs.c4_only || needs.smoke_a.result == 'success') }}
     needs: smoke_a
     runs-on: windows-latest
     timeout-minutes: 180
