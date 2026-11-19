@@ -950,6 +950,7 @@ jobs:
       TARGET_SHA: ${{ inputs.target_sha }}
       CONTEXT_SIZE: ${{ inputs.context_size }}
       SCENARIO: c4
+      NEXUS_ALLOW_PROJECT_EXECUTION: "1"
       ITERATIONS: "3"
     steps:
       - name: Initialize isolated environment
