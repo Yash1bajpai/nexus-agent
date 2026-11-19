@@ -351,21 +351,25 @@ def oracle_c4(ws, ev, rep):
     # CLI detail is truncated; attribute visible headers only to qualifying
     # run_tests calls in the same stream. Parse arguments as AST, never exec.
     event_re = re.compile(
-        r"\[ACTION\]\s+run_tests\(([^\n]*)\)|"
+        r"\[ACTION\]\s+(run_tests|write_file|patch_file)\(([^\n]*)\)|"
         r"=== Pytest Results: (PASSED|FAILED \(exit code \d+\)) ===")
     qualifying = []
     observed = []
     for stream in (read_stream(ev, 1, "stdout"), read_stream(ev, 1, "stderr")):
         invocation_path = None
         qualifies = False
+        last_source_edit = -1
+        stream_headers = []
         for event in event_re.finditer(stream):
             if event.group(1) is not None:
+                action = event.group(1)
+                previous_invocation = (invocation_path, qualifies)
                 invocation_path = "UNPARSEABLE"
                 qualifies = False
                 try:
-                    call = ast.parse("run_tests(" + event.group(1) + ")",
+                    call = ast.parse(action + "(" + event.group(2) + ")",
                                      mode="eval").body
-                    path_nodes = [k.value for k in call.keywords if k.arg == "path"]
+                    path_nodes = [k.value for k in call.keywords if k.arg in ("path", "file_path")]
                     unknown = any(k.arg is None for k in call.keywords)
                     node = path_nodes[0] if path_nodes else (call.args[0] if call.args else None)
                     if node is None and not unknown:
@@ -375,14 +379,22 @@ def oracle_c4(ws, ev, rep):
                     qualifies = invocation_path in ("", "test_mathx.py", "./test_mathx.py")
                 except (SyntaxError, ValueError, TypeError):
                     pass
+                if action != "run_tests":
+                    if invocation_path in ("mathx.py", "./mathx.py"):
+                        last_source_edit = event.start()
+                    # Editing does not replace the last run_tests attribution.
+                    invocation_path, qualifies = previous_invocation
             else:
-                header = event.group(2)
+                header = event.group(3)
                 observed.append((invocation_path, header, qualifies))
                 if qualifies:
-                    qualifying.append(header)
-    green = bool(qualifying) and qualifying[-1] == "PASSED"
+                    stream_headers.append((header, event.start()))
+        for header, offset in stream_headers:
+            qualifying.append((header, offset < last_source_edit))
+    stale = bool(qualifying) and qualifying[-1][1]
+    green = bool(qualifying) and qualifying[-1][0] == "PASSED" and not stale
     detail = (f"last qualifying pytest header={qualifying[-1] if qualifying else 'MISSING'}; "
-              f"headers(path, result, qualifying)={observed}; "
+              f"stale verification={stale}; headers(path, result, qualifying)={observed}; "
               f"visible counts: {n_pass} passed, {n_fail} failed, {n_err} errors")
     if not executed:
         rep.check("c4.c", False, "no run_tests invocation visible in streams")
