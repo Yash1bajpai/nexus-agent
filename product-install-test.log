@@ -1,0 +1,15 @@
+Processing ./nexus-cloud-test-product
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: nexus-agent-ai
+  Building wheel for nexus-agent-ai (pyproject.toml): started
+  Building wheel for nexus-agent-ai (pyproject.toml): finished with status 'done'
+  Created wheel for nexus-agent-ai: filename=nexus_agent_ai-2.10.5-py3-none-any.whl size=127743 sha256=ce1ebd17189bdf6e6fa5f34329cd4eb8d6c45fa5e4e414dd40274167c99247eb
+  Stored in directory: /tmp/pip-ephem-wheel-cache-bfddmwh7/wheels/4c/d8/8a/0767a94604f4d130560bee33f0fe456d3b91a12b99482d2cec
+Successfully built nexus-agent-ai
+Installing collected packages: nexus-agent-ai
+  Attempting uninstall: nexus-agent-ai
+    Found existing installation: nexus-agent-ai 2.10.5
+    Uninstalling nexus-agent-ai-2.10.5:
+      Successfully uninstalled nexus-agent-ai-2.10.5
+Successfully installed nexus-agent-ai-2.10.5

@@ -1,0 +1,5 @@
+Using Python 3.12.15 environment at: nexus-cloud-test312
+Resolved 37 packages in 6ms
+Installed 2 packages in 4ms
+ + setuptools==84.2.1
+ + wheel==0.48.0
