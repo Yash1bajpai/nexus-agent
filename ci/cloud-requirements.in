@@ -1,0 +1,11 @@
+typer>=0.12.0
+rich>=13.0.0
+prompt_toolkit>=3.0.0
+ddgs>=9.16.1
+python-dotenv>=1.0.0
+pytest>=8.0.0
+psutil>=5.9.0; sys_platform == 'win32' or sys_platform == 'darwin'
+openai==3.56.0
+httpx==0.28.1
+setuptools
+wheel
