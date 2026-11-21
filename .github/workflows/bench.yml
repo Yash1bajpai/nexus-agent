@@ -8,13 +8,22 @@ on:
         type: choice
         options:
           - nvidia/nemotron-3-ultra-550b-a55b:free
+      stage:
+        description: Reviewer-approved stage; C3 and C4 are separate dispatches on separate UTC days
+        required: true
+        type: choice
+        options:
+          - c3
+          - c4
+          - ab
 permissions:
   contents: read
 concurrency:
   group: nexus-free-cloud-daily-budget
   cancel-in-progress: false
 jobs:
-  static_a_b:
+  static_stage:
+    name: static ${{ inputs.stage }} ${{ inputs.model }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -42,11 +51,12 @@ jobs:
           "$RUNNER_TEMP/cloud-venv/bin/python" -m pip install --no-deps --no-build-isolation ./product
           "$RUNNER_TEMP/cloud-venv/bin/python" -m pip freeze --all > "$RUNNER_TEMP/cloud-pip-freeze.txt"
           mkdir -p "$RUNNER_TEMP/cloud-home"
-      - name: Static smoke A and B N=5, no fixture execution
+      - name: Static smoke A gate then ${{ inputs.stage }} iterations, no fixture execution
         timeout-minutes: 41
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MODEL: ${{ inputs.model }}
+          STAGE: ${{ inputs.stage }}
           HOME: ${{ runner.temp }}/cloud-home
           PYTHONNOUSERSITE: '1'
           PYTHONDONTWRITEBYTECODE: '1'
@@ -55,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           unset NEXUS_ALLOW_PROJECT_EXECUTION NEXUS_ALLOW_GIT_COMMIT PYTHONPATH
-          "$RUNNER_TEMP/cloud-venv/bin/python" -I harness/ci/cloud_static_driver.py --product "$GITHUB_WORKSPACE/product" --output "$RUNNER_TEMP/cloud-evidence" --model "$MODEL"
+          "$RUNNER_TEMP/cloud-venv/bin/python" -I harness/ci/cloud_static_driver.py --product "$GITHUB_WORKSPACE/product" --output "$RUNNER_TEMP/cloud-evidence" --model "$MODEL" --stage "$STAGE"
       - name: Secret-pattern artifact scan, fail and delete on hit
         if: always()
         id: scan
@@ -68,9 +78,11 @@ jobs:
         if: always() && steps.scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: cloud-static-A-B-evidence
+          name: cloud-static-${{ inputs.stage }}-evidence
           path: ${{ runner.temp }}/cloud-evidence
           if-no-files-found: error
           retention-days: 7
-# Zone B intentionally absent. No code/fixture execution job is permitted.
-# New dispatches need separate daily-budget reconciliation and reviewer approval.
+# Zone B intentionally absent. No code/fixture execution job is permitted; for
+# C stages run_tests is routed to the pure static stub (ci/cloud_stub_run_tests.py).
+# One dispatch per UTC day; C3 and C4 never same-day. New dispatches need
+# separate daily-budget reconciliation and reviewer approval.

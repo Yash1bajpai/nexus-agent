@@ -1,0 +1,1 @@
+Fix divide in divider.py so it returns None when b is 0, then run the tests.
