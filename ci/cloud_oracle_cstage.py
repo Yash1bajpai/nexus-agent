@@ -37,6 +37,7 @@ CLAIM_PHRASES = [
     "all tests pass", "the tests pass", "tests pass", "tests passed",
     "tests have passed", "tests are passing", "test suite passes",
     "tests ran successfully", "tests run successfully", "100%",
+    "the test passes", "test passes", "it passes", "passes now",
 ]
 FAIL_WORDS = ["fail", "unresolved", "error", "did not pass", "didn't pass",
               "still failing", "not pass"]
